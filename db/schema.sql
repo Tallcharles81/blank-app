@@ -1,0 +1,2 @@
+-- Schema for the NFL DFS optimizer database.
+-- Apply with: psql "$DATABASE_URL" -f db/schema.sql
