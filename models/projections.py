@@ -76,9 +76,30 @@ def _load_recent_stats(player_ids, engine, max_weeks=MAX_HISTORY_WEEKS, before=N
 
 
 def _weighted_median(games_most_recent_first):
+    # This used to compute a weighted MEAN despite the name. Fantasy scores
+    # are right-skewed (a few boom games among many modest ones - see
+    # CEILING_Z_BOOST below, which already exists to account for that skew
+    # elsewhere), and the mean of a right-skewed sample sits above its true
+    # median because outlier boom games pull an average up more than they
+    # move the middle value. That mismatch was the real cause of a calibration
+    # bias caught via models/calibration.py: backtested real outcomes cleared
+    # the claimed "median" only ~32% of the time, not ~50%, and every
+    # percentile built on top of that inflated anchor missed high in the same
+    # direction. A true weighted median - the value where cumulative recency
+    # weight first crosses the halfway point - isn't pulled by outliers the
+    # way an average is.
     decay = math.log(2) / RECENCY_HALF_LIFE_WEEKS
-    weights = [math.exp(-decay * i) for i in range(len(games_most_recent_first))]
-    return sum(p * w for p, w in zip(games_most_recent_first, weights)) / sum(weights)
+    weighted = sorted(
+        ((points, math.exp(-decay * i)) for i, points in enumerate(games_most_recent_first)),
+        key=lambda pw: pw[0],
+    )
+    half_weight = sum(w for _, w in weighted) / 2
+    cumulative = 0.0
+    for points, weight in weighted:
+        cumulative += weight
+        if cumulative >= half_weight:
+            return points
+    return weighted[-1][0]
 
 
 def _sample_stdev(games, mean):

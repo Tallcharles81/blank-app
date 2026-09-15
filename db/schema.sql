@@ -107,6 +107,10 @@ CREATE TABLE IF NOT EXISTS calibration_weekly (
     week                    INTEGER NOT NULL,
     num_players_evaluated   INTEGER NOT NULL,
     mae_by_position         JSONB,
+    p20_hits                INTEGER,
+    p20_opportunities       INTEGER,
+    p50_hits                INTEGER,
+    p50_opportunities       INTEGER,
     p80_hits                INTEGER,
     p80_opportunities       INTEGER,
     avg_field_percentile    NUMERIC(5, 4),
@@ -114,3 +118,10 @@ CREATE TABLE IF NOT EXISTS calibration_weekly (
     computed_at             TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (season, week)
 );
+
+-- Added after the table already existed with p80-only data - CREATE TABLE IF
+-- NOT EXISTS above doesn't add columns to an existing table.
+ALTER TABLE calibration_weekly ADD COLUMN IF NOT EXISTS p20_hits INTEGER;
+ALTER TABLE calibration_weekly ADD COLUMN IF NOT EXISTS p20_opportunities INTEGER;
+ALTER TABLE calibration_weekly ADD COLUMN IF NOT EXISTS p50_hits INTEGER;
+ALTER TABLE calibration_weekly ADD COLUMN IF NOT EXISTS p50_opportunities INTEGER;
