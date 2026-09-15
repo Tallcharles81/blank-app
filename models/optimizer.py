@@ -5,6 +5,7 @@ import pulp
 from sqlalchemy import text
 
 from data.dk_salary_csv import CLASSIC_ROSTER, SHOWDOWN_ROSTER
+from data.player_availability import get_availability_gate, resolve_slate_season_week
 from db.migrate import get_engine
 
 SALARY_CAP = 50000
@@ -35,7 +36,26 @@ def _load_player_pool(slate_id, projection_field, engine):
         rows = conn.execute(query, {"slate_id": slate_id}).mappings().fetchall()
     # proj.* columns are NUMERIC in Postgres, so psycopg2 returns Decimal - PuLP's
     # LpAffineExpression only accepts float/int coefficients and errors on Decimal.
-    return [{**dict(row), "points": float(row["points"])} for row in rows]
+    players = [{**dict(row), "points": float(row["points"])} for row in rows]
+
+    # Hard blocker, not opt-in: a live slate's player pool is never handed to
+    # the solver without checking current roster/injury status first. Refusing
+    # to guess the slate's (season, week) rather than silently skipping the
+    # gate if it can't be resolved - see data/player_availability.py.
+    season_week = resolve_slate_season_week(slate_id, engine)
+    if season_week is None:
+        raise RuntimeError(
+            f"Could not determine (season, week) for slate {slate_id} - refusing to build a lineup "
+            "without checking current roster/injury status first"
+        )
+    season, week = season_week
+    excluded, flagged, injury_report_available = get_availability_gate(players, season, week, engine)
+
+    available_players = [p for p in players if p["player_id"] not in excluded]
+    for p in available_players:
+        p["availability_flag"] = flagged.get(p["player_id"])
+
+    return available_players, excluded, injury_report_available
 
 
 def _apply_common_constraints(prob, x, players, locked_ids, excluded_ids, max_players_per_team):
@@ -285,10 +305,11 @@ def generate_lineups(
     engine=None,
 ):
     engine = engine or get_engine()
-    players = _load_player_pool(slate_id, projection_field, engine)
+    players, availability_excluded, injury_report_available = _load_player_pool(slate_id, projection_field, engine)
     if not players:
         raise ValueError(f"No players with a '{projection_field}' projection found for slate {slate_id}")
-    return build_lineups_from_pool(
+
+    lineups, exposure_report = build_lineups_from_pool(
         players,
         num_lineups=num_lineups,
         salary_cap=salary_cap,
@@ -299,6 +320,21 @@ def generate_lineups(
         max_exposure=max_exposure,
         min_exposure=min_exposure,
     )
+
+    availability_report = {
+        # Hard-excluded before the solver ever saw them - see
+        # data/player_availability.py. {dk_player_id: reason}.
+        "excluded": availability_excluded,
+        # Still eligible, but risky - Questionable/Doubtful on the real
+        # current injury report. {dk_player_id: status}.
+        "flagged": {p["player_id"]: p["availability_flag"] for p in players if p.get("availability_flag")},
+        # Injury reports are filed Wed-Fri of game week - False here means
+        # nflverse hasn't published this week's report yet, not that everyone
+        # is confirmed healthy. Roster-status exclusions (IR/PUP/Suspended)
+        # are unaffected either way.
+        "injury_report_available": injury_report_available,
+    }
+    return lineups, exposure_report, availability_report
 
 
 def lineup_player_ids(lineup):

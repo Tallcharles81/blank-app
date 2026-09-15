@@ -41,7 +41,7 @@ REQUEST_TIMEOUT_SECONDS = 60
 # this season", not an error.
 
 
-def _download_csv(tag, filename, usecols=None):
+def download_csv(tag, filename, usecols=None):
     url = f"{NFLVERSE_RELEASE_BASE}/{tag}/{filename}"
     try:
         response = requests.get(url, timeout=REQUEST_TIMEOUT_SECONDS)
@@ -69,7 +69,7 @@ def _fetch_per_season(tag, filename_template, seasons, usecols=None):
     frames = []
     for season in seasons:
         try:
-            df = _download_csv(tag, filename_template.format(season=season), usecols=usecols)
+            df = download_csv(tag, filename_template.format(season=season), usecols=usecols)
         except RuntimeError as exc:
             # Most commonly a season that hasn't been played yet (no release
             # asset exists) - skip it rather than fail the whole fetch over one
@@ -114,11 +114,11 @@ def fetch_snap_counts(seasons):
 
 
 def fetch_players_crosswalk():
-    return _download_csv("players", "players.csv.gz")
+    return download_csv("players", "players.csv.gz")
 
 
 def fetch_schedules():
-    return _download_csv("schedules", "games.csv.gz")
+    return download_csv("schedules", "games.csv.gz")
 
 
 PBP_RED_ZONE_COLUMNS = [
