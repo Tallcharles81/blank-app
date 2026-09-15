@@ -24,12 +24,15 @@ REQUEST_TIMEOUT_SECONDS = 60
 #   - players/players.csv.gz                     (single file, gsis_id<->pfr_id crosswalk)
 #   - schedules/games.csv.gz                     (single all-seasons file - note the
 #     asset is named "games.csv.gz", not "schedules.csv.gz", despite the tag name)
+#   - stats_team/stats_team_week_{season}.csv.gz (weekly, team-keyed; not visible
+#     in the release page's own asset listing, confirmed by direct download)
+#   - pbp/play_by_play_{season}.csv.gz           (weekly play-by-play, ~370 columns)
 # A given season's file may simply not exist yet (e.g. player_stats has no 2025/2026
 # release as of writing, since nflfastR can't compute weekly stats for games that
 # haven't been played) - callers must treat a 404 as "skip this season", not an error.
 
 
-def _download_csv(tag, filename):
+def _download_csv(tag, filename, usecols=None):
     url = f"{NFLVERSE_RELEASE_BASE}/{tag}/{filename}"
     try:
         response = requests.get(url, timeout=REQUEST_TIMEOUT_SECONDS)
@@ -45,16 +48,19 @@ def _download_csv(tag, filename):
             raise RuntimeError(f"Failed to gunzip {url}: {exc}") from exc
 
     try:
-        return pd.read_csv(io.BytesIO(content), low_memory=False)
-    except (pd.errors.ParserError, UnicodeDecodeError) as exc:
+        # usecols matters here: play-by-play files are ~370 columns and tens of
+        # MB compressed - parsing only the handful of columns red-zone
+        # aggregation actually needs avoids a full unnecessary parse of all of it.
+        return pd.read_csv(io.BytesIO(content), low_memory=False, usecols=usecols)
+    except (pd.errors.ParserError, UnicodeDecodeError, ValueError) as exc:
         raise RuntimeError(f"Failed to parse {url} as CSV: {exc}") from exc
 
 
-def _fetch_per_season(tag, filename_template, seasons):
+def _fetch_per_season(tag, filename_template, seasons, usecols=None):
     frames = []
     for season in seasons:
         try:
-            df = _download_csv(tag, filename_template.format(season=season))
+            df = _download_csv(tag, filename_template.format(season=season), usecols=usecols)
         except RuntimeError as exc:
             # Most commonly a season that hasn't been played yet (no release
             # asset exists) - skip it rather than fail the whole fetch over one
@@ -104,6 +110,54 @@ def fetch_players_crosswalk():
 
 def fetch_schedules():
     return _download_csv("schedules", "games.csv.gz")
+
+
+PBP_RED_ZONE_COLUMNS = [
+    "season",
+    "week",
+    "posteam",
+    "yardline_100",
+    "rush",
+    "receiver_player_id",
+    "rusher_player_id",
+    "two_point_attempt",
+]
+
+
+def fetch_pbp(seasons):
+    # Confirmed filename by direct download: play_by_play_{season}.csv.gz under
+    # the "pbp" tag (not "pbp_{season}.csv.gz", which 404s).
+    frames = _fetch_per_season("pbp", "play_by_play_{season}.csv.gz", seasons, usecols=PBP_RED_ZONE_COLUMNS)
+    if not frames:
+        raise RuntimeError(f"No play-by-play data could be fetched for any of seasons {seasons}")
+    return pd.concat(frames, ignore_index=True)
+
+
+def _red_zone_counts(pbp_df):
+    # yardline_100 is the offense's distance to the opponent's end zone, so
+    # "red zone" is yardline_100 <= 20. Verified against real 2024 data before
+    # relying on these filters: receiver_player_id is null on every sack (so
+    # filtering on it being non-null already excludes sacks from targets with
+    # no extra "sack" check needed), and rush==1 never overlaps with qb_kneel
+    # (so kneel-downs are already excluded from carries). two_point_attempt
+    # plays are excluded because nflverse's official targets/carries counts
+    # (in player_stats) exclude them too - without this, a handful of real
+    # rows had red_zone_targets/carries exceeding the season's official
+    # targets/carries, caught by cross-checking against real data (e.g. an
+    # offensive tackle's trick-play 2-point conversion target).
+    red_zone = pbp_df[(pbp_df["yardline_100"] <= 20) & (pbp_df["two_point_attempt"] != 1)]
+
+    targets = red_zone.dropna(subset=["receiver_player_id"])
+    targets_by_key = {
+        key: count for key, count in targets.groupby(["receiver_player_id", "season", "week"]).size().items()
+    }
+
+    carries = red_zone[red_zone["rush"] == 1].dropna(subset=["rusher_player_id"])
+    carries_by_key = {
+        key: count for key, count in carries.groupby(["rusher_player_id", "season", "week"]).size().items()
+    }
+
+    return targets_by_key, carries_by_key
 
 
 def fetch_stats_team_week(seasons):
@@ -201,14 +255,16 @@ def _clear_and_insert_season(conn, season, rows):
             """
             INSERT INTO player_weekly_stats (
                 player_id, player_name, position, team, season, week,
-                targets, target_share, air_yards_share, carries,
-                rushing_yards, receiving_yards, fantasy_points_ppr,
-                opponent, snap_pct, injury_status, vegas_implied_total
+                targets, target_share, air_yards_share, red_zone_targets,
+                carries, red_zone_carries, rushing_yards, receiving_yards,
+                fantasy_points_ppr, opponent, snap_pct, injury_status,
+                vegas_implied_total
             ) VALUES (
                 :player_id, :player_name, :position, :team, :season, :week,
-                :targets, :target_share, :air_yards_share, :carries,
-                :rushing_yards, :receiving_yards, :fantasy_points_ppr,
-                :opponent, :snap_pct, :injury_status, :vegas_implied_total
+                :targets, :target_share, :air_yards_share, :red_zone_targets,
+                :carries, :red_zone_carries, :rushing_yards, :receiving_yards,
+                :fantasy_points_ppr, :opponent, :snap_pct, :injury_status,
+                :vegas_implied_total
             )
             """
         ),
@@ -334,6 +390,17 @@ def refresh_player_weekly_stats(seasons, engine=None):
     except (RuntimeError, KeyError) as exc:
         logger.warning("Continuing without vegas_implied_total: %s", exc)
 
+    # None (not {}) distinguishes "couldn't fetch pbp this run, leave the
+    # columns NULL/unknown" from "fetched fine, this player-week just had zero
+    # red zone touches" (.get(key, 0) below only makes sense once we know we
+    # have full red-zone coverage for the season).
+    rz_targets_by_key = None
+    rz_carries_by_key = None
+    try:
+        rz_targets_by_key, rz_carries_by_key = _red_zone_counts(fetch_pbp(fetched_seasons))
+    except RuntimeError as exc:
+        logger.warning("Continuing without red zone stats: %s", exc)
+
     rows_by_season = {}
     for row in stats_df.itertuples():
         key = (row.player_id, row.season, row.week)
@@ -349,7 +416,9 @@ def refresh_player_weekly_stats(seasons, engine=None):
                 "targets": _nan_to_none(row.targets),
                 "target_share": _nan_to_none(row.target_share),
                 "air_yards_share": _nan_to_none(row.air_yards_share),
+                "red_zone_targets": rz_targets_by_key.get(key, 0) if rz_targets_by_key is not None else None,
                 "carries": _nan_to_none(row.carries),
+                "red_zone_carries": rz_carries_by_key.get(key, 0) if rz_carries_by_key is not None else None,
                 "rushing_yards": _nan_to_none(row.rushing_yards),
                 "receiving_yards": _nan_to_none(row.receiving_yards),
                 "fantasy_points_ppr": _nan_to_none(row.fantasy_points_ppr),
