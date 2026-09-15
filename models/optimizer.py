@@ -1,3 +1,4 @@
+import math
 from collections import defaultdict
 
 import pulp
@@ -145,6 +146,17 @@ def _solve_showdown(players, salary_cap, locked_ids, excluded_ids, max_players_p
     return [("CPT", cpt)] + [("FLEX", p) for p in flex]
 
 
+def _resolve_exposure(spec, player_id):
+    # spec is None (no cap/floor at all), a single float/int (applies to every
+    # player), or a dict of per-player overrides with an optional "default" for
+    # players not explicitly listed.
+    if spec is None:
+        return None
+    if isinstance(spec, dict):
+        return spec[player_id] if player_id in spec else spec.get("default")
+    return spec
+
+
 def generate_lineups(
     slate_id,
     num_lineups=1,
@@ -155,8 +167,18 @@ def generate_lineups(
     max_players_per_team=None,
     min_uniques=1,
     max_exposure=None,
+    min_exposure=None,
     engine=None,
 ):
+    """max_exposure/min_exposure: None, a single fraction (0-1) applied to every
+    player, or {player_id: fraction, "default": fraction}.
+
+    Returns (lineups, exposure_report) where exposure_report is
+    {player_id: {"count": n, "fraction": n / lineups_actually_built}} - the
+    achieved exposure, which may fall short of requested max/min_exposure if
+    the caps made later lineups infeasible (see the ValueError handling
+    below); the report is what lets a caller notice that happened.
+    """
     engine = engine or get_engine()
     players = _load_player_pool(slate_id, projection_field, engine)
     if not players:
@@ -168,24 +190,54 @@ def generate_lineups(
     lineups = []
     previous_lineups = []
     exposure_counts = defaultdict(int)
-    excluded_ids = set(excluded_player_ids or [])
+    base_excluded_ids = set(excluded_player_ids or [])
+    base_locked_ids = list(locked_player_ids or [])
 
     for i in range(num_lineups):
-        # max_exposure is enforced by hard-excluding a player once they've hit their
-        # cap across lineups generated so far, rather than a true exposure-aware
-        # MILP - much simpler, and good enough at the lineup counts DFS players
-        # actually build (dozens, not thousands).
-        exposure_excluded = (
-            {pid for pid, count in exposure_counts.items() if count >= max_exposure * num_lineups}
-            if max_exposure is not None
-            else set()
-        )
+        lineups_remaining = num_lineups - i
+
+        # max_exposure is checked against the final target lineup count, not
+        # lineups built so far: a player is excluded once their count would
+        # put them over cap * num_lineups. This does mean a popular player
+        # gets included in the first cap*num_lineups solves and hard-excluded
+        # after that, rather than interleaved throughout the run - but that's
+        # just an ordering artifact; the final achieved exposure fraction is
+        # identical either way, and comparing against lineups-built-so-far
+        # instead would make cap enforcement impossible on lineup 1 (every
+        # player's "fraction so far" starts at 100% the moment they're used
+        # once out of one lineup built).
+        exposure_excluded = set()
+        forced_locks = []
+        for p in players:
+            pid = p["player_id"]
+            cap = _resolve_exposure(max_exposure, pid)
+            if cap is not None and exposure_counts[pid] >= cap * num_lineups:
+                exposure_excluded.add(pid)
+
+            floor = _resolve_exposure(min_exposure, pid)
+            if floor is not None:
+                # Lineups still needed to reach this player's floor by the end
+                # of the run - once that equals the lineups left to build,
+                # they must be locked into every remaining one to make it.
+                needed = math.ceil(floor * num_lineups) - exposure_counts[pid]
+                if needed >= lineups_remaining:
+                    forced_locks.append(pid)
+
+        conflicts = exposure_excluded & set(forced_locks)
+        if conflicts:
+            # A configuration error, not something to silently resolve one way -
+            # the caller asked for this player both capped out and floored in
+            # for the same lineup.
+            raise ValueError(f"max_exposure and min_exposure conflict for player(s): {sorted(conflicts)}")
+
+        locked_ids = list(dict.fromkeys(base_locked_ids + forced_locks))
+
         try:
             slots = solve_fn(
                 players,
                 salary_cap,
-                locked_player_ids,
-                excluded_ids | exposure_excluded,
+                locked_ids,
+                base_excluded_ids | exposure_excluded,
                 max_players_per_team,
                 previous_lineups,
                 min_uniques,
@@ -208,7 +260,13 @@ def generate_lineups(
             }
         )
 
-    return lineups
+    built = len(lineups)
+    exposure_report = {
+        pid: {"count": count, "fraction": round(count / built, 4) if built else 0.0}
+        for pid, count in exposure_counts.items()
+    }
+
+    return lineups, exposure_report
 
 
 def lineup_player_ids(lineup):
