@@ -106,6 +106,64 @@ def fetch_schedules():
     return _download_csv("schedules", "games.csv.gz")
 
 
+def fetch_stats_team_week(seasons):
+    # Confirmed to exist by direct download (stats_team_week_{season}.csv.gz),
+    # despite not appearing in the truncated release-asset listing checked
+    # earlier - team-level, per-week defense/special-teams box score stats,
+    # which is what DK's DST scoring needs and player_stats (per-player,
+    # offense-only) doesn't have at all.
+    frames = _fetch_per_season("stats_team", "stats_team_week_{season}.csv.gz", seasons)
+    if not frames:
+        raise RuntimeError(f"No stats_team_week data could be fetched for any of seasons {seasons}")
+    df = pd.concat(frames, ignore_index=True)
+    return df[df["season_type"] == "REG"].copy()
+
+
+def _team_points_allowed(schedules_df):
+    df = schedules_df.dropna(subset=["home_score", "away_score"])
+    home = df[["season", "week", "home_team", "away_score"]].rename(
+        columns={"home_team": "team", "away_score": "points_allowed"}
+    )
+    away = df[["season", "week", "away_team", "home_score"]].rename(
+        columns={"away_team": "team", "home_score": "points_allowed"}
+    )
+    combined = pd.concat([home, away], ignore_index=True)
+    return {(row.team, row.season, row.week): row.points_allowed for row in combined.itertuples()}
+
+
+# DraftKings' published Classic-contest DST scoring: tiers are keyed by the
+# upper bound of a "points allowed" bracket, first match wins.
+_POINTS_ALLOWED_TIERS = [(0, 10), (6, 7), (13, 4), (20, 1), (27, 0), (34, -1)]
+_POINTS_ALLOWED_BLOWOUT_PENALTY = -4
+
+
+def _points_allowed_bonus(points_allowed):
+    for upper_bound, bonus in _POINTS_ALLOWED_TIERS:
+        if points_allowed <= upper_bound:
+            return bonus
+    return _POINTS_ALLOWED_BLOWOUT_PENALTY
+
+
+def _dst_fantasy_points(team_row, points_allowed):
+    # Verified against real stats_team_week data before relying on it: def_tds,
+    # fumble_recovery_tds, and special_teams_tds are independent, non-
+    # overlapping touchdown categories (e.g. def_tds never exceeds
+    # def_interceptions across a full season, and a real game exists with both
+    # a def_td and a fumble_recovery_td counted separately in the same row) -
+    # summing all three double-counts nothing.
+    score = (
+        1 * team_row.def_sacks
+        + 2 * team_row.def_interceptions
+        + 2 * team_row.fumble_recovery_opp
+        + 6 * (team_row.def_tds + team_row.fumble_recovery_tds + team_row.special_teams_tds)
+        + 2 * team_row.def_safeties
+        + 2 * (team_row.def_punt_blocks + team_row.def_pat_blocks + team_row.def_fg_blocks)
+    )
+    if points_allowed is not None:
+        score += _points_allowed_bonus(points_allowed)
+    return round(float(score), 2)
+
+
 def _team_implied_totals(schedules_df):
     # spread_line is the HOME team's favored margin (confirmed empirically: it
     # correlates positively with home_score - away_score across real games, not
@@ -129,8 +187,13 @@ def _clear_and_insert_season(conn, season, rows):
     # Delete-then-insert in the same transaction as the caller's `conn`, so a
     # failure partway through this season's insert rolls back the delete too -
     # we never end up with a season's real data half-written, or worse, deleted
-    # with nothing to replace it.
-    conn.execute(text("DELETE FROM player_weekly_stats WHERE season = :season"), {"season": season})
+    # with nothing to replace it. Scoped to position != 'DST' so this never
+    # wipes out the DST rows refresh_dst_weekly_stats() writes to this same
+    # table - the two refreshes must not delete each other's data.
+    conn.execute(
+        text("DELETE FROM player_weekly_stats WHERE season = :season AND position != 'DST'"),
+        {"season": season},
+    )
     if not rows:
         return
     conn.execute(
@@ -151,6 +214,80 @@ def _clear_and_insert_season(conn, season, rows):
         ),
         rows,
     )
+
+
+def _clear_and_insert_dst_season(conn, season, rows):
+    # Scoped to position = 'DST' only - the counterpart to
+    # _clear_and_insert_season's "!= 'DST'" scoping, so refreshing DST never
+    # touches the offensive player rows in the same table.
+    conn.execute(
+        text("DELETE FROM player_weekly_stats WHERE season = :season AND position = 'DST'"),
+        {"season": season},
+    )
+    if not rows:
+        return
+    conn.execute(
+        text(
+            """
+            INSERT INTO player_weekly_stats (
+                player_id, player_name, position, team, season, week,
+                fantasy_points_ppr, opponent, vegas_implied_total
+            ) VALUES (
+                :player_id, :player_name, :position, :team, :season, :week,
+                :fantasy_points_ppr, :opponent, :vegas_implied_total
+            )
+            """
+        ),
+        rows,
+    )
+
+
+def refresh_dst_weekly_stats(seasons, engine=None):
+    """Replace player_weekly_stats' DST rows for `seasons` with real nflverse data.
+
+    DST fantasy points are computed here (see _dst_fantasy_points), not sourced
+    directly, since no nflverse release publishes DK's DST fantasy score - only
+    the raw box-score categories DK's formula is built from. player_id is a
+    synthetic f"DST_{team}" (team defenses aren't people, so there's no GSIS id
+    to reuse); data/player_crosswalk.py resolves DK's DST rows to this same id
+    by team code, not name matching.
+    """
+    engine = engine or get_engine()
+
+    team_stats_df = fetch_stats_team_week(seasons)
+    schedules_df = fetch_schedules()
+    points_allowed_by_key = _team_points_allowed(schedules_df)
+
+    vegas_by_team_key = {}
+    try:
+        vegas_by_team_key = _team_implied_totals(schedules_df)
+    except KeyError as exc:
+        logger.warning("Continuing without vegas_implied_total: %s", exc)
+
+    rows_by_season = {}
+    for row in team_stats_df.itertuples():
+        points_allowed = points_allowed_by_key.get((row.team, row.season, row.week))
+        rows_by_season.setdefault(row.season, []).append(
+            {
+                "player_id": f"DST_{row.team}",
+                "player_name": f"{row.team} DST",
+                "position": "DST",
+                "team": row.team,
+                "season": row.season,
+                "week": row.week,
+                "opponent": row.opponent_team,
+                "fantasy_points_ppr": _dst_fantasy_points(row, points_allowed),
+                "vegas_implied_total": _nan_to_none(vegas_by_team_key.get((row.team, row.season, row.week))),
+            }
+        )
+
+    row_counts = {}
+    for season, rows in rows_by_season.items():
+        with engine.begin() as conn:
+            _clear_and_insert_dst_season(conn, season, rows)
+        row_counts[season] = len(rows)
+
+    return row_counts
 
 
 def refresh_player_weekly_stats(seasons, engine=None):

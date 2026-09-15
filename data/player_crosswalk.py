@@ -25,7 +25,10 @@ def normalize_name(name):
 
 
 def _nflverse_players_by_name_position(engine):
-    query = text("SELECT DISTINCT player_id AS gsis_id, player_name, position FROM player_weekly_stats")
+    query = text(
+        "SELECT DISTINCT player_id AS gsis_id, player_name, position "
+        "FROM player_weekly_stats WHERE position != 'DST'"
+    )
     with engine.connect() as conn:
         rows = conn.execute(query).fetchall()
 
@@ -36,27 +39,46 @@ def _nflverse_players_by_name_position(engine):
     return candidates
 
 
+def _existing_dst_ids(engine):
+    query = text("SELECT DISTINCT player_id FROM player_weekly_stats WHERE position = 'DST'")
+    with engine.connect() as conn:
+        return {row.player_id for row in conn.execute(query)}
+
+
 def resolve_dk_players_to_gsis(dk_players, engine=None):
-    """Match DK players (dicts with player_id/name/position) to nflverse GSIS IDs by
-    normalized name + position.
+    """Match DK players (dicts with player_id/name/position/team) to their
+    corresponding player_weekly_stats id.
 
     Returns (mapping, unmatched, ambiguous):
-    - mapping: {dk_player_id: gsis_id} for confident single matches.
+    - mapping: {dk_player_id: player_weekly_stats.player_id} for confident matches.
     - unmatched: dk_player_ids with no candidate at all - expected for rookies
-      with no prior-season history, and for DST, since nflverse's player_stats
-      release has no team-defense rows (it's a per-player stats file); there is
-      no historical source fetched for DST scoring yet.
+      with no prior-season history, or a DST whose team has no
+      refresh_dst_weekly_stats() data for the relevant seasons.
     - ambiguous: dk_player_ids whose normalized name+position matched more than
       one distinct historical player - too risky to guess, so left unmatched
-      rather than silently picking one.
+      rather than silently picking one. Never happens for DST, which matches
+      on team code instead of name.
     """
     engine = engine or get_engine()
     candidates = _nflverse_players_by_name_position(engine)
+    existing_dst_ids = _existing_dst_ids(engine)
 
     mapping = {}
     unmatched = []
     ambiguous = []
     for player in dk_players:
+        if player["position"] == "DST":
+            # DK's DST name is the team nickname only (e.g. "49ers"), which has
+            # no reliable, guessable relationship to any naming convention we'd
+            # invent for the synthetic rows refresh_dst_weekly_stats() writes -
+            # team code is the one unambiguous, stable key both sides share.
+            dst_id = f"DST_{player['team']}"
+            if dst_id in existing_dst_ids:
+                mapping[player["player_id"]] = dst_id
+            else:
+                unmatched.append(player["player_id"])
+            continue
+
         key = (normalize_name(player["name"]), player["position"])
         matches = candidates.get(key, set())
         if len(matches) == 1:

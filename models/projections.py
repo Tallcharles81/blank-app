@@ -100,7 +100,7 @@ def generate_projections(slate_id, engine=None):
 
     with engine.connect() as conn:
         players = conn.execute(
-            text("SELECT player_id, name, position FROM slate_player_pool WHERE slate_id = :slate_id"),
+            text("SELECT player_id, name, position, team FROM slate_player_pool WHERE slate_id = :slate_id"),
             {"slate_id": slate_id},
         ).mappings().fetchall()
 
