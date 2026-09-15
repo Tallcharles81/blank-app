@@ -42,9 +42,11 @@ def parse_game_info(game_info):
 
 
 def _find_header_row(rows):
+    header_len = len(PLAYER_POOL_HEADER)
     for i, row in enumerate(rows):
-        if row[: len(PLAYER_POOL_HEADER)] == PLAYER_POOL_HEADER:
-            return i
+        for offset in range(len(row) - header_len + 1):
+            if row[offset : offset + header_len] == PLAYER_POOL_HEADER:
+                return i, offset
     raise ValueError("Could not find DraftKings player pool header row")
 
 
@@ -59,14 +61,15 @@ def parse_dk_salary_csv(file_path):
     with open(file_path, newline="", encoding="utf-8-sig") as f:
         rows = list(csv.reader(f))
 
-    header_idx = _find_header_row(rows)
+    header_idx, col_offset = _find_header_row(rows)
     slate_type = _detect_slate_type(rows, header_idx)
 
     players = []
     for row in rows[header_idx + 1 :]:
-        if len(row) < len(PLAYER_POOL_HEADER) or not row[0].strip():
+        fields = row[col_offset : col_offset + len(PLAYER_POOL_HEADER)]
+        if len(fields) < len(PLAYER_POOL_HEADER) or not fields[0].strip():
             continue
-        position, _name_and_id, name, player_id, _roster_position, salary, game_info, team, avg_pts = row[:9]
+        position, _name_and_id, name, player_id, _roster_position, salary, game_info, team, avg_pts = fields
         away_team, home_team, kickoff_time = parse_game_info(game_info)
         team = team.strip()
         opponent = home_team if team == away_team else away_team
