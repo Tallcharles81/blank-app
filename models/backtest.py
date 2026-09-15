@@ -15,40 +15,57 @@ from models.projections import _load_recent_stats, _project_from_history
 DEFAULT_RANDOM_FIELD_SIZE = 300
 
 
-def _load_slate_pool(slate_id, engine):
+def load_slate_pool(slate_id, engine):
     query = text("SELECT player_id, name, position, salary, team FROM slate_player_pool WHERE slate_id = :slate_id")
     with engine.connect() as conn:
         rows = conn.execute(query, {"slate_id": slate_id}).mappings().fetchall()
     return [dict(row) for row in rows]
 
 
-def _load_actual_scores(slate_players, season, week, engine):
+def load_actual_scores(slate_players, season, week, engine):
     """Resolve each DK player to a real fantasy_points_ppr for (season, week).
 
     Returns (scores, excluded_ids):
     - scores: {dk_player_id: actual_points}. A player who resolves to a real
-      historical identity but has no row for this exact (season, week) is
-      scored 0 - the correct real-contest outcome for a bye/inactive/
-      didn't-play week, not a missing-data gap.
-    - excluded_ids: DK player_ids the crosswalk couldn't resolve to any
-      historical identity at all (see data/player_crosswalk.py) - there is no
-      real score to use for them, so they're left out of the backtest's
-      candidate pool entirely rather than guessed at as 0.
+      historical identity, HAS other rows fetched for that season, but has no
+      row for this exact (season, week) is scored 0 - the correct real-contest
+      outcome for a bye/inactive/didn't-play week. A player with zero rows for
+      the entire season is a different situation - no real data was ever
+      fetched for them that year at all (e.g. only DST has been fetched for
+      2025/2026 so far, no skill positions) - and gets excluded rather than
+      defaulted to a fabricated 0, which would silently fake an entire
+      season's worth of "actual" skill-position scores.
+    - excluded_ids: the above, plus DK player_ids the crosswalk couldn't
+      resolve to any historical identity at all (see
+      data/player_crosswalk.py) - there is no real score to use for either
+      case, so both are left out of the candidate pool entirely rather than
+      guessed at.
     """
     gsis_by_dk_id, unmatched, ambiguous = resolve_dk_players_to_gsis(slate_players, engine)
     excluded_ids = set(unmatched) | set(ambiguous)
 
-    query = text(
+    ids = list(gsis_by_dk_id.values())
+    season_query = text("SELECT DISTINCT player_id FROM player_weekly_stats WHERE player_id = ANY(:ids) AND season = :season")
+    week_query = text(
         "SELECT player_id, fantasy_points_ppr FROM player_weekly_stats "
         "WHERE player_id = ANY(:ids) AND season = :season AND week = :week"
     )
     with engine.connect() as conn:
-        rows = conn.execute(
-            query, {"ids": list(gsis_by_dk_id.values()), "season": season, "week": week}
-        ).fetchall()
-    actual_by_gsis = {row.player_id: float(row.fantasy_points_ppr) for row in rows}
+        in_season_scope = {row.player_id for row in conn.execute(season_query, {"ids": ids, "season": season})}
+        actual_by_gsis = {
+            row.player_id: float(row.fantasy_points_ppr)
+            for row in conn.execute(week_query, {"ids": ids, "season": season, "week": week})
+        }
 
-    scores = {dk_id: actual_by_gsis.get(gsis_id, 0.0) for dk_id, gsis_id in gsis_by_dk_id.items()}
+    scores = {}
+    for dk_id, gsis_id in gsis_by_dk_id.items():
+        if gsis_id in actual_by_gsis:
+            scores[dk_id] = actual_by_gsis[gsis_id]
+        elif gsis_id in in_season_scope:
+            scores[dk_id] = 0.0
+        else:
+            excluded_ids.add(dk_id)
+
     return scores, excluded_ids
 
 
@@ -102,18 +119,18 @@ def backtest_slate(
     - field_size: how many random-legal comparison lineups were sampled.
     - excluded_no_asof_projection / excluded_no_actual_result: DK player_ids
       dropped from the candidate pool because either couldn't be produced -
-      see _load_actual_scores and _asof_projected_points.
+      see load_actual_scores and _asof_projected_points.
     """
     engine = engine or get_engine()
 
-    slate_players = _load_slate_pool(source_slate_id, engine)
+    slate_players = load_slate_pool(source_slate_id, engine)
     if not slate_players:
         raise ValueError(f"No players found in slate_player_pool for slate {source_slate_id}")
 
     gsis_by_dk_id, unmatched, ambiguous = resolve_dk_players_to_gsis(slate_players, engine)
     crosswalk_excluded = set(unmatched) | set(ambiguous)
 
-    actual_points, _ = _load_actual_scores(slate_players, season, week, engine)
+    actual_points, _ = load_actual_scores(slate_players, season, week, engine)
     asof_points = _asof_projected_points(slate_players, gsis_by_dk_id, season, week, engine)
 
     # A lineup can only be built from players we could both have projected

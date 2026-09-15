@@ -96,3 +96,21 @@ CREATE INDEX IF NOT EXISTS idx_actuals_slate_id
 
 CREATE INDEX IF NOT EXISTS idx_actuals_contest_id
     ON actuals (contest_id);
+
+-- One row per backtested (season, week) - see models/calibration.py. Stored
+-- per-position/per-week counts (not just an already-averaged MAE) so weeks
+-- can be pooled correctly afterward: sum(mae * n) / sum(n), not a naive
+-- average-of-per-week-averages that would equal-weight a 5-player week the
+-- same as a 300-player week. Same reasoning for p80_hits/p80_opportunities.
+CREATE TABLE IF NOT EXISTS calibration_weekly (
+    season                  INTEGER NOT NULL,
+    week                    INTEGER NOT NULL,
+    num_players_evaluated   INTEGER NOT NULL,
+    mae_by_position         JSONB,
+    p80_hits                INTEGER,
+    p80_opportunities       INTEGER,
+    avg_field_percentile    NUMERIC(5, 4),
+    field_size              INTEGER,
+    computed_at             TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (season, week)
+);
