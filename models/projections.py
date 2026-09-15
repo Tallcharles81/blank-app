@@ -4,15 +4,14 @@ from collections import defaultdict
 
 from sqlalchemy import text
 
+from data.player_crosswalk import resolve_dk_players_to_gsis
 from db.migrate import get_engine
 
-# KNOWN GAP: player_weekly_stats.player_id is now populated by
-# data/nflverse_fetch.py with nflverse's GSIS IDs (e.g. "00-0034857"), which do
-# NOT match slate_player_pool.player_id's DraftKings numeric IDs (e.g.
-# "44132656") - confirmed, not assumed; there is no published GSIS<->DK
-# crosswalk. Until that's resolved (name+team matching is the standard
-# approach), _load_recent_stats() below will find zero history for every
-# DK-sourced player_id, since the join key literally can't match.
+# player_weekly_stats.player_id is nflverse's GSIS ID (e.g. "00-0034857"), which
+# does not match slate_player_pool.player_id's DraftKings numeric ID (e.g.
+# "44132656") - there is no published GSIS<->DK crosswalk, so
+# generate_projections() below resolves DK player_ids to GSIS ids by name+
+# position via data/player_crosswalk.py before querying player_weekly_stats.
 
 MAX_HISTORY_WEEKS = 10
 MIN_GAMES_FOR_OWN_VARIANCE = 3
@@ -101,11 +100,12 @@ def generate_projections(slate_id, engine=None):
 
     with engine.connect() as conn:
         players = conn.execute(
-            text("SELECT player_id, position FROM slate_player_pool WHERE slate_id = :slate_id"),
+            text("SELECT player_id, name, position FROM slate_player_pool WHERE slate_id = :slate_id"),
             {"slate_id": slate_id},
         ).mappings().fetchall()
 
-    history_by_player = _load_recent_stats([p["player_id"] for p in players], engine)
+    gsis_by_dk_id, unmatched, ambiguous = resolve_dk_players_to_gsis(players, engine)
+    history_by_gsis = _load_recent_stats(gsis_by_dk_id.values(), engine)
 
     upsert_sql = text(
         """
@@ -127,7 +127,8 @@ def generate_projections(slate_id, engine=None):
     skipped_no_history = []
     with engine.begin() as conn:
         for player in players:
-            games = history_by_player.get(player["player_id"])
+            gsis_id = gsis_by_dk_id.get(player["player_id"])
+            games = history_by_gsis.get(gsis_id) if gsis_id else None
             if not games:
                 skipped_no_history.append(player["player_id"])
                 continue
@@ -145,7 +146,7 @@ def generate_projections(slate_id, engine=None):
             )
             projected += 1
 
-    return projected, skipped_no_history
+    return projected, skipped_no_history, ambiguous
 
 
 def lock_projections(slate_id, engine=None):
