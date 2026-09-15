@@ -28,6 +28,9 @@ GAME_INFO_RE = re.compile(
     r"(?P<time>\d{1,2}:\d{2}(?:AM|PM))\s+ET$"
 )
 
+# DK's "Game Info" times are always ET but never say which offset (EST/EDT), and
+# game_time is stored as TIMESTAMPTZ, so attach the zone explicitly rather than
+# storing a naive datetime that would be misinterpreted as UTC or local server time.
 EASTERN = ZoneInfo("America/New_York")
 
 
@@ -42,6 +45,10 @@ def parse_game_info(game_info):
 
 
 def _find_header_row(rows):
+    # DK's real contest-export CSVs put the player pool to the right of the
+    # entry-template columns (e.g. 10 blank leading fields for a Classic slate's
+    # "QB,RB,RB,WR,WR,WR,TE,FLEX,DST,," row), so the header isn't at column 0 -
+    # search for it at any offset instead of assuming a fixed column.
     header_len = len(PLAYER_POOL_HEADER)
     for i, row in enumerate(rows):
         for offset in range(len(row) - header_len + 1):
@@ -51,6 +58,10 @@ def _find_header_row(rows):
 
 
 def _detect_slate_type(rows, header_idx):
+    # The player-pool header itself is identical for Classic and Showdown slates;
+    # the roster shape only shows up in the entry-template row above it (e.g.
+    # "QB,RB,RB,WR,WR,WR,TE,FLEX,DST" vs "CPT,FLEX,FLEX,FLEX,FLEX,FLEX"), so scan
+    # the rows before the header rather than the header row or the player data.
     preamble = "\n".join(",".join(row) for row in rows[:header_idx])
     if ",".join(SHOWDOWN_ROSTER) in preamble or re.search(r"\bCPT\b", preamble):
         return "showdown"

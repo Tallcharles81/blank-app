@@ -23,6 +23,9 @@ def get_engine() -> Engine:
 def run_migrations(engine: Engine | None = None) -> None:
     engine = engine or get_engine()
     schema_sql = SCHEMA_PATH.read_text()
+    # Use the raw DBAPI connection instead of engine.execute(text(...)): SQLAlchemy
+    # always passes a parameters dict to psycopg2, which then tries to %-interpolate
+    # the literal "%" characters in schema.sql's RAISE EXCEPTION message and fails.
     raw_conn = engine.raw_connection()
     try:
         with raw_conn.cursor() as cur:
