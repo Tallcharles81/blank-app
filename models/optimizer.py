@@ -22,10 +22,14 @@ def _load_player_pool(slate_id, projection_field, engine):
         raise ValueError(f"projection_field must be one of {sorted(ALLOWED_PROJECTION_FIELDS)}")
     # projection_field is checked against the fixed whitelist above before use, so
     # it's safe to interpolate here - column names can't be passed as bind params.
+    # proj_floor/proj_ceiling are always fetched alongside whichever field
+    # drives the main objective, not just the one field - generate_cash_lineups
+    # below needs both to build its variance-penalized objective.
     query = text(
         f"""
         SELECT p.player_id, p.name, p.position, p.salary, p.team,
-               proj.{projection_field} AS points
+               proj.{projection_field} AS points,
+               proj.proj_floor, proj.proj_ceiling
         FROM slate_player_pool p
         JOIN projections proj
             ON proj.slate_id = p.slate_id AND proj.player_id = p.player_id
@@ -36,7 +40,15 @@ def _load_player_pool(slate_id, projection_field, engine):
         rows = conn.execute(query, {"slate_id": slate_id}).mappings().fetchall()
     # proj.* columns are NUMERIC in Postgres, so psycopg2 returns Decimal - PuLP's
     # LpAffineExpression only accepts float/int coefficients and errors on Decimal.
-    players = [{**dict(row), "points": float(row["points"])} for row in rows]
+    players = [
+        {
+            **dict(row),
+            "points": float(row["points"]),
+            "proj_floor": float(row["proj_floor"]),
+            "proj_ceiling": float(row["proj_ceiling"]),
+        }
+        for row in rows
+    ]
 
     # Hard blocker, not opt-in: a live slate's player pool is never handed to
     # the solver without checking current roster/injury status first. Refusing
@@ -58,7 +70,7 @@ def _load_player_pool(slate_id, projection_field, engine):
     return available_players, excluded, injury_report_available
 
 
-def _apply_common_constraints(prob, x, players, locked_ids, excluded_ids, max_players_per_team):
+def _apply_common_constraints(prob, x, players, locked_ids, excluded_ids, max_players_per_team, min_salary=None):
     for pid in locked_ids or []:
         if pid in x:
             prob += x[pid] == 1
@@ -72,6 +84,14 @@ def _apply_common_constraints(prob, x, players, locked_ids, excluded_ids, max_pl
                 pulp.lpSum(x[p["player_id"]] for p in players if p["team"] == team)
                 <= max_players_per_team
             )
+    if min_salary:
+        # Without this, a risk-averse objective (see generate_cash_lineups) can
+        # rationally prefer leaving salary unspent over rostering an expensive
+        # player whose upside also brings volatility - caught for real: an
+        # early cash-mode run left $17k of a $50k cap unused, filling slots
+        # with zero-projection scrubs instead, since a guaranteed zero has
+        # zero spread too. This forces the solver to still spend real budget.
+        prob += pulp.lpSum(x[p["player_id"]] * p["salary"] for p in players) >= min_salary
 
 
 def _apply_diversity_constraints(prob, x, previous_lineups, min_uniques, roster_size):
@@ -89,7 +109,9 @@ def _solve(prob):
         raise ValueError("No feasible lineup found for the given constraints")
 
 
-def _solve_classic(players, salary_cap, locked_ids, excluded_ids, max_players_per_team, previous_lineups, min_uniques):
+def _solve_classic(
+    players, salary_cap, locked_ids, excluded_ids, max_players_per_team, previous_lineups, min_uniques, min_salary=None
+):
     prob = pulp.LpProblem("dfs_classic", pulp.LpMaximize)
     x = {p["player_id"]: pulp.LpVariable(f"x_{p['player_id']}", cat="Binary") for p in players}
 
@@ -111,7 +133,7 @@ def _solve_classic(players, salary_cap, locked_ids, excluded_ids, max_players_pe
         == sum(CLASSIC_POSITION_MINIMUMS[pos] for pos in CLASSIC_FLEX_ELIGIBLE) + 1
     )
 
-    _apply_common_constraints(prob, x, players, locked_ids, excluded_ids, max_players_per_team)
+    _apply_common_constraints(prob, x, players, locked_ids, excluded_ids, max_players_per_team, min_salary)
     _apply_diversity_constraints(prob, x, previous_lineups, min_uniques, CLASSIC_ROSTER_SIZE)
 
     _solve(prob)
@@ -135,7 +157,9 @@ def _assign_classic_slots(selected):
     return slots
 
 
-def _solve_showdown(players, salary_cap, locked_ids, excluded_ids, max_players_per_team, previous_lineups, min_uniques):
+def _solve_showdown(
+    players, salary_cap, locked_ids, excluded_ids, max_players_per_team, previous_lineups, min_uniques, min_salary=None
+):
     prob = pulp.LpProblem("dfs_showdown", pulp.LpMaximize)
     x = {p["player_id"]: pulp.LpVariable(f"x_{p['player_id']}", cat="Binary") for p in players}
 
@@ -156,7 +180,7 @@ def _solve_showdown(players, salary_cap, locked_ids, excluded_ids, max_players_p
         if len(rows) > 1:
             prob += pulp.lpSum(x[p["player_id"]] for p in rows) <= 1
 
-    _apply_common_constraints(prob, x, players, locked_ids, excluded_ids, max_players_per_team)
+    _apply_common_constraints(prob, x, players, locked_ids, excluded_ids, max_players_per_team, min_salary)
     _apply_diversity_constraints(prob, x, previous_lineups, min_uniques, SHOWDOWN_ROSTER_SIZE)
 
     _solve(prob)
@@ -187,6 +211,7 @@ def build_lineups_from_pool(
     min_uniques=1,
     max_exposure=None,
     min_exposure=None,
+    min_salary=None,
 ):
     """Core multi-lineup builder, operating on an in-memory player pool (dicts
     with player_id/name/position/salary/team/points) instead of loading from
@@ -263,6 +288,7 @@ def build_lineups_from_pool(
                 max_players_per_team,
                 previous_lineups,
                 min_uniques,
+                min_salary,
             )
         except ValueError:
             if i == 0:
@@ -321,7 +347,12 @@ def generate_lineups(
         min_exposure=min_exposure,
     )
 
-    availability_report = {
+    availability_report = _build_availability_report(players, availability_excluded, injury_report_available)
+    return lineups, exposure_report, availability_report
+
+
+def _build_availability_report(players, availability_excluded, injury_report_available):
+    return {
         # Hard-excluded before the solver ever saw them - see
         # data/player_availability.py. {dk_player_id: reason}.
         "excluded": availability_excluded,
@@ -334,6 +365,74 @@ def generate_lineups(
         # are unaffected either way.
         "injury_report_available": injury_report_available,
     }
+
+
+def generate_cash_lineups(
+    slate_id,
+    num_lineups=1,
+    risk_aversion=1.0,
+    salary_cap=SALARY_CAP,
+    min_salary_fraction=0.95,
+    locked_player_ids=None,
+    excluded_player_ids=None,
+    max_players_per_team=3,
+    min_uniques=1,
+    engine=None,
+):
+    """Cash-mode lineup builder with an explicit variance penalty, not just a
+    different projection field.
+
+    The solver is a linear MILP (PuLP/CBC) - it can't optimize true lineup
+    variance directly, since that needs the covariance between every pair of
+    rostered players (a quadratic term). Instead, each player's own
+    (ceiling - floor) spread is used as a linear proxy for how much risk they
+    add, and the objective becomes:
+
+        maximize  sum(floor_i * x_i) - risk_aversion * sum((ceiling_i - floor_i) * x_i)
+
+    which rewards floor and directly punishes width in the same pass, instead
+    of just picking a safer percentile to maximize and hoping the width comes
+    along for the ride. max_players_per_team defaults to 3 here (vs.
+    unrestricted for GPP) since a same-team stack raises correlated bust risk,
+    which cash mode should avoid by default.
+
+    min_salary_fraction (as a fraction of salary_cap) is not optional padding -
+    without it, this objective can rationally leave real cap unspent rather
+    than pay for an expensive-but-volatile player, and a guaranteed-zero
+    player has zero spread too, so nothing stops the solver from filling
+    slots with worthless $2,500 scrubs instead. Caught for real on the first
+    run: risk_aversion=1.0 with no salary floor left $17,200 of a $50,000 cap
+    unused, rostering four zero-projection players. min_salary_fraction=0.95
+    forces the solver to still spend real budget while it searches for the
+    lowest-variance combination.
+
+    lineup['total_points'] on the results is the real sum of proj_floor (what
+    you'd actually expect), not the risk-adjusted objective value used
+    internally to pick the roster.
+    """
+    engine = engine or get_engine()
+    players, availability_excluded, injury_report_available = _load_player_pool(slate_id, "proj_floor", engine)
+    if not players:
+        raise ValueError(f"No players with a 'proj_floor' projection found for slate {slate_id}")
+
+    for p in players:
+        p["points"] = p["proj_floor"] - risk_aversion * (p["proj_ceiling"] - p["proj_floor"])
+
+    lineups, exposure_report = build_lineups_from_pool(
+        players,
+        num_lineups=num_lineups,
+        salary_cap=salary_cap,
+        min_salary=min_salary_fraction * salary_cap if min_salary_fraction else None,
+        locked_player_ids=locked_player_ids,
+        excluded_player_ids=excluded_player_ids,
+        max_players_per_team=max_players_per_team,
+        min_uniques=min_uniques,
+    )
+    # Report the real floor sum, not the risk-adjusted solver objective.
+    for lu in lineups:
+        lu["total_points"] = sum(p["proj_floor"] for _, p in lu["roster"])
+
+    availability_report = _build_availability_report(players, availability_excluded, injury_report_available)
     return lineups, exposure_report, availability_report
 
 
