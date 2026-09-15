@@ -24,6 +24,10 @@ CREATE TABLE IF NOT EXISTS player_weekly_stats (
     PRIMARY KEY (player_id, season, week)
 );
 
+-- Added for the nflverse injuries fetch (data/nflverse_fetch.py) - the official
+-- weekly report status (e.g. "Out", "Questionable"), not the full injury detail.
+ALTER TABLE player_weekly_stats ADD COLUMN IF NOT EXISTS injury_status TEXT;
+
 CREATE INDEX IF NOT EXISTS idx_player_weekly_stats_season_week
     ON player_weekly_stats (season, week);
 

@@ -6,11 +6,13 @@ from sqlalchemy import text
 
 from db.migrate import get_engine
 
-# NOTE: this assumes player_weekly_stats.player_id uses the same DK numeric ID
-# scheme as slate_player_pool.player_id. There's no fetch script populating
-# player_weekly_stats yet - whatever pulls that historical data from an external
-# source (nflfastR, an NFL stats API, etc.) will need to resolve players to DK
-# IDs (by name + team) before inserting, since those sources use their own IDs.
+# KNOWN GAP: player_weekly_stats.player_id is now populated by
+# data/nflverse_fetch.py with nflverse's GSIS IDs (e.g. "00-0034857"), which do
+# NOT match slate_player_pool.player_id's DraftKings numeric IDs (e.g.
+# "44132656") - confirmed, not assumed; there is no published GSIS<->DK
+# crosswalk. Until that's resolved (name+team matching is the standard
+# approach), _load_recent_stats() below will find zero history for every
+# DK-sourced player_id, since the join key literally can't match.
 
 MAX_HISTORY_WEEKS = 10
 MIN_GAMES_FOR_OWN_VARIANCE = 3
