@@ -157,10 +157,9 @@ def _resolve_exposure(spec, player_id):
     return spec
 
 
-def generate_lineups(
-    slate_id,
+def build_lineups_from_pool(
+    players,
     num_lineups=1,
-    projection_field="proj_median",
     salary_cap=SALARY_CAP,
     locked_player_ids=None,
     excluded_player_ids=None,
@@ -168,9 +167,14 @@ def generate_lineups(
     min_uniques=1,
     max_exposure=None,
     min_exposure=None,
-    engine=None,
 ):
-    """max_exposure/min_exposure: None, a single fraction (0-1) applied to every
+    """Core multi-lineup builder, operating on an in-memory player pool (dicts
+    with player_id/name/position/salary/team/points) instead of loading from
+    the DB - shared by generate_lineups() (points from the projections table)
+    and models/backtest.py (points from as-of projections or real actual
+    scores computed in Python, never written to the DB at all).
+
+    max_exposure/min_exposure: None, a single fraction (0-1) applied to every
     player, or {player_id: fraction, "default": fraction}.
 
     Returns (lineups, exposure_report) where exposure_report is
@@ -179,10 +183,8 @@ def generate_lineups(
     the caps made later lineups infeasible (see the ValueError handling
     below); the report is what lets a caller notice that happened.
     """
-    engine = engine or get_engine()
-    players = _load_player_pool(slate_id, projection_field, engine)
     if not players:
-        raise ValueError(f"No players with a '{projection_field}' projection found for slate {slate_id}")
+        raise ValueError("No players in the given pool")
 
     slate_type = "showdown" if any(p["position"] == "CPT" for p in players) else "classic"
     solve_fn = _solve_showdown if slate_type == "showdown" else _solve_classic
@@ -267,6 +269,36 @@ def generate_lineups(
     }
 
     return lineups, exposure_report
+
+
+def generate_lineups(
+    slate_id,
+    num_lineups=1,
+    projection_field="proj_median",
+    salary_cap=SALARY_CAP,
+    locked_player_ids=None,
+    excluded_player_ids=None,
+    max_players_per_team=None,
+    min_uniques=1,
+    max_exposure=None,
+    min_exposure=None,
+    engine=None,
+):
+    engine = engine or get_engine()
+    players = _load_player_pool(slate_id, projection_field, engine)
+    if not players:
+        raise ValueError(f"No players with a '{projection_field}' projection found for slate {slate_id}")
+    return build_lineups_from_pool(
+        players,
+        num_lineups=num_lineups,
+        salary_cap=salary_cap,
+        locked_player_ids=locked_player_ids,
+        excluded_player_ids=excluded_player_ids,
+        max_players_per_team=max_players_per_team,
+        min_uniques=min_uniques,
+        max_exposure=max_exposure,
+        min_exposure=min_exposure,
+    )
 
 
 def lineup_player_ids(lineup):

@@ -35,12 +35,24 @@ PERCENTILE_Z = {"10": -1.2816, "25": -0.6745, "50": 0.0, "75": 0.6745, "90": 1.2
 CEILING_Z_BOOST = 0.3
 
 
-def _load_recent_stats(player_ids, engine, max_weeks=MAX_HISTORY_WEEKS):
+def _load_recent_stats(player_ids, engine, max_weeks=MAX_HISTORY_WEEKS, before=None):
     # A single windowed query instead of one query per player - RANK gives each
     # player's own games a recency rank so we can cap history length per player
     # without N+1 round trips for a slate of hundreds of players.
+    #
+    # `before`, an optional (season, week) cutoff, exists for backtesting
+    # (models/backtest.py): without it, "recent" always means the most recent
+    # data in the table, which for a past week under test would include that
+    # week itself and everything after it - lookahead bias that would make a
+    # backtest meaningless (projecting a week partly from its own result).
+    cutoff_sql = ""
+    params = {"player_ids": list(player_ids), "max_weeks": max_weeks}
+    if before is not None:
+        cutoff_sql = "AND (season < :before_season OR (season = :before_season AND week < :before_week))"
+        params["before_season"], params["before_week"] = before
+
     query = text(
-        """
+        f"""
         SELECT player_id, fantasy_points_ppr, recency_rank FROM (
             SELECT player_id, fantasy_points_ppr,
                    ROW_NUMBER() OVER (
@@ -48,12 +60,13 @@ def _load_recent_stats(player_ids, engine, max_weeks=MAX_HISTORY_WEEKS):
                    ) AS recency_rank
             FROM player_weekly_stats
             WHERE player_id = ANY(:player_ids) AND fantasy_points_ppr IS NOT NULL
+            {cutoff_sql}
         ) ranked
         WHERE recency_rank <= :max_weeks
         """
     )
     with engine.connect() as conn:
-        rows = conn.execute(query, {"player_ids": list(player_ids), "max_weeks": max_weeks}).fetchall()
+        rows = conn.execute(query, params).fetchall()
 
     by_player = defaultdict(list)
     for row in rows:
