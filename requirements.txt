@@ -3,4 +3,5 @@ numpy
 requests
 flask
 psycopg2-binary
+sqlalchemy
 python-dotenv
