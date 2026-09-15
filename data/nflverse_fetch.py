@@ -14,22 +14,31 @@ NFLVERSE_RELEASE_BASE = "https://github.com/nflverse/nflverse-data/releases/down
 REQUEST_TIMEOUT_SECONDS = 60
 
 # Confirmed by hand against https://github.com/nflverse/nflverse-data/releases
-# before writing this module (nflverse has renamed/retired release tags before,
-# e.g. the legacy "player_stats" naming stops at 2022 in favor of per-season
-# files under the same tag - these are the tags/filenames that actually exist
-# today, not assumed ones):
-#   - player_stats/player_stats_{season}.csv.gz  (weekly, REG+POST, gsis_id-keyed)
-#   - snap_counts/snap_counts_{season}.csv.gz    (weekly, pfr_player_id-keyed)
-#   - injuries/injuries_{season}.csv.gz          (weekly, gsis_id-keyed)
-#   - players/players.csv.gz                     (single file, gsis_id<->pfr_id crosswalk)
-#   - schedules/games.csv.gz                     (single all-seasons file - note the
+# before writing this module (nflverse has renamed/retired release tags before) -
+# these are the tags/filenames that actually exist today, not assumed ones:
+#   - stats_player/stats_player_week_{season}.csv.gz  (weekly, REG+POST, gsis_id-keyed)
+#   - snap_counts/snap_counts_{season}.csv.gz         (weekly, pfr_player_id-keyed)
+#   - injuries/injuries_{season}.csv.gz               (weekly, gsis_id-keyed)
+#   - players/players.csv.gz                          (single file, gsis_id<->pfr_id crosswalk)
+#   - schedules/games.csv.gz                          (single all-seasons file - note the
 #     asset is named "games.csv.gz", not "schedules.csv.gz", despite the tag name)
-#   - stats_team/stats_team_week_{season}.csv.gz (weekly, team-keyed; not visible
+#   - stats_team/stats_team_week_{season}.csv.gz      (weekly, team-keyed; not visible
 #     in the release page's own asset listing, confirmed by direct download)
-#   - pbp/play_by_play_{season}.csv.gz           (weekly play-by-play, ~370 columns)
-# A given season's file may simply not exist yet (e.g. player_stats has no 2025/2026
-# release as of writing, since nflfastR can't compute weekly stats for games that
-# haven't been played) - callers must treat a 404 as "skip this season", not an error.
+#   - pbp/play_by_play_{season}.csv.gz                (weekly play-by-play, ~370 columns)
+#
+# stats_player_week is the CURRENT source (confirmed against nflreadr's own R
+# source for load_player_stats() at github.com/nflverse/nflreadr, not just the
+# release page). The legacy "player_stats" tag - what an earlier version of
+# this file used - stops at 2024 entirely and does NOT get new seasons; the
+# gap that looked like "nflverse hasn't published 2025/2026 skill-position
+# data yet" was actually us reading the wrong (retired) tag. This was only
+# caught by checking nflreadr's real source rather than trusting the release
+# page's own asset listing, which silently truncates on long asset lists and
+# had previously produced a false "no stats_player_week files exist" reading.
+#
+# A given season's file may still simply not exist yet for other tags/reasons
+# (e.g. a season with no games played) - callers must treat a 404 as "skip
+# this season", not an error.
 
 
 def _download_csv(tag, filename, usecols=None):
@@ -73,9 +82,9 @@ def _fetch_per_season(tag, filename_template, seasons, usecols=None):
 
 
 def fetch_player_stats(seasons):
-    frames = _fetch_per_season("player_stats", "player_stats_{season}.csv.gz", seasons)
+    frames = _fetch_per_season("stats_player", "stats_player_week_{season}.csv.gz", seasons)
     if not frames:
-        raise RuntimeError(f"No player_stats data could be fetched for any of seasons {seasons}")
+        raise RuntimeError(f"No stats_player_week data could be fetched for any of seasons {seasons}")
     df = pd.concat(frames, ignore_index=True)
     # "week" numbering restarts each season_type (REG week 1 and POST week 1 both
     # exist), which would collide with player_weekly_stats' (player_id, season,
@@ -404,13 +413,13 @@ def refresh_player_weekly_stats(seasons, engine=None):
     rows_by_season = {}
     for row in stats_df.itertuples():
         key = (row.player_id, row.season, row.week)
-        team_key = (row.recent_team, row.season, row.week)
+        team_key = (row.team, row.season, row.week)
         rows_by_season.setdefault(row.season, []).append(
             {
                 "player_id": row.player_id,
                 "player_name": row.player_display_name,
                 "position": row.position,
-                "team": row.recent_team,
+                "team": row.team,
                 "season": row.season,
                 "week": row.week,
                 "targets": _nan_to_none(row.targets),
