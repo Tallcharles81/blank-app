@@ -4,6 +4,8 @@ from collections import defaultdict
 
 from sqlalchemy import text
 
+from data.nflverse_fetch import fetch_team_implied_totals
+from data.player_availability import resolve_slate_season_week
 from data.player_crosswalk import resolve_dk_players_to_gsis
 from db.migrate import get_engine
 
@@ -42,6 +44,28 @@ PERCENTILE_Z = {"10": -1.2816, "25": -0.6745, "50": 0.0, "75": 0.6745, "90": 1.2
 # distribution predicts) - nudge percentiles above the median up to reflect that,
 # and leave the median/below alone since busts are bounded near zero anyway.
 CEILING_Z_BOOST = 0.3
+
+# Real, current-week Vegas lines (spread_line/total_line, via
+# data/nflverse_fetch.py's fetch_team_implied_totals) were being fetched and
+# stored in player_weekly_stats.vegas_implied_total this whole time but never
+# actually read by anything in this module - a real signal sitting unused. A
+# team's implied point total is a standard, well-established correlate of
+# offensive ceiling outcomes (more expected plays and scoring in a real
+# projected shootout, fewer in a real projected defensive grind) - applied
+# here ONLY to the ceiling-side percentiles (75th/90th, i.e. proj_ceiling),
+# never floor/median, matching "a shootout raises the boom-game upside" more
+# precisely than "a shootout raises the median outcome," which isn't the same
+# claim. Scaled off the GAP between this player's own team's implied total
+# and the field's average for the week, not the raw number, so an average-
+# implied-total player's ceiling is unaffected either way.
+#
+# NOT YET backtested - unlike models/matchups.py's TE adjustment, which only
+# shipped after clearing a real paired-significance test, this coefficient is
+# a deliberately modest, honestly-disclosed starting point, not a validated
+# one. Treat it the same way matchups.py treats its own LOW-confidence
+# adjustment: real, plausible, not yet proven - revisit with a real backtest
+# (models/calibration.py) before trusting the exact magnitude.
+GAME_ENVIRONMENT_CEILING_BOOST_PER_POINT = 0.015
 
 
 def _real_week_sequence(engine):
@@ -187,6 +211,26 @@ def _project_from_history(games, position):
     }
 
 
+def _apply_game_environment_adjustment(proj, implied_total, league_average_implied_total):
+    """Nudge only the ceiling-side percentiles (PERCENTILE_Z labels with
+    z > 0 - "75"/"90", i.e. proj_ceiling) by the real gap between this
+    player's team's current-week Vegas-implied total and the week's average
+    implied total across the whole slate - a positive gap (a real projected
+    shootout) scales the ceiling up, a negative one (a real projected
+    grind) scales it down, and a team sitting exactly at the week's average
+    is left unchanged. floor/median are untouched - see
+    GAME_ENVIRONMENT_CEILING_BOOST_PER_POINT for why this is ceiling-only
+    and not yet backtested.
+    """
+    gap = implied_total - league_average_implied_total
+    multiplier = max(1.0 + GAME_ENVIRONMENT_CEILING_BOOST_PER_POINT * gap, 0.0)
+    adjusted_percentiles = dict(proj["proj_percentiles"])
+    for label, z in PERCENTILE_Z.items():
+        if z > 0:
+            adjusted_percentiles[label] = round(adjusted_percentiles[label] * multiplier, 2)
+    return {**proj, "proj_ceiling": adjusted_percentiles["90"], "proj_percentiles": adjusted_percentiles}
+
+
 def generate_projections(slate_id, engine=None):
     engine = engine or get_engine()
 
@@ -198,6 +242,24 @@ def generate_projections(slate_id, engine=None):
 
     gsis_by_dk_id, unmatched, ambiguous = resolve_dk_players_to_gsis(players, engine)
     history_by_gsis = _load_recent_stats(gsis_by_dk_id.values(), engine)
+
+    # Real, current-week game-environment signal (see
+    # GAME_ENVIRONMENT_CEILING_BOOST_PER_POINT) - best-effort per this
+    # project's convention of wrapping external-data fetches in try/except:
+    # projections generating successfully matters far more than this one
+    # adjustment, so a fetch failure or a week with no posted lines yet
+    # (empty dict back, not an error - see fetch_team_implied_totals) just
+    # skips the adjustment rather than blocking projections entirely.
+    implied_totals_by_team = {}
+    try:
+        season_week = resolve_slate_season_week(slate_id, engine)
+        if season_week is not None:
+            implied_totals_by_team = fetch_team_implied_totals(*season_week)
+    except Exception:
+        implied_totals_by_team = {}
+    league_average_implied_total = (
+        sum(implied_totals_by_team.values()) / len(implied_totals_by_team) if implied_totals_by_team else None
+    )
 
     upsert_sql = text(
         """
@@ -225,6 +287,9 @@ def generate_projections(slate_id, engine=None):
                 skipped_no_history.append(player["player_id"])
                 continue
             proj = _project_from_history(games, player["position"])
+            implied_total = implied_totals_by_team.get(player["team"])
+            if implied_total is not None and league_average_implied_total is not None:
+                proj = _apply_game_environment_adjustment(proj, implied_total, league_average_implied_total)
             conn.execute(
                 upsert_sql,
                 {

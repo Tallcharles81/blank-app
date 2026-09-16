@@ -268,6 +268,20 @@ def _team_implied_totals(schedules_df):
     return {(row.team, row.season, row.week): row.implied_total for row in combined.itertuples()}
 
 
+def fetch_team_implied_totals(season, week):
+    """Real Vegas-derived implied point total per team for one (season, week)
+    - {team: implied_total}. Public wrapper around _team_implied_totals for
+    callers outside this module (models/projections.py's game-environment
+    ceiling adjustment) that only care about a single current week, not the
+    full multi-season index _team_implied_totals returns. Confirmed real
+    lines exist for future, not-yet-played weeks too (spread_line/total_line
+    are posted well before kickoff) - an empty dict back means this
+    specific week genuinely has no posted lines yet, not a fetch failure.
+    """
+    totals_by_key = _team_implied_totals(fetch_schedules())
+    return {team: total for (team, s, w), total in totals_by_key.items() if s == season and w == week}
+
+
 def _clear_and_insert_season(conn, season, rows):
     # Delete-then-insert in the same transaction as the caller's `conn`, so a
     # failure partway through this season's insert rolls back the delete too -
