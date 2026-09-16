@@ -249,6 +249,65 @@ def _dst_fantasy_points(team_row, points_allowed):
     return round(float(score), 2)
 
 
+# DraftKings' published Classic-contest offensive scoring, computed here from
+# raw nflverse box-score columns rather than trusted from nflverse's own
+# fantasy_points/fantasy_points_ppr columns - those were confirmed, by hand,
+# against real games (Puka Nacua's real 225-yard, 2-TD week 16 2025 game;
+# Joe Flacco's real 470-yard, 4-TD, 2-INT, 1-fumble-lost, 1-two-point-
+# conversion week 9 2025 game) to implement a GENERIC full-PPR formula, not
+# DK's real one: nflverse's stored value exactly matches 0.04/pass yd,
+# 4/pass TD, 0.1/rush-or-rec yd, 6/rush-or-rec TD, 1/reception, but
+# -2/interception and -2/fumble lost (DK is -1 for each) and NO 100/300-yard
+# bonuses at all (DK's real 100+ rushing/receiving and 300+ passing yardage
+# bonuses, +3 each, are entirely absent). Also separately confirmed real
+# offensive fumble-recovery TDs (Patrick Ricard, week 4 2024 - recovered his
+# own team's fumble for a TD, 0 rushing/receiving yards or TDs) score exactly
+# 0.0 in nflverse's own fantasy_points/fantasy_points_ppr - that scoring
+# category is missing from nflverse's formula entirely, not just discounted.
+# Every one of these gaps is real, not a rounding artifact - verified against
+# the actual raw stat lines before writing this, not assumed from a formula
+# description. special_teams_tds (a real punt/kickoff return TD) was the one
+# category confirmed to already be included correctly in nflverse's own
+# total (Xavier Gipson, week 1 2023 - 0 other stats, exactly 6.0 fantasy
+# points), included explicitly below anyway so this function is a complete,
+# self-contained, auditable computation rather than partially trusting a
+# black-box upstream total for one category and not the others.
+#
+# fumble_recovery_tds/special_teams_tds/rushing_tds/receiving_tds confirmed
+# non-overlapping (0 real rows across 2023-2025 with fumble_recovery_tds > 0
+# AND (rushing_tds > 0 or receiving_tds > 0) at once) - summing double-counts
+# nothing. fumbles_lost_total (not the sum of sack_fumbles_lost/rushing_
+# fumbles_lost/receiving_fumbles_lost) is used for DK's blanket "Fumble Lost"
+# penalty since 115 of 54,476 real 2023-2025 rows have a fumble lost that
+# isn't captured by those three specific sub-categories (a return/special-
+# teams fumble) - fumbles_lost_total is the real, complete figure.
+_HUNDRED_YARD_BONUS = 3
+_THREE_HUNDRED_YARD_PASSING_BONUS = 3
+
+
+def _skill_player_fantasy_points(row):
+    score = (
+        0.04 * row.passing_yards
+        + 4 * row.passing_tds
+        - 1 * row.passing_interceptions
+        + 0.1 * row.rushing_yards
+        + 6 * row.rushing_tds
+        + 0.1 * row.receiving_yards
+        + 6 * row.receiving_tds
+        + 1 * row.receptions
+        + 6 * (row.special_teams_tds + row.fumble_recovery_tds)
+        - 1 * row.fumbles_lost_total
+        + 2 * (row.passing_2pt_conversions + row.rushing_2pt_conversions + row.receiving_2pt_conversions)
+    )
+    if row.passing_yards >= 300:
+        score += _THREE_HUNDRED_YARD_PASSING_BONUS
+    if row.rushing_yards >= 100:
+        score += _HUNDRED_YARD_BONUS
+    if row.receiving_yards >= 100:
+        score += _HUNDRED_YARD_BONUS
+    return round(float(score), 2)
+
+
 def _team_implied_totals(schedules_df):
     # spread_line is the HOME team's favored margin (confirmed empirically: it
     # correlates positively with home_score - away_score across real games, not
@@ -466,7 +525,7 @@ def refresh_player_weekly_stats(seasons, engine=None):
                 "red_zone_carries": rz_carries_by_key.get(key, 0) if rz_carries_by_key is not None else None,
                 "rushing_yards": _nan_to_none(row.rushing_yards),
                 "receiving_yards": _nan_to_none(row.receiving_yards),
-                "fantasy_points_ppr": _nan_to_none(row.fantasy_points_ppr),
+                "fantasy_points_ppr": _skill_player_fantasy_points(row),
                 "opponent": row.opponent_team,
                 "snap_pct": _nan_to_none(snap_pct_by_key.get(key)),
                 "injury_status": _nan_to_none(injury_by_key.get(key)),
