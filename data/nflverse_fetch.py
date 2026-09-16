@@ -181,7 +181,9 @@ def fetch_pfr_def_advstats(seasons):
     # verification. This PFR data is real but still a charter's judgment call
     # about who was in coverage on a given target, not a verified per-play
     # assignment fact - models/matchups.py aggregates it to team level and
-    # labels every adjustment it produces MEDIUM confidence accordingly.
+    # labels adjustments built on it accordingly (see MATCHUP_CONFIDENCE
+    # there for the current scale and rating, which also depends on whether
+    # a given adjustment has cleared a real backtest, not just data provenance).
     frames = _fetch_per_season("pfr_advstats", "advstats_week_def_{season}.csv.gz", seasons)
     if not frames:
         raise RuntimeError(f"No pfr_advstats def data could be fetched for any of seasons {seasons}")

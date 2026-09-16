@@ -49,14 +49,36 @@ from models.calibration import _asof_projections, _available_weeks, _played_gsis
 #
 # Confidence scale used throughout this project's matchup adjustments (no
 # prior spec for this existed anywhere in this project's history - checked
-# the full session transcript, found nothing - so this is defined here):
+# the full session transcript, found nothing - so this is defined here).
+#
+# The first version of this scale graded only data PROVENANCE (how direct is
+# the source) and said nothing about VALIDATION (has this specific adjustment
+# actually been shown to help). That gap was real, not theoretical: under the
+# provenance-only version, WR and TE would have been labeled identically
+# MEDIUM before either was backtested, despite WR turning out harmful and TE
+# turning out marginal - the label carried no information about the thing
+# that mattered. Revised to require both:
 #   HIGH   - a confirmed, player-specific fact (e.g. an actual injury/role
-#            change reflected in real recent games).
-#   MEDIUM - a real signal that is indirect or aggregated rather than a
-#            confirmed one-on-one fact. Every adjustment this module produces
-#            is MEDIUM, never higher - see above for exactly why.
-#   LOW    - a small-sample or heavily-inferred signal.
-MATCHUP_CONFIDENCE = "MEDIUM"
+#            change reflected in real recent games). No validation step
+#            needed - the fact itself is the evidence.
+#   MEDIUM - a real, indirect/aggregated signal (not a confirmed one-on-one
+#            fact) that has ALSO cleared a real backtest: a statistically
+#            significant, cap/parameter-robust improvement - not a magnitude
+#            artifact of an untuned parameter (the bar WR failed) and not a
+#            coin-flip-level result (see LOW).
+#   LOW    - a real signal that hasn't cleared that bar yet: small-sample,
+#            heavily-inferred, untested, or backtested with a result that
+#            isn't statistically distinguishable from noise.
+#
+# TE is LOW, not MEDIUM: its backtested improvement (3.735 -> ~3.71 MAE) held
+# up across every FACTOR_CLAMP width tested (see run_matchup_backtest_
+# comparison), which ruled out "it's just an artifact of the cap" - but a
+# paired significance check on the same 1,762 adjusted player-weeks gave
+# t=1.93 (p=0.053, just short of significant) with a near-coin-flip 780
+# helped / 788 hurt split. Real signal, provenance is fine, but not yet
+# validated to the MEDIUM bar - kept opt-in only, not wired into the default
+# pipeline, pending a larger sample (more slates/seasons) before revisiting.
+MATCHUP_CONFIDENCE = "LOW"
 
 # Matches models/projections.py's own recency-decay half-life, for consistency.
 HALF_LIFE_WEEKS = 4
