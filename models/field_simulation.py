@@ -137,6 +137,7 @@ def run_field_simulation(
     num_simulations=DEFAULT_NUM_SIMULATIONS,
     seed=None,
     engine=None,
+    projection_field="proj_median",
 ):
     """Simulate a `contest_size`-lineup GPP field around `my_lineup` and score
     everyone against the SAME num_simulations simulated worlds (one call to
@@ -162,7 +163,7 @@ def run_field_simulation(
     sampling, not a separately asserted ownership number) so the sampling
     itself can be sanity-checked.
     """
-    players, _, _ = _load_player_pool(slate_id, "proj_median", engine=engine)
+    players, _, _ = _load_player_pool(slate_id, projection_field, engine=engine)
     opponents, failed_draws = generate_opponent_lineups(players, contest_size, concentration, seed)
     if not opponents:
         raise RuntimeError(f"Could not generate any feasible opponent lineups (all {contest_size} draws failed)")
@@ -316,6 +317,7 @@ def run_validation_comparison(
     num_simulations=DEFAULT_NUM_SIMULATIONS,
     seed=None,
     engine=None,
+    projection_field="proj_median",
 ):
     """The validation check this module needs before being trusted: build a
     chalk lineup and a similarly-projected contrarian lineup from the SAME
@@ -323,6 +325,13 @@ def run_validation_comparison(
     generate_opponent_lineups draw for both, so the field itself isn't a
     confound), and report win_pct/duplication_rate/total projection side by
     side.
+
+    projection_field picks what both the lineup-builders AND ownership_proxy
+    treat as "points" - default proj_median was this module's own original
+    synthetic test. Passing projection_field="proj_ceiling" instead builds
+    both lineups from the SAME field models/optimizer.generate_lineups uses
+    for real GPP mode, so this stops being a synthetic median-based stand-in
+    and starts testing the actual product's own construction logic.
 
     Ran this at the caller's `concentration` AND separately across a sweep
     (1/3/8/15/25) during development - see the module docstring's VALIDATION
@@ -338,7 +347,7 @@ def run_validation_comparison(
     report a single run's win_pct ordering as proof either way without
     checking avg_shared_players and the concentration it was run at.
     """
-    players, _, _ = _load_player_pool(slate_id, "proj_median", engine=engine)
+    players, _, _ = _load_player_pool(slate_id, projection_field, engine=engine)
     raw_points_by_id = {p["player_id"]: p["points"] for p in players}
 
     chalk = build_chalk_lineup(players)
@@ -347,9 +356,11 @@ def run_validation_comparison(
         players, chalk_projection
     )
 
-    chalk_result = run_field_simulation(chalk, slate_id, contest_size, concentration, num_simulations, seed, engine)
+    chalk_result = run_field_simulation(
+        chalk, slate_id, contest_size, concentration, num_simulations, seed, engine, projection_field
+    )
     contrarian_result = run_field_simulation(
-        contrarian, slate_id, contest_size, concentration, num_simulations, seed, engine
+        contrarian, slate_id, contest_size, concentration, num_simulations, seed, engine, projection_field
     )
 
     chalk_result["total_median_projection"] = round(chalk_projection, 2)

@@ -69,11 +69,15 @@ def load_actual_scores(slate_players, season, week, engine):
     return scores, excluded_ids
 
 
-def _asof_projected_points(slate_players, gsis_by_dk_id, season, week, engine):
+def _asof_projected_points(slate_players, gsis_by_dk_id, season, week, engine, field="proj_median"):
     # Same recency-weighted model as models/projections.py, just restricted to
     # history strictly before (season, week) - see _load_recent_stats's
     # `before` param - so this can't see the very outcome it's being
-    # backtested against.
+    # backtested against. `field` selects which of _project_from_history's
+    # three outputs (proj_floor/proj_median/proj_ceiling) drives the lineup -
+    # models/calibration.py's run_gpp_ceiling_backtest uses proj_ceiling here,
+    # the same field real GPP-mode lineups (models/optimizer.generate_lineups)
+    # are built from.
     history = _load_recent_stats(gsis_by_dk_id.values(), engine, before=(season, week))
 
     points_by_dk_id = {}
@@ -82,7 +86,7 @@ def _asof_projected_points(slate_players, gsis_by_dk_id, season, week, engine):
         games = history.get(gsis_id) if gsis_id else None
         if not games:
             continue
-        points_by_dk_id[player["player_id"]] = _project_from_history(games, player["position"])["proj_median"]
+        points_by_dk_id[player["player_id"]] = _project_from_history(games, player["position"])[field]
     return points_by_dk_id
 
 

@@ -6,7 +6,7 @@ from sqlalchemy import text
 
 from data.player_crosswalk import resolve_dk_players_to_gsis
 from db.migrate import get_engine
-from models.backtest import DEFAULT_RANDOM_FIELD_SIZE, load_actual_scores, load_slate_pool
+from models.backtest import DEFAULT_RANDOM_FIELD_SIZE, _asof_projected_points, load_actual_scores, load_slate_pool
 from models.optimizer import SALARY_CAP, build_lineups_from_pool
 from models.projections import _load_recent_stats, _project_from_history
 
@@ -287,3 +287,108 @@ def summarize_calibration(seasons=None, engine=None):
         "worst_week": {"season": worst[0], "week": worst[1], "avg_field_percentile": worst[2]} if worst else None,
         "best_week": {"season": best[0], "week": best[1], "avg_field_percentile": best[2]} if best else None,
     }
+
+
+def run_gpp_ceiling_backtest(source_slate_id, seasons=None, random_field_size=DEFAULT_RANDOM_FIELD_SIZE, engine=None):
+    """The GPP equivalent of the projection engine's own P80 calibration
+    check, applied to whole lineups instead of individual players: build the
+    as-of proj_ceiling-optimized lineup for every real historical week (the
+    same field real GPP-mode lineups use - see
+    models/optimizer.generate_lineups), score it against that week's real
+    actual results, and rank it against a real random-legal-lineup field
+    (same technique as models/backtest.py's backtest_slate) scored on the
+    same real outcomes.
+
+    A random lineup finishes in the top 20% of a random field exactly 20% of
+    the time by construction - that's the baseline. If the ceiling-optimized
+    lineup is doing what it claims, its top-20%-finish rate should be
+    meaningfully ABOVE 20%. Also builds the as-of proj_median lineup for the
+    same weeks as a same-methodology comparison point (not pulled from the
+    separately-computed calibration_weekly table, to keep this apples-to-
+    apples on identical weeks/field draws).
+
+    Returns (weekly_results, summary). Never writes to any table - a
+    diagnostic, not a stored calibration.
+    """
+    engine = engine or get_engine()
+
+    slate_players = load_slate_pool(source_slate_id, engine)
+    if not slate_players:
+        raise ValueError(f"No players found in slate_player_pool for slate {source_slate_id}")
+    gsis_by_dk_id, _, _ = resolve_dk_players_to_gsis(slate_players, engine)
+
+    weeks = _available_weeks(engine)
+    if seasons is not None:
+        weeks = [(s, w) for s, w in weeks if s in seasons]
+
+    rng = random.Random()
+    weekly_results = []
+    skipped = []
+
+    for season, week in weeks:
+        actual_points, _ = load_actual_scores(slate_players, season, week, engine)
+        ceiling_points = _asof_projected_points(slate_players, gsis_by_dk_id, season, week, engine, field="proj_ceiling")
+        median_points = _asof_projected_points(slate_players, gsis_by_dk_id, season, week, engine, field="proj_median")
+
+        eligible_ids = set(actual_points) & set(ceiling_points) & set(median_points)
+        if not eligible_ids:
+            skipped.append((season, week))
+            continue
+        eligible_players = [p for p in slate_players if p["player_id"] in eligible_ids]
+
+        def score_actual(roster):
+            return sum(actual_points[p["player_id"]] for _, p in roster)
+
+        field_scores = []
+        for _ in range(random_field_size):
+            randomized_pool = [{**p, "points": rng.random()} for p in eligible_players]
+            try:
+                field_lineup, _ = build_lineups_from_pool(randomized_pool, num_lineups=1, salary_cap=SALARY_CAP)
+            except ValueError:
+                continue
+            field_scores.append(score_actual(field_lineup[0]["roster"]))
+        if not field_scores:
+            skipped.append((season, week))
+            continue
+
+        def build_and_rank(points_by_id):
+            pool = [{**p, "points": points_by_id[p["player_id"]]} for p in eligible_players]
+            try:
+                lineups, _ = build_lineups_from_pool(pool, num_lineups=1, salary_cap=SALARY_CAP)
+            except ValueError:
+                return None
+            actual = score_actual(lineups[0]["roster"])
+            better_than = sum(1 for s in field_scores if actual > s)
+            return round(better_than / len(field_scores), 4)
+
+        ceiling_percentile = build_and_rank(ceiling_points)
+        median_percentile = build_and_rank(median_points)
+        if ceiling_percentile is None or median_percentile is None:
+            skipped.append((season, week))
+            continue
+
+        weekly_results.append(
+            {
+                "season": season,
+                "week": week,
+                "ceiling_field_percentile": ceiling_percentile,
+                "median_field_percentile": median_percentile,
+                "ceiling_top20": ceiling_percentile >= 0.80,
+                "field_size": len(field_scores),
+            }
+        )
+
+    n = len(weekly_results)
+    ceiling_top20_rate = round(sum(1 for r in weekly_results if r["ceiling_top20"]) / n, 4) if n else None
+    avg_ceiling_percentile = round(sum(r["ceiling_field_percentile"] for r in weekly_results) / n, 4) if n else None
+    avg_median_percentile = round(sum(r["median_field_percentile"] for r in weekly_results) / n, 4) if n else None
+
+    summary = {
+        "weeks_evaluated": n,
+        "skipped_weeks": skipped,
+        "ceiling_top20_finish_rate": ceiling_top20_rate,
+        "baseline_random_top20_rate": 0.20,
+        "avg_ceiling_lineup_field_percentile": avg_ceiling_percentile,
+        "avg_median_lineup_field_percentile": avg_median_percentile,
+    }
+    return weekly_results, summary
