@@ -12,6 +12,7 @@ from data.ownership_calibration import (
     import_contest_standings,
     parse_contest_standings_csv,
     run_ownership_correlation_test,
+    summarize_ownership_calibration,
 )
 
 # Real player identities already loaded for dk_thu_mon_2026_09_17 (with real
@@ -308,3 +309,40 @@ def test_analyze_qb_ownership_gap_runs_on_real_contest_and_reports_every_categor
     assert "clean_starter" in summary
     assert "intermittent_backup_pattern" in summary
     assert summary["intermittent_backup_pattern"]["mean_rank_diff"] < summary["clean_starter"]["mean_rank_diff"]
+
+
+# --- summarize_ownership_calibration ---------------------------------------
+
+
+def test_summarize_ownership_calibration_reports_per_contest_not_pooled(engine, imported_contest):
+    with engine.begin() as conn:
+        conn.execute(text("DELETE FROM ownership_calibration_runs WHERE contest_id = :c"), {"c": TEST_CONTEST_ID})
+    run_ownership_correlation_test(TEST_CONTEST_ID, slate_id="dk_thu_mon_2026_09_17", engine=engine, store=True)
+
+    result = summarize_ownership_calibration(engine=engine)
+    assert "proj_median" in result
+    proj_basis = result["proj_median"]
+
+    contest_ids = {c["contest_id"] for c in proj_basis["contests"]}
+    assert TEST_CONTEST_ID in contest_ids
+    # Per-contest rows must be individually present, not collapsed into one
+    # blended number - the whole point of this function over a naive pooled
+    # correlation across contests that may share the same real slate.
+    test_entry = next(c for c in proj_basis["contests"] if c["contest_id"] == TEST_CONTEST_ID)
+    assert test_entry["n_matched"] == 3  # this fixture's tiny 3-player matched-with-projection sample
+    assert test_entry["spearman_rho"] is None  # below MIN_MATCHED_PLAYERS_FOR_CORRELATION, correctly reported as such
+
+
+def test_summarize_ownership_calibration_flags_shared_slate_ids(engine):
+    # Uses the real permanently-imported contests 193028208/193028210 (both
+    # on dk_thu_mon_2026_09_17) - same real-fixture-dependency pattern as
+    # the other tests above that rely on this session's real imported data.
+    result = summarize_ownership_calibration(engine=engine)
+    proj_basis = result["proj_median"]
+    real_contests = [c for c in proj_basis["contests"] if c["contest_id"] in ("193028208", "193028210")]
+    assert len(real_contests) == 2
+    # Both real contests share the same real slate_id - distinct_slate_ids_with_data
+    # must reflect that they are NOT independent weeks, not silently count them as two.
+    slate_ids = {c["slate_id"] for c in real_contests}
+    assert len(slate_ids) == 1
+    assert proj_basis["distinct_slate_ids_with_data"] < proj_basis["n_contests_with_data"]

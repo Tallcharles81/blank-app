@@ -670,3 +670,68 @@ def analyze_qb_ownership_gap(contest_id, slate_id=None, engine=None):
     }
 
     return {"qbs": qb_results, "summary_by_starter_certainty": summary_by_starter_certainty}
+
+
+def summarize_ownership_calibration(engine=None):
+    """The real, cross-contest aggregate picture ownership_calibration_runs
+    exists for - every stored run, grouped by proxy_basis, WITHOUT
+    collapsing into one blended number. A pooled rho across contests that
+    share the same real slate_id would overstate independent replication:
+    two contests on the SAME slate/week share the exact same real
+    proj_median and real realized outcomes, so a match between them mostly
+    confirms the correlation is stable across different contest FIELDS on
+    one real slate, not that it holds across different real weeks - a
+    materially weaker claim. distinct_slate_ids_with_data (per basis) is
+    reported explicitly so that distinction is never silently lost when
+    this is read later.
+
+    Returns {basis: {"contests": [{"contest_id", "slate_id", "n_matched",
+    "spearman_rho", "mean_rank_diff_by_position" (proj_median/realized_fpts
+    bases only - full_sample doesn't carry the same per-contest comparison
+    weight), ...}], "distinct_slate_ids_with_data": int}}.
+    """
+    engine = engine or get_engine()
+    with engine.connect() as conn:
+        rows = conn.execute(
+            text(
+                """
+                SELECT contest_id, slate_id, n_matched, spearman_rho, p_value, proxy_basis, notes, run_at
+                FROM ownership_calibration_runs
+                ORDER BY proxy_basis, run_at
+                """
+            )
+        ).mappings().fetchall()
+
+    by_basis = defaultdict(list)
+    for r in rows:
+        by_basis[r["proxy_basis"]].append(dict(r))
+
+    result = {}
+    for basis, basis_rows in by_basis.items():
+        contests = []
+        slate_ids_with_data = set()
+        for r in basis_rows:
+            entry = {
+                "contest_id": r["contest_id"],
+                "slate_id": r["slate_id"],
+                "n_matched": r["n_matched"],
+                "spearman_rho": float(r["spearman_rho"]) if r["spearman_rho"] is not None else None,
+                "p_value": float(r["p_value"]) if r["p_value"] is not None else None,
+            }
+            if r["notes"]:
+                entry["mean_rank_diff_by_position"] = r["notes"].get("mean_rank_diff_by_position")
+            contests.append(entry)
+            if r["spearman_rho"] is not None and r["slate_id"]:
+                slate_ids_with_data.add(r["slate_id"])
+
+        rhos = [c["spearman_rho"] for c in contests if c["spearman_rho"] is not None]
+        result[basis] = {
+            "contests": contests,
+            "n_contests_with_data": len(rhos),
+            "distinct_slate_ids_with_data": len(slate_ids_with_data),
+            "rho_min": round(min(rhos), 4) if rhos else None,
+            "rho_max": round(max(rhos), 4) if rhos else None,
+            "rho_spread": round(max(rhos) - min(rhos), 4) if len(rhos) >= 2 else None,
+        }
+
+    return result
