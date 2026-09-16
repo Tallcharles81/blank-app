@@ -7,20 +7,46 @@ from db.migrate import get_engine
 
 DEFAULT_NUM_SIMULATIONS = 10000
 
-# Rule-based correlation assumptions for a single NFL game. We don't have enough
-# real joint (same-game, same-week) player outcome data yet to fit an empirical
-# correlation matrix, so these mirror well-known GPP stacking logic instead: a
-# QB correlates strongly with his own pass-catchers (they score off the same
-# completions), weakly/negatively with his own RB (competing for the same game
-# script), a bit with the rest of his team (shared pace/Vegas total), and a
-# "bring-back" correlation with the opposing pass-catchers in a shootout. A
-# defense anti-correlates with the opponent's offense scoring well. Replace
-# these with a fitted matrix once real historical joint data exists.
-QB_PASS_CATCHER_CORR = 0.55
-QB_RB_CORR = -0.05
-SAME_TEAM_CORR = 0.15
-BRING_BACK_CORR = 0.20
-DST_VS_OPPONENT_OFFENSE_CORR = -0.30
+# Real, empirically-fitted correlations - replaces an earlier hand-picked set
+# of well-known GPP-stacking rules of thumb ("QB correlates strongly (~0.55)
+# with his own pass-catchers... weakly/negatively (~-0.05) with his own RB...")
+# that were never actually fit to data, because at the time this module was
+# built there wasn't enough real joint (same-game, same-week) player outcome
+# data available to fit from. That data exists now - see
+# models/calibration.py::fit_real_correlation_matrix for the fitting function
+# (real Pearson correlation across every real (team, season, week) in
+# player_weekly_stats, restricted to players with meaningful usage -
+# target_share >= 0.10 or carries >= 5 - so the fit measures the same
+# population of "players who'd actually end up in a real generated lineup"
+# that this correlation matrix gets applied to, not deep-bench/garbage-time
+# noise). Several of the real numbers below are notably different from the
+# original hand-picked guesses, in both direction and size:
+#   - QB_PASS_CATCHER_CORR: guessed 0.55, real ~0.33 (n=5,249) - real,
+#     positive, and strong, but the hand-picked value overstated it.
+#   - QB_RB_CORR: guessed -0.05 (assumed competing game-script), real ~0.05
+#     (n=2,516) - near zero and, if anything, slightly POSITIVE: a QB's own
+#     RB's receiving work and shared positive game script outweigh any
+#     rush-vs-pass tradeoff in the real data.
+#   - SAME_TEAM_CORR: guessed 0.15 (assumed shared pace/Vegas total lifts
+#     everyone), real ~0.01 (n=16,222) - essentially zero. A real, offsetting
+#     effect was missing from the original assumption: teammates who aren't
+#     directly connected by a QB's throws are also competing for the same
+#     limited touches/targets, which cancels out most of the shared-total
+#     lift.
+#   - BRING_BACK_CORR: guessed 0.20, real ~0.09 (n=5,245) - real and
+#     positive (the shootout effect is real), but weaker than assumed.
+#   - DST_VS_OPPONENT_OFFENSE_CORR: guessed -0.30, real ~-0.51 (n=1,664) -
+#     real, negative, and considerably STRONGER than assumed: a defense
+#     suppressing its opponent's offensive scoring is a bigger real effect
+#     than the original guess gave it credit for.
+# All five real sample sizes clear MIN_PAIRS_FOR_FITTED_CORRELATION (200) by
+# a wide margin. Re-run fit_real_correlation_matrix() periodically as more
+# real seasons accumulate rather than treating these as permanently fixed.
+QB_PASS_CATCHER_CORR = 0.3284
+QB_RB_CORR = 0.0499
+SAME_TEAM_CORR = 0.0136
+BRING_BACK_CORR = 0.0872
+DST_VS_OPPONENT_OFFENSE_CORR = -0.5073
 
 PERCENTILE_POINTS = np.array([0.10, 0.25, 0.50, 0.75, 0.90])
 

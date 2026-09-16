@@ -733,3 +733,159 @@ def run_hard_exclude_backtest(source_slate_id, seasons=None, engine=None):
             for pos, scores in excluded_scores_by_position.items()
         },
     }
+
+
+# Real sample size floor for a fitted correlation to be trusted at all - below
+# this, a single unusual week could swing the number a lot. Mirrors
+# MIN_RECENT_GAMES_FOR_ROLE_CONFIDENCE's role elsewhere in this codebase: a
+# minimum, not a claim that more data wouldn't still help.
+MIN_PAIRS_FOR_FITTED_CORRELATION = 200
+
+# "Relevant" here filters out players with token/garbage-time usage before
+# computing a correlation - matches LOW_TARGET_SHARE_THRESHOLD/LOW_CARRIES_
+# PER_GAME_THRESHOLD's reasoning in data/pre_lock_check.py: a real generated
+# lineup only ever contains players who'd pass hard_role_exclusions in the
+# first place, so pooling in every 4th-string, near-zero-usage player here
+# would measure a different, less relevant population than what this
+# correlation matrix actually gets applied to at simulation time.
+FITTED_CORR_MIN_TARGET_SHARE = 0.10
+FITTED_CORR_MIN_CARRIES = 5
+
+
+def fit_real_correlation_matrix(seasons=None, engine=None):
+    """Real, empirically-fitted replacement for models/simulation.py's
+    hand-picked QB_PASS_CATCHER_CORR/QB_RB_CORR/SAME_TEAM_CORR/BRING_BACK_
+    CORR/DST_VS_OPPONENT_OFFENSE_CORR - see that module's docstring for why
+    those started as rule-of-thumb GPP-stacking assumptions rather than
+    fitted values ("we don't have enough real joint outcome data yet").
+    This is that fit, now that real multi-season player_weekly_stats data
+    (with a real `opponent` column per player-week) exists to compute it
+    from directly.
+
+    This is NOT a no-lookahead backtest the way run_hard_exclude_backtest
+    and run_game_environment_backtest_comparison above are - those evaluate
+    whether a DECISION RULE would have correctly predicted an outcome using
+    only data available beforehand, which lookahead bias would make
+    meaningless. A correlation matrix is different in kind: it's a fixed
+    structural property of how teammates'/opponents' real outcomes move
+    together, applied identically to every future week regardless of when
+    it was fit, not a per-week prediction that could leak future
+    information into an earlier decision. Same reasoning nflverse-derived
+    Vegas totals or any other static model parameter would get.
+
+    For every real (team, season, week) with exactly one QB who recorded
+    fantasy_points_ppr > 3 (filters out garbage-time/kneel-down backup
+    relief appearances that aren't a real joint-outcome sample), computes
+    real Pearson correlations across the whole real sample for:
+      - qb_pass_catcher: that QB vs each of his own team's relevant WR/TE
+      - qb_rb: that QB vs each of his own team's relevant RB
+      - same_team: relevant RB/WR/TE pairs on the same team, excluding the
+        QB (what SAME_TEAM_CORR covers in _player_correlation)
+      - bring_back: that QB vs the OPPOSING team's relevant WR/TE that same
+        week (uses player_weekly_stats.opponent)
+      - dst_vs_opponent_offense: each team's DST fantasy_points_ppr vs the
+        OPPOSING team's total real QB+RB+WR+TE fantasy_points_ppr that week
+
+    Returns {relationship: {"correlation": float, "sample_size": int}} -
+    caller decides what to do with a relationship whose sample_size is below
+    MIN_PAIRS_FOR_FITTED_CORRELATION (too little real data to trust yet).
+    """
+    engine = engine or get_engine()
+
+    query = text(
+        """
+        SELECT player_id, player_name, position, team, opponent, season, week,
+               fantasy_points_ppr, target_share, carries
+        FROM player_weekly_stats
+        WHERE fantasy_points_ppr IS NOT NULL AND position IN ('QB', 'RB', 'WR', 'TE', 'DST')
+        """
+        + (" AND season = ANY(:seasons)" if seasons is not None else "")
+    )
+    params = {"seasons": list(seasons)} if seasons is not None else {}
+    with engine.connect() as conn:
+        rows = [dict(r) for r in conn.execute(query, params).mappings().fetchall()]
+    for r in rows:
+        r["fantasy_points_ppr"] = float(r["fantasy_points_ppr"])
+
+    by_team_week = defaultdict(list)
+    for r in rows:
+        by_team_week[(r["team"], r["season"], r["week"])].append(r)
+
+    team_offense_total = {
+        key: sum(p["fantasy_points_ppr"] for p in plist if p["position"] in ("QB", "RB", "WR", "TE"))
+        for key, plist in by_team_week.items()
+    }
+
+    def is_relevant_pass_catcher(p):
+        return p["target_share"] is not None and float(p["target_share"]) >= FITTED_CORR_MIN_TARGET_SHARE
+
+    def is_relevant_rb(p):
+        return p["carries"] is not None and p["carries"] >= FITTED_CORR_MIN_CARRIES
+
+    pairs = {
+        "qb_pass_catcher": ([], []),
+        "qb_rb": ([], []),
+        "same_team": ([], []),
+        "bring_back": ([], []),
+        "dst_vs_opponent_offense": ([], []),
+    }
+
+    for (team, season, week), plist in by_team_week.items():
+        qbs = [p for p in plist if p["position"] == "QB" and p["fantasy_points_ppr"] and p["fantasy_points_ppr"] > 3]
+        if len(qbs) != 1:
+            continue
+        qb = qbs[0]
+        rbs = [p for p in plist if p["position"] == "RB" and is_relevant_rb(p)]
+        pass_catchers = [p for p in plist if p["position"] in ("WR", "TE") and is_relevant_pass_catcher(p)]
+        others = rbs + pass_catchers
+
+        for p in pass_catchers:
+            pairs["qb_pass_catcher"][0].append(qb["fantasy_points_ppr"])
+            pairs["qb_pass_catcher"][1].append(p["fantasy_points_ppr"])
+        for p in rbs:
+            pairs["qb_rb"][0].append(qb["fantasy_points_ppr"])
+            pairs["qb_rb"][1].append(p["fantasy_points_ppr"])
+        for i in range(len(others)):
+            for j in range(i + 1, len(others)):
+                pairs["same_team"][0].append(others[i]["fantasy_points_ppr"])
+                pairs["same_team"][1].append(others[j]["fantasy_points_ppr"])
+
+        opponent = qb.get("opponent")
+        if opponent:
+            opp_pass_catchers = [
+                p
+                for p in by_team_week.get((opponent, season, week), [])
+                if p["position"] in ("WR", "TE") and is_relevant_pass_catcher(p)
+            ]
+            for p in opp_pass_catchers:
+                pairs["bring_back"][0].append(qb["fantasy_points_ppr"])
+                pairs["bring_back"][1].append(p["fantasy_points_ppr"])
+
+    for (team, season, week), plist in by_team_week.items():
+        dsts = [p for p in plist if p["position"] == "DST"]
+        if not dsts:
+            continue
+        opponent = dsts[0].get("opponent")
+        opponent_total = team_offense_total.get((opponent, season, week)) if opponent else None
+        if opponent_total is None:
+            continue
+        pairs["dst_vs_opponent_offense"][0].append(dsts[0]["fantasy_points_ppr"])
+        pairs["dst_vs_opponent_offense"][1].append(opponent_total)
+
+    results = {}
+    for relationship, (xs, ys) in pairs.items():
+        n = len(xs)
+        if n < 2:
+            results[relationship] = {"correlation": None, "sample_size": n}
+            continue
+        mean_x, mean_y = sum(xs) / n, sum(ys) / n
+        cov = sum((x - mean_x) * (y - mean_y) for x, y in zip(xs, ys)) / (n - 1)
+        std_x = math.sqrt(sum((x - mean_x) ** 2 for x in xs) / (n - 1))
+        std_y = math.sqrt(sum((y - mean_y) ** 2 for y in ys) / (n - 1))
+        correlation = cov / (std_x * std_y) if std_x > 0 and std_y > 0 else None
+        results[relationship] = {
+            "correlation": round(correlation, 4) if correlation is not None else None,
+            "sample_size": n,
+        }
+
+    return results
