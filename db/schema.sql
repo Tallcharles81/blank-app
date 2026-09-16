@@ -143,3 +143,26 @@ CREATE TABLE IF NOT EXISTS team_pass_defense_weekly (
     def_receiving_td_allowed    INTEGER,
     PRIMARY KEY (team, season, week)
 );
+
+-- Durable record of pre-lock web-research checks (see data/pre_lock_check.py)
+-- - a second, independent check of injury news/inactive lists/weather in the
+-- hours before a slate locks, specifically for news that broke faster than
+-- the roster/injury data feeds (see data/player_availability.py) caught up
+-- to. This table is what makes a check's result auditable after the fact,
+-- not just a chat message that scrolls away - `contradicts_gate` is what a
+-- caller queries to find something that needs loud attention right now.
+CREATE TABLE IF NOT EXISTS pre_lock_checks (
+    id                  BIGSERIAL PRIMARY KEY,
+    slate_id            TEXT NOT NULL,
+    player_id           TEXT NOT NULL,
+    source              TEXT NOT NULL,
+    finding             TEXT NOT NULL,
+    gate_status_at_check TEXT,
+    contradicts_gate    BOOLEAN NOT NULL DEFAULT FALSE,
+    checked_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+    FOREIGN KEY (slate_id, player_id)
+        REFERENCES slate_player_pool (slate_id, player_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_pre_lock_checks_slate_id
+    ON pre_lock_checks (slate_id);
