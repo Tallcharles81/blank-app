@@ -59,12 +59,28 @@ CEILING_Z_BOOST = 0.3
 # and the field's average for the week, not the raw number, so an average-
 # implied-total player's ceiling is unaffected either way.
 #
-# NOT YET backtested - unlike models/matchups.py's TE adjustment, which only
-# shipped after clearing a real paired-significance test, this coefficient is
-# a deliberately modest, honestly-disclosed starting point, not a validated
-# one. Treat it the same way matchups.py treats its own LOW-confidence
-# adjustment: real, plausible, not yet proven - revisit with a real backtest
-# (models/calibration.py) before trusting the exact magnitude.
+# BACKTESTED (models/calibration.py::run_game_environment_backtest_comparison,
+# 54 real historical weeks, 14,547 real played player-weeks, split into
+# terciles by the real gap this coefficient scales on) - and the honest
+# result is a MIXED one, not a clean pass:
+#   - High-implied-total tercile (avg gap +4.16, real projected shootouts,
+#     n=4,818): baseline P90 hit rate 14.78% -> adjusted 12.72% - moves
+#     TOWARD the true 10% target, the intended direction, real effect
+#     (t=10.05, p<0.0001).
+#   - Low-implied-total tercile (avg gap -3.84, real projected grinds,
+#     n=4,818): baseline P90 hit rate 15.34% -> adjusted 16.92% - moves
+#     AWAY from the 10% target, the OPPOSITE of the intended direction,
+#     also a real, highly significant effect (t=-8.79, p<0.0001), not noise.
+# Conclusion: the upward (shootout) half of this adjustment is real and
+# working as designed; the downward (grind-game) half is backwards as
+# currently calibrated - lowering the ceiling bar for low-total games
+# over-corrects rather than improving calibration. Unlike models/
+# matchups.py's TE adjustment, which cleared its backtest before shipping,
+# this one shipped first and was backtested after - flagged here rather
+# than silently left as "validated" once the real result came back mixed.
+# The asymmetry is worth revisiting (e.g. a smaller or zero downward
+# coefficient) but hasn't been changed based on this result without it
+# being a separate, explicit decision.
 GAME_ENVIRONMENT_CEILING_BOOST_PER_POINT = 0.015
 
 

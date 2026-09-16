@@ -1,14 +1,23 @@
 import json
+import math
 import random
 from collections import defaultdict
 
 from sqlalchemy import text
 
+from data.nflverse_fetch import _team_implied_totals, fetch_schedules
 from data.player_crosswalk import resolve_dk_players_to_gsis
+from data.pre_lock_check import MIN_RECENT_GAMES_FOR_ROLE_CONFIDENCE, _load_recent_usage_batch, _would_be_hard_excluded
 from db.migrate import get_engine
 from models.backtest import DEFAULT_RANDOM_FIELD_SIZE, _asof_projected_points, load_actual_scores, load_slate_pool
 from models.optimizer import SALARY_CAP, build_lineups_from_pool
-from models.projections import _load_recent_stats, _project_from_history
+from models.projections import (
+    GAME_ENVIRONMENT_CEILING_BOOST_PER_POINT,
+    _apply_game_environment_adjustment,
+    _load_recent_stats,
+    _project_from_history,
+)
+from models.simulation import _standard_normal_cdf
 
 # The stored percentile ladder (models/projections.py's PERCENTILE_Z) has
 # 10/25/50/75/90 but not 20 or 80 directly - both interpolated between their
@@ -392,3 +401,335 @@ def run_gpp_ceiling_backtest(source_slate_id, seasons=None, random_field_size=DE
         "avg_median_lineup_field_percentile": avg_median_percentile,
     }
     return weekly_results, summary
+
+
+# ---------------------------------------------------------------------------
+# Backtests for two real additions that shipped tonight without ever being
+# run through this module - the Vegas ceiling adjustment
+# (models/projections.py) and the hard-exclude thresholds
+# (data/pre_lock_check.py). Both were reasoned through and spot-checked
+# against the live pool, which is a different, weaker claim than "validated
+# against real historical outcomes" - the standard models/matchups.py's TE
+# adjustment was held to before it shipped. These two functions apply that
+# same standard after the fact.
+#
+# Neither this project's requirements.txt nor any other module here depends
+# on scipy (see models/simulation.py's own hand-rolled erf-based normal
+# CDF, kept specifically to avoid that dependency) - _paired_significance/
+# _two_sample_significance below reuse that exact function rather than
+# duplicate it, and use a normal approximation to the t-distribution, which
+# is a reasonable approximation at the sample sizes (hundreds of real
+# player-weeks) these backtests actually produce.
+# ---------------------------------------------------------------------------
+
+
+def _paired_significance(differences):
+    """Two-tailed significance test for whether paired `differences` (e.g.
+    baseline_error - adjusted_error for the SAME player-week under both
+    conditions) has a nonzero mean. Returns (mean_diff, t_stat, p_value);
+    t_stat/p_value are None if there's too little data or zero variance to
+    say anything.
+    """
+    n = len(differences)
+    if n < 2:
+        return (differences[0] if differences else 0.0), None, None
+    mean_diff = sum(differences) / n
+    variance = sum((d - mean_diff) ** 2 for d in differences) / (n - 1)
+    stdev = math.sqrt(variance)
+    if stdev == 0:
+        return mean_diff, None, None
+    t_stat = mean_diff / (stdev / math.sqrt(n))
+    p_value = float(2 * (1 - _standard_normal_cdf(abs(t_stat))))
+    return mean_diff, t_stat, p_value
+
+
+def _two_sample_significance(group_a, group_b):
+    """Welch's t-test (unequal variance, normal approximation) for whether
+    two INDEPENDENT samples (e.g. would-be-excluded vs not-excluded
+    player-weeks - different players/weeks, not a paired comparison) have
+    different means. Returns (mean_a, mean_b, t_stat, p_value); the latter
+    two are None if either group has too little data or the pooled
+    variance is zero.
+    """
+    n_a, n_b = len(group_a), len(group_b)
+    mean_a = sum(group_a) / n_a if n_a else None
+    mean_b = sum(group_b) / n_b if n_b else None
+    if n_a < 2 or n_b < 2:
+        return mean_a, mean_b, None, None
+    var_a = sum((x - mean_a) ** 2 for x in group_a) / (n_a - 1)
+    var_b = sum((x - mean_b) ** 2 for x in group_b) / (n_b - 1)
+    se = math.sqrt(var_a / n_a + var_b / n_b)
+    if se == 0:
+        return mean_a, mean_b, None, None
+    t_stat = (mean_a - mean_b) / se
+    p_value = float(2 * (1 - _standard_normal_cdf(abs(t_stat))))
+    return mean_a, mean_b, t_stat, p_value
+
+
+def _teams_for_week(gsis_ids, season, week, engine):
+    # A player's CURRENT slate team can differ from their real team in a
+    # past backtested week after a trade - the same real issue
+    # models/matchups.py's _opponents_for_week already solves by pulling
+    # the real historical value per week rather than trusting the current
+    # slate's stored field. Vegas implied totals are team-specific, so
+    # using the wrong team for a traded player would silently test the
+    # adjustment against the wrong number.
+    query = text(
+        "SELECT player_id, team FROM player_weekly_stats WHERE player_id = ANY(:ids) AND season = :season AND week = :week"
+    )
+    with engine.connect() as conn:
+        rows = conn.execute(query, {"ids": list(gsis_ids), "season": season, "week": week}).fetchall()
+    return {row.player_id: row.team for row in rows}
+
+
+def run_game_environment_backtest_comparison(source_slate_id, seasons=None, engine=None):
+    """Does the Vegas ceiling adjustment (models/projections.py's
+    GAME_ENVIRONMENT_CEILING_BOOST_PER_POINT) improve real calibration
+    versus the unadjusted baseline, across every real historical week this
+    can be tested against? Mirrors models/matchups.py's
+    run_matchup_backtest_comparison methodology (same as-of/no-lookahead
+    pattern via _load_recent_stats(before=...), same played-only filter,
+    pooled + adjusted-only subset) so this is a fair before/after
+    comparison, not a new, incomparable test design.
+
+    The adjustment only touches the ceiling-side percentiles (see
+    _apply_game_environment_adjustment) - proj_ceiling is meant to be a
+    90th-percentile target, not a central-tendency point estimate, so the
+    metric here is the P90 HIT RATE (fraction of real actuals >=
+    proj_ceiling), which should sit near 10% for a well-calibrated target,
+    not MAE.
+
+    Player-weeks with a real implied total are split into terciles by
+    (implied_total - that week's league-average implied total) - the exact
+    quantity the adjustment scales on - to test the real, DIRECTIONAL
+    claim: in the highest tercile (real projected shootouts), does the
+    adjusted ceiling's P90 hit rate land closer to the true 10% target than
+    the unadjusted baseline? Symmetrically for the lowest tercile. A pooled
+    all-weeks number alone can hide this - a real effect in both tails can
+    still average out to "no difference" overall.
+
+    Returns a dict with pooled hit rates, tercile-level hit rates, and a
+    paired significance test on the per-player-week P90-hit indicator
+    (baseline - adjusted) within the top and bottom terciles. Never writes
+    anywhere - a diagnostic, like run_matchup_backtest_comparison.
+    """
+    engine = engine or get_engine()
+
+    slate_players = load_slate_pool(source_slate_id, engine)
+    if not slate_players:
+        raise ValueError(f"No players found in slate_player_pool for slate {source_slate_id}")
+    gsis_by_dk_id, _, _ = resolve_dk_players_to_gsis(slate_players, engine)
+    players_by_id = {p["player_id"]: p for p in slate_players}
+
+    weeks = _available_weeks(engine)
+    if seasons is not None:
+        weeks = [(s, w) for s, w in weeks if s in seasons]
+
+    # Fetched ONCE and filtered per week in Python below, not re-fetched
+    # inside the loop - real historical spread_line/total_line data for
+    # every season/week lives in the same schedules file, and this loop
+    # covers 50+ real weeks; re-downloading it that many times would be
+    # pure network waste for data that never changes within one run.
+    try:
+        implied_totals_by_team_season_week = _team_implied_totals(fetch_schedules())
+    except Exception:
+        implied_totals_by_team_season_week = {}
+
+    records = []  # (position, gap_or_None, baseline_hit, adjusted_hit)
+    weeks_evaluated = 0
+
+    for season, week in weeks:
+        history = _load_recent_stats(gsis_by_dk_id.values(), engine, before=(season, week))
+        actual_points, _ = load_actual_scores(slate_players, season, week, engine)
+        played_gsis_ids = _played_gsis_ids(gsis_by_dk_id.values(), season, week, engine)
+        teams_by_gsis = _teams_for_week(gsis_by_dk_id.values(), season, week, engine)
+
+        implied_totals_by_team = {
+            team: total
+            for (team, s, w), total in implied_totals_by_team_season_week.items()
+            if s == season and w == week
+        }
+        league_average = (
+            sum(implied_totals_by_team.values()) / len(implied_totals_by_team) if implied_totals_by_team else None
+        )
+
+        week_had_data = False
+        for dk_id, gsis_id in gsis_by_dk_id.items():
+            player = players_by_id.get(dk_id)
+            if player is None or dk_id not in actual_points:
+                continue
+            if player["position"] != "DST" and gsis_id not in played_gsis_ids:
+                continue
+            games = history.get(gsis_id)
+            if not games:
+                continue
+
+            proj = _project_from_history(games, player["position"])
+            actual = actual_points[dk_id]
+            baseline_hit = 1 if actual >= proj["proj_ceiling"] else 0
+
+            real_team = teams_by_gsis.get(gsis_id)
+            implied_total = implied_totals_by_team.get(real_team) if real_team else None
+            if implied_total is not None and league_average is not None:
+                adjusted = _apply_game_environment_adjustment(proj, implied_total, league_average)
+                gap = implied_total - league_average
+            else:
+                adjusted = proj
+                gap = None
+            adjusted_hit = 1 if actual >= adjusted["proj_ceiling"] else 0
+
+            records.append((player["position"], gap, baseline_hit, adjusted_hit))
+            week_had_data = True
+
+        if week_had_data:
+            weeks_evaluated += 1
+
+    if not records:
+        raise ValueError(f"No real player-weeks could be evaluated for slate {source_slate_id}")
+
+    def _hit_rate_summary(rows, hit_index):
+        hits = sum(r[hit_index] for r in rows)
+        return {"hits": hits, "opportunities": len(rows), "rate": round(hits / len(rows), 4) if rows else None}
+
+    with_gap = [r for r in records if r[1] is not None]
+    with_gap.sort(key=lambda r: r[1])
+    n = len(with_gap)
+    tercile_size = n // 3
+
+    result = {
+        "weeks_evaluated": weeks_evaluated,
+        "players_evaluated": len(records),
+        "players_with_real_implied_total": n,
+        "pooled": {
+            "baseline_p90_hit_rate": _hit_rate_summary(records, 2),
+            "adjusted_p90_hit_rate": _hit_rate_summary(records, 3),
+        },
+    }
+
+    if tercile_size >= 20:  # not worth reporting a tercile split on a tiny sample
+        low_tercile = with_gap[:tercile_size]
+        high_tercile = with_gap[-tercile_size:]
+        for label, tercile in (("low_implied_total_tercile", low_tercile), ("high_implied_total_tercile", high_tercile)):
+            baseline_diffs = [r[2] - r[3] for r in tercile]  # positive = baseline hit more than adjusted
+            mean_diff, t_stat, p_value = _paired_significance(baseline_diffs)
+            result[label] = {
+                "n": len(tercile),
+                "avg_gap": round(sum(r[1] for r in tercile) / len(tercile), 2),
+                "baseline_p90_hit_rate": _hit_rate_summary(tercile, 2),
+                "adjusted_p90_hit_rate": _hit_rate_summary(tercile, 3),
+                "baseline_minus_adjusted_hit_rate_diff": round(mean_diff, 4),
+                "t_stat": round(t_stat, 4) if t_stat is not None else None,
+                "p_value": round(p_value, 4) if p_value is not None else None,
+            }
+
+    return result
+
+
+# Roughly a usable FLEX/bench score at PPR scoring - the real cost of a
+# hard exclusion being wrong is a player who'd have been benched anyway
+# scoring nothing (no real cost) vs. one who goes on to have a genuinely
+# relevant real week despite the exclusion (a real cost). Not a precise
+# science - a round, defensible "this would have mattered" line.
+MEANINGFUL_SCORE_THRESHOLD = 8.0
+
+
+def run_hard_exclude_backtest(source_slate_id, seasons=None, engine=None):
+    """Does data/pre_lock_check.py's hard_role_exclusions criteria
+    (HARD_EXCLUDE_MAX_SNAP_PCT for RB/WR/TE, the MIN_SNAP_PCT_FOR_BENCHED/
+    MAX_SNAP_PCT_FOR_FULL_GAME pattern for QB) actually correspond to real
+    subsequent futility? For every real historical played player-week,
+    would_be_hard_excluded() is evaluated using ONLY data available
+    strictly before that week (see _load_recent_usage_batch's `before`),
+    then compared against what the player actually scored - the same
+    no-lookahead standard as every other backtest in this module.
+
+    A silent, permanent, hard exclusion is only defensible if the players
+    it would catch genuinely tend not to produce. Reports the real average
+    actual score for would-be-excluded vs not-excluded player-weeks (the
+    effect size), a two-sample significance test on that gap, and the
+    MISS RATE - the fraction of would-be-excluded player-weeks that
+    nonetheless scored above MEANINGFUL_SCORE_THRESHOLD real PPR points -
+    the real cost of this gate being wrong, which the average alone can
+    hide.
+    """
+    engine = engine or get_engine()
+
+    slate_players = load_slate_pool(source_slate_id, engine)
+    if not slate_players:
+        raise ValueError(f"No players found in slate_player_pool for slate {source_slate_id}")
+    non_dst_players = [p for p in slate_players if p["position"] != "DST"]
+    gsis_by_dk_id, _, _ = resolve_dk_players_to_gsis(non_dst_players, engine)
+    players_by_id = {p["player_id"]: p for p in non_dst_players}
+
+    weeks = _available_weeks(engine)
+    if seasons is not None:
+        weeks = [(s, w) for s, w in weeks if s in seasons]
+
+    excluded_scores = []
+    not_excluded_scores = []
+    excluded_scores_by_position = defaultdict(list)
+    weeks_evaluated = 0
+
+    for season, week in weeks:
+        games_by_gsis = _load_recent_usage_batch(gsis_by_dk_id.values(), engine, before=(season, week))
+        actual_points, _ = load_actual_scores(non_dst_players, season, week, engine)
+        played_gsis_ids = _played_gsis_ids(gsis_by_dk_id.values(), season, week, engine)
+
+        week_had_data = False
+        for dk_id, gsis_id in gsis_by_dk_id.items():
+            if dk_id not in actual_points or gsis_id not in played_gsis_ids:
+                continue
+            player = players_by_id[dk_id]
+            games = games_by_gsis.get(gsis_id, [])
+            if len(games) < MIN_RECENT_GAMES_FOR_ROLE_CONFIDENCE:
+                continue  # not enough as-of history to make this call either way - same as the live gate
+
+            is_excluded, _reason = _would_be_hard_excluded(player["position"], games)
+            actual = actual_points[dk_id]
+            if is_excluded:
+                excluded_scores.append(actual)
+                excluded_scores_by_position[player["position"]].append(actual)
+            else:
+                not_excluded_scores.append(actual)
+            week_had_data = True
+
+        if week_had_data:
+            weeks_evaluated += 1
+
+    if not excluded_scores:
+        raise ValueError(
+            f"No real player-weeks would have been hard-excluded for slate {source_slate_id} - "
+            "nothing to evaluate (this itself is worth knowing, not just an error)"
+        )
+
+    mean_excluded, mean_not_excluded, t_stat, p_value = _two_sample_significance(excluded_scores, not_excluded_scores)
+    misses = sum(1 for s in excluded_scores if s > MEANINGFUL_SCORE_THRESHOLD)
+
+    return {
+        "weeks_evaluated": weeks_evaluated,
+        "would_be_excluded_player_weeks": len(excluded_scores),
+        "not_excluded_player_weeks": len(not_excluded_scores),
+        "avg_actual_score_if_excluded": round(mean_excluded, 2) if mean_excluded is not None else None,
+        "avg_actual_score_if_not_excluded": round(mean_not_excluded, 2) if mean_not_excluded is not None else None,
+        "t_stat": round(t_stat, 4) if t_stat is not None else None,
+        "p_value": round(p_value, 4) if p_value is not None else None,
+        "meaningful_score_threshold": MEANINGFUL_SCORE_THRESHOLD,
+        "miss_rate": round(misses / len(excluded_scores), 4),
+        "misses": misses,
+        "avg_actual_score_if_excluded_by_position": {
+            pos: round(sum(scores) / len(scores), 2) for pos, scores in excluded_scores_by_position.items()
+        },
+        "would_be_excluded_count_by_position": {
+            pos: len(scores) for pos, scores in excluded_scores_by_position.items()
+        },
+        # Pooled miss_rate above blends positions with very different real
+        # exclusion criteria (RB/WR/TE: a volume floor claiming "no real
+        # role"; QB: an intermittent-starter pattern claiming "can't
+        # confirm who starts," a genuinely different, weaker claim) - a
+        # per-position breakdown is what actually shows whether either one
+        # is carrying the pooled number.
+        "miss_rate_by_position": {
+            pos: round(sum(1 for s in scores if s > MEANINGFUL_SCORE_THRESHOLD) / len(scores), 4)
+            for pos, scores in excluded_scores_by_position.items()
+        },
+    }

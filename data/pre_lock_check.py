@@ -133,7 +133,7 @@ SEVERITY_MEDIUM = "MEDIUM"
 SEVERITY_LOW = "LOW"
 
 
-def _load_recent_usage_batch(gsis_ids, engine, max_weeks=ROLE_CHECK_HISTORY_WEEKS):
+def _load_recent_usage_batch(gsis_ids, engine, max_weeks=ROLE_CHECK_HISTORY_WEEKS, before=None):
     """Recent player_weekly_stats usage rows for every id in gsis_ids, in one
     windowed query - the same pattern as models/projections.py's
     _load_recent_stats, and for the same reason: a per-player round trip is
@@ -142,23 +142,36 @@ def _load_recent_usage_batch(gsis_ids, engine, max_weeks=ROLE_CHECK_HISTORY_WEEK
     before the optimizer ever runs, where an N+1 query pattern would be a
     real cost, not just a style nit.
 
+    `before`, an optional (season, week) cutoff, exists for the same reason
+    it does in _load_recent_stats: models/calibration.py's hard-exclude
+    backtest needs to know what this function would have returned USING
+    ONLY DATA AVAILABLE STRICTLY BEFORE the week under test, or it would be
+    testing the rule against outcomes it could already see - lookahead bias
+    that would make the backtest meaningless.
+
     Returns {gsis_id: [games most-recent-first]}.
     """
+    cutoff_sql = ""
+    params = {"gsis_ids": list(gsis_ids), "max_weeks": max_weeks}
+    if before is not None:
+        cutoff_sql = "AND (season < :before_season OR (season = :before_season AND week < :before_week))"
+        params["before_season"], params["before_week"] = before
+
     query = text(
-        """
+        f"""
         SELECT player_id, season, week, position, snap_pct, target_share, carries, injury_status, recency_rank FROM (
             SELECT player_id, season, week, position, snap_pct, target_share, carries, injury_status,
                    ROW_NUMBER() OVER (
                        PARTITION BY player_id ORDER BY season DESC, week DESC
                    ) AS recency_rank
             FROM player_weekly_stats
-            WHERE player_id = ANY(:gsis_ids)
+            WHERE player_id = ANY(:gsis_ids) {cutoff_sql}
         ) ranked
         WHERE recency_rank <= :max_weeks
         """
     )
     with engine.connect() as conn:
-        rows = conn.execute(query, {"gsis_ids": list(gsis_ids), "max_weeks": max_weeks}).mappings().fetchall()
+        rows = conn.execute(query, params).mappings().fetchall()
 
     by_player = defaultdict(list)
     for row in rows:
@@ -371,6 +384,18 @@ def build_lineup_role_checklist(slate_id, player_ids, engine=None):
 # those stay correctly caught by the advisory, human-reviewed severity check
 # instead (see build_lineup_role_checklist), the right layer for a genuinely
 # borderline case, not a hard, silent block.
+#
+# BACKTESTED since (models/calibration.py::run_hard_exclude_backtest, 53 real
+# historical weeks, no-lookahead as-of evaluation): RB/WR/TE is strongly
+# validated as a real production-floor signal, not just a plausible-looking
+# live-pool spot check. 979 real RB/WR/TE player-weeks would have been
+# hard-excluded; they averaged 2.86 (RB) / 1.57 (WR) / 1.34 (TE) real PPR
+# points, versus 9.47 for everyone NOT excluded (t=-37.2, p<0.0001) - and the
+# MISS rate (a would-be-excluded player-week that nonetheless scored above
+# 8.0 real PPR points - the real cost of this gate being wrong) was low:
+# 9.4% (RB) / 4.8% (WR) / 4.6% (TE). This is what makes a hard, silent gate
+# defensible - see MIN_SNAP_PCT_FOR_BENCHED below for the QB result, which
+# is NOT this clean.
 HARD_EXCLUDE_MAX_SNAP_PCT = 0.25
 
 # QB needs a DIFFERENT signal entirely, not this same max-snap-pct rule: a
@@ -403,6 +428,25 @@ HARD_EXCLUDE_MAX_SNAP_PCT = 0.25
 # benched for (there's no "partial-share" version of starting QB the way a
 # WR2 can play a reduced route share) - that clean binary doesn't hold at
 # other positions, so this pattern check is QB-only.
+#
+# BACKTESTED since (models/calibration.py::run_hard_exclude_backtest, same
+# 53-week no-lookahead run as HARD_EXCLUDE_MAX_SNAP_PCT above) - and this
+# one is NOT clean the same way RB/WR/TE is. 141 real QB player-weeks would
+# have been hard-excluded; they averaged 9.06 real PPR points when they
+# happened (not "on average were near zero" - a real, usable-if-not-great
+# QB score), and the miss rate (scored above 8.0 real PPR points anyway)
+# was 46.8% - roughly a coin flip, nothing like RB/WR/TE's 4-9% miss rates.
+# This isn't actually a contradiction of what this check is FOR, though:
+# unlike the RB/WR/TE rule, which claims "this player has no real role,"
+# this rule claims "this codebase can't confirm who's starting" - an
+# intermittent backup who DOES get the start in a given week can
+# legitimately put up a normal QB score, and that's expected, not a sign
+# the pattern-detection itself is wrong. But a hard, silent gate is only
+# defensible when it's very rarely wrong in the case that matters (production),
+# and a coin-flip miss rate on real historical data is a genuinely weaker
+# case than RB/WR/TE's - flagged here plainly rather than left looking
+# equally validated. Not changed to advisory-only based on this result
+# without that being a separate, explicit decision.
 MIN_SNAP_PCT_FOR_BENCHED = 0.15
 MAX_SNAP_PCT_FOR_FULL_GAME = 0.85
 
@@ -474,23 +518,41 @@ def hard_role_exclusions(players, engine=None):
         if real_position is None:
             continue  # a Showdown pseudo-position row with no history to recover a real position from
 
-        snap_pcts = [float(g["snap_pct"]) for g in games if g["snap_pct"] is not None]
-        if len(snap_pcts) < MIN_RECENT_GAMES_FOR_ROLE_CONFIDENCE:
-            continue  # too little data to be confident it's genuinely zero/unclear role, not just unrecorded
-
-        if real_position == "QB":
-            if min(snap_pcts) < MIN_SNAP_PCT_FOR_BENCHED and max(snap_pcts) >= MAX_SNAP_PCT_FOR_FULL_GAME:
-                excluded[p["player_id"]] = (
-                    f"intermittent starter pattern in the last {len(snap_pcts)} recorded games "
-                    f"(snap share swings between {min(snap_pcts):.0%} and {max(snap_pcts):.0%}) - "
-                    "this is the real backup/spot-starter signature, not normal starter variance"
-                )
-        elif max(snap_pcts) < HARD_EXCLUDE_MAX_SNAP_PCT:
-            excluded[p["player_id"]] = (
-                f"no meaningful snap share in any of the last {len(snap_pcts)} recorded games "
-                f"(max {max(snap_pcts):.0%}) - no evidence of a real current role"
-            )
+        is_excluded, reason = _would_be_hard_excluded(real_position, games)
+        if is_excluded:
+            excluded[p["player_id"]] = reason
     return excluded
+
+
+def _would_be_hard_excluded(real_position, games):
+    """The exact per-player decision hard_role_exclusions makes, given a
+    real (not Showdown CPT/FLEX) position and that player's own recent
+    usage history - factored out so models/calibration.py's backtest can
+    apply this SAME rule against real historical data as-of each week
+    (see _load_recent_usage_batch's `before` param), rather than risk a
+    second, hand-copied implementation drifting out of sync with the one
+    actually wired into the optimizer. Returns (excluded: bool, reason:
+    str | None).
+    """
+    snap_pcts = [float(g["snap_pct"]) for g in games if g["snap_pct"] is not None]
+    if len(snap_pcts) < MIN_RECENT_GAMES_FOR_ROLE_CONFIDENCE:
+        return False, None  # too little data to be confident it's genuinely zero/unclear role, not just unrecorded
+
+    if real_position == "QB":
+        if min(snap_pcts) < MIN_SNAP_PCT_FOR_BENCHED and max(snap_pcts) >= MAX_SNAP_PCT_FOR_FULL_GAME:
+            return True, (
+                f"intermittent starter pattern in the last {len(snap_pcts)} recorded games "
+                f"(snap share swings between {min(snap_pcts):.0%} and {max(snap_pcts):.0%}) - "
+                "this is the real backup/spot-starter signature, not normal starter variance"
+            )
+        return False, None
+
+    if max(snap_pcts) < HARD_EXCLUDE_MAX_SNAP_PCT:
+        return True, (
+            f"no meaningful snap share in any of the last {len(snap_pcts)} recorded games "
+            f"(max {max(snap_pcts):.0%}) - no evidence of a real current role"
+        )
+    return False, None
 
 
 def build_pre_lock_checklist(slate_id, engine=None):
