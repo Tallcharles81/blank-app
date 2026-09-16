@@ -8,6 +8,7 @@ from data.dk_salary_csv import CLASSIC_ROSTER, SHOWDOWN_ROSTER
 from data.player_availability import game_lock_status, get_availability_gate, resolve_slate_season_week
 from data.pre_lock_check import hard_role_exclusions
 from db.migrate import get_engine
+from models.simulation import DEFAULT_NUM_SIMULATIONS, select_best_by_simulation
 
 SALARY_CAP = 50000
 CLASSIC_ROSTER_SIZE = len(CLASSIC_ROSTER)
@@ -692,6 +693,55 @@ def _build_availability_report(players, availability_excluded, injury_report_ava
         # are unaffected either way.
         "injury_report_available": injury_report_available,
     }
+
+
+def generate_simulation_selected_lineup(
+    slate_id,
+    num_candidates=10,
+    projection_field="proj_ceiling",
+    num_simulations=DEFAULT_NUM_SIMULATIONS,
+    seed=None,
+    engine=None,
+    **generate_lineups_kwargs,
+):
+    """The real selection layer this codebase's MILP-only path was missing:
+    build `num_candidates` diverse, legal GPP lineups the normal way (via
+    generate_lineups - same hard gates, same stacking), then rank them by
+    REAL SIMULATED win rate (models/simulation.py's correlation-aware
+    Monte Carlo engine) instead of just handing back whichever one
+    happened to have the highest raw linear-objective ceiling sum.
+
+    This is the actual mechanism a simulation-driven optimizer uses -
+    score correlated outcomes, then pick the lineup that wins the most
+    simulated worlds - applied as a selection step on top of the existing
+    MILP candidate pool rather than a full simulation-native rebuild of
+    the solver itself (which would need a quadratic objective CBC can't
+    solve). min_uniques defaults to 3 here specifically (overridable via
+    generate_lineups_kwargs) so the candidates represent meaningfully
+    different bets, not near-duplicates of the same core with one swap -
+    ranking near-identical lineups by simulation wouldn't tell you much.
+
+    Returns (ranked, exposure_report, availability_report) - ranked[0] is
+    the recommended lineup, with its real win_rate/mean_score/p10/p50/p90
+    attached (see select_best_by_simulation), not a black-box pick.
+    """
+    engine = engine or get_engine()
+    generate_lineups_kwargs.setdefault("min_uniques", 3)
+    lineups, exposure_report, availability_report = generate_lineups(
+        slate_id,
+        num_lineups=num_candidates,
+        projection_field=projection_field,
+        engine=engine,
+        **generate_lineups_kwargs,
+    )
+    if len(lineups) < 2:
+        raise ValueError(
+            f"Only {len(lineups)} legal candidate lineup(s) could be built for slate {slate_id} - "
+            "need at least 2 to rank by simulation (try a smaller min_uniques or max_exposure)"
+        )
+
+    ranked = select_best_by_simulation(lineups, slate_id, num_simulations=num_simulations, seed=seed, engine=engine)
+    return ranked, exposure_report, availability_report
 
 
 def generate_cash_lineups(

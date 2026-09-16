@@ -175,3 +175,55 @@ def win_rates(sim_results):
     winner_idx = np.argmax(stacked, axis=0)
     counts = np.bincount(winner_idx, minlength=len(sim_results))
     return [count / stacked.shape[1] for count in counts]
+
+
+def select_best_by_simulation(candidate_lineups, slate_id, num_simulations=DEFAULT_NUM_SIMULATIONS, seed=None, engine=None):
+    """Rank several already-built, already-legal candidate lineups by real
+    simulated relative win rate instead of raw linear-objective ceiling
+    sum - the actual selection mechanism a real simulation-driven
+    optimizer uses (score correlated outcomes, then pick whichever lineup
+    wins the most simulated worlds), layered on top of this codebase's
+    MILP-generated candidates rather than requiring a full simulation-
+    native rebuild of the optimizer itself.
+
+    Why this matters: models/optimizer.py's solver picks the single
+    highest-ceiling-sum roster under a LINEAR objective - it has no way to
+    directly compare two similarly-projected but differently-stacked
+    lineups on which one actually wins more often once real player
+    correlation is accounted for (that needs the quadratic/joint-outcome
+    reasoning a MILP can't do, which is exactly what simulate_lineups
+    already provides). This is the missing selection step: build a few
+    diverse legal candidates (e.g. via build_lineups_from_pool's
+    min_uniques diversity, so they're meaningfully different bets, not
+    near-duplicates), simulate them all against the SAME correlated
+    worlds, and let the real win rate - not the raw projection sum -
+    decide which one you actually enter.
+
+    `candidate_lineups` needs at least 2 entries - ranking a single lineup
+    against itself isn't a real selection. Returns candidates sorted
+    best-to-worst by win rate, each annotated with the real numbers the
+    ranking was based on (win_rate, mean_score, p10/p50/p90) - not a
+    silent re-order, so a caller can see why one lineup beat another.
+    """
+    if len(candidate_lineups) < 2:
+        raise ValueError(
+            f"Need at least 2 candidate lineups to rank by simulation, got {len(candidate_lineups)}"
+        )
+
+    sim_results = simulate_lineups(
+        candidate_lineups, slate_id, num_simulations=num_simulations, seed=seed, engine=engine
+    )
+    rates = win_rates(sim_results)
+
+    ranked = sorted(zip(candidate_lineups, sim_results, rates), key=lambda triple: triple[2], reverse=True)
+    return [
+        {
+            "lineup": lineup,
+            "win_rate": round(rate, 4),
+            "mean_score": round(result["mean_score"], 2),
+            "p10": round(result["p10"], 2),
+            "p50": round(result["p50"], 2),
+            "p90": round(result["p90"], 2),
+        }
+        for lineup, result, rate in ranked
+    ]
