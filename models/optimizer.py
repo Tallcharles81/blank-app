@@ -128,6 +128,46 @@ def _apply_diversity_constraints(prob, x, previous_lineups, min_uniques, roster_
         prob += pulp.lpSum(overlap_vars) <= roster_size - min_uniques
 
 
+def _apply_qb_stack_constraint(prob, x, players):
+    # Correlated ceiling outcomes are the actual mechanism by which a GPP
+    # lineup wins a tournament (see models/simulation.py's real correlation
+    # model - QB_PASS_CATCHER_CORR=0.55, the single strongest same-game
+    # correlation it encodes) - but until this existed, nothing in the
+    # solver's own objective knew that: it summed independent point
+    # estimates with no covariance term, so a ceiling-maximizing build had
+    # no reason to prefer a QB+pass-catcher combo over 9 unrelated high-
+    # ceiling players. Verified for real: 19 of 20 lineups from a fresh live
+    # GPP run had zero same-team QB+WR/TE pairing before this existed.
+    #
+    # PuLP/CBC only solves LINEAR programs - there's no way to directly
+    # optimize for the simulated correlation benefit itself inside the MILP
+    # (that would need a quadratic/covariance term). What IS linear and
+    # captures the same real, standard DFS construction principle: require
+    # at least one same-team WR/TE alongside whichever QB gets selected.
+    # For binary x, `sum(same-team pass catchers) >= x[qb]` is a standard
+    # linear implication - it's automatically satisfied when the QB isn't
+    # selected (x[qb]=0), and forces at least one pass-catcher in when he
+    # is (x[qb]=1).
+    #
+    # Skipped for a team with zero WR/TE candidates left in the pool (every
+    # one hard-excluded, or genuinely none on the slate) rather than forcing
+    # that QB to zero - an interaction with an unrelated gate shouldn't
+    # silently make an otherwise-legal QB unselectable.
+    by_team = defaultdict(lambda: {"qb": [], "pass_catchers": []})
+    for p in players:
+        if p["position"] == "QB":
+            by_team[p["team"]]["qb"].append(p["player_id"])
+        elif p["position"] in ("WR", "TE"):
+            by_team[p["team"]]["pass_catchers"].append(p["player_id"])
+
+    for team_players in by_team.values():
+        if not team_players["pass_catchers"]:
+            continue
+        pass_catcher_sum = pulp.lpSum(x[pid] for pid in team_players["pass_catchers"])
+        for qb_id in team_players["qb"]:
+            prob += pass_catcher_sum >= x[qb_id]
+
+
 def _solve(prob):
     prob.solve(pulp.PULP_CBC_CMD(msg=False))
     if pulp.LpStatus[prob.status] != "Optimal":
@@ -135,7 +175,15 @@ def _solve(prob):
 
 
 def _solve_classic(
-    players, salary_cap, locked_ids, excluded_ids, max_players_per_team, previous_lineups, min_uniques, min_salary=None
+    players,
+    salary_cap,
+    locked_ids,
+    excluded_ids,
+    max_players_per_team,
+    previous_lineups,
+    min_uniques,
+    min_salary=None,
+    require_qb_stack=False,
 ):
     prob = pulp.LpProblem("dfs_classic", pulp.LpMaximize)
     x = {p["player_id"]: pulp.LpVariable(f"x_{p['player_id']}", cat="Binary") for p in players}
@@ -160,6 +208,8 @@ def _solve_classic(
 
     _apply_common_constraints(prob, x, players, locked_ids, excluded_ids, max_players_per_team, min_salary)
     _apply_diversity_constraints(prob, x, previous_lineups, min_uniques, CLASSIC_ROSTER_SIZE)
+    if require_qb_stack:
+        _apply_qb_stack_constraint(prob, x, players)
 
     _solve(prob)
     selected = [p for p in players if x[p["player_id"]].value() == 1]
@@ -183,8 +233,24 @@ def _assign_classic_slots(selected):
 
 
 def _solve_showdown(
-    players, salary_cap, locked_ids, excluded_ids, max_players_per_team, previous_lineups, min_uniques, min_salary=None
+    players,
+    salary_cap,
+    locked_ids,
+    excluded_ids,
+    max_players_per_team,
+    previous_lineups,
+    min_uniques,
+    min_salary=None,
+    require_qb_stack=False,
 ):
+    # require_qb_stack is accepted (not just missing) so build_lineups_from_pool
+    # can call either solver with the same keyword args, but it's a no-op here:
+    # a showdown roster is only 6 players, all drawn from the SAME 2 teams in
+    # one game, so "stack the QB with a teammate" doesn't carve out a distinct
+    # correlated subset the way it does in a 9-player classic roster pulled
+    # from up to 8 different games - most showdown rosters already include a
+    # meaningful share of one team or the other by construction.
+    del require_qb_stack
     prob = pulp.LpProblem("dfs_showdown", pulp.LpMaximize)
     x = {p["player_id"]: pulp.LpVariable(f"x_{p['player_id']}", cat="Binary") for p in players}
 
@@ -237,6 +303,7 @@ def build_lineups_from_pool(
     max_exposure=None,
     min_exposure=None,
     min_salary=None,
+    require_qb_stack=False,
 ):
     """Core multi-lineup builder, operating on an in-memory player pool (dicts
     with player_id/name/position/salary/team/points) instead of loading from
@@ -246,6 +313,14 @@ def build_lineups_from_pool(
 
     max_exposure/min_exposure: None, a single fraction (0-1) applied to every
     player, or {player_id: fraction, "default": fraction}.
+
+    require_qb_stack: classic slates only (see _apply_qb_stack_constraint) -
+    require at least one same-team WR/TE alongside whichever QB is selected,
+    the correlation-aware construction real GPP play depends on. Defaults to
+    False here so every existing caller (models/backtest.py, calibration.py,
+    field_simulation.py all call this directly, not through generate_lineups)
+    keeps its already-validated behavior unchanged; generate_lineups()
+    defaults it to True instead, since that's the actual live GPP path.
 
     Returns (lineups, exposure_report) where exposure_report is
     {player_id: {"count": n, "fraction": n / lineups_actually_built}} - the
@@ -314,6 +389,7 @@ def build_lineups_from_pool(
                 previous_lineups,
                 min_uniques,
                 min_salary,
+                require_qb_stack,
             )
         except ValueError:
             if i == 0:
@@ -353,8 +429,20 @@ def generate_lineups(
     min_uniques=1,
     max_exposure=None,
     min_exposure=None,
+    require_qb_stack=True,
     engine=None,
 ):
+    """The live GPP-style lineup path (models/backtest.py, calibration.py,
+    and field_simulation.py all call build_lineups_from_pool directly for
+    their own validation runs, never through here - see that function's
+    docstring). require_qb_stack defaults to True here specifically because
+    this is the function real lineup generation actually goes through:
+    without it, the solver's objective has no covariance term at all and
+    has no reason to prefer a correlated QB+pass-catcher combo over 9
+    unrelated high-projection players, even though correlated ceiling
+    outcomes are the real mechanism a GPP lineup wins by (see
+    _apply_qb_stack_constraint). Pass False to opt back out.
+    """
     engine = engine or get_engine()
     players, availability_excluded, injury_report_available = _load_player_pool(slate_id, projection_field, engine)
     if not players:
@@ -370,6 +458,7 @@ def generate_lineups(
         min_uniques=min_uniques,
         max_exposure=max_exposure,
         min_exposure=min_exposure,
+        require_qb_stack=require_qb_stack,
     )
 
     availability_report = _build_availability_report(players, availability_excluded, injury_report_available)
