@@ -61,26 +61,28 @@ CEILING_Z_BOOST = 0.3
 #
 # BACKTESTED (models/calibration.py::run_game_environment_backtest_comparison,
 # 54 real historical weeks, 14,547 real played player-weeks, split into
-# terciles by the real gap this coefficient scales on) - and the honest
-# result is a MIXED one, not a clean pass:
+# terciles by the real gap this coefficient scales on). First version was
+# symmetric (also scaled ceiling DOWN for a below-average implied total)
+# and came back MIXED, not a clean pass:
 #   - High-implied-total tercile (avg gap +4.16, real projected shootouts,
-#     n=4,818): baseline P90 hit rate 14.78% -> adjusted 12.72% - moves
+#     n=4,818): baseline P90 hit rate 14.78% -> adjusted 12.72% - moved
 #     TOWARD the true 10% target, the intended direction, real effect
 #     (t=10.05, p<0.0001).
 #   - Low-implied-total tercile (avg gap -3.84, real projected grinds,
-#     n=4,818): baseline P90 hit rate 15.34% -> adjusted 16.92% - moves
+#     n=4,818): baseline P90 hit rate 15.34% -> adjusted 16.92% - moved
 #     AWAY from the 10% target, the OPPOSITE of the intended direction,
-#     also a real, highly significant effect (t=-8.79, p<0.0001), not noise.
-# Conclusion: the upward (shootout) half of this adjustment is real and
-# working as designed; the downward (grind-game) half is backwards as
-# currently calibrated - lowering the ceiling bar for low-total games
-# over-corrects rather than improving calibration. Unlike models/
+#     also real and highly significant (t=-8.79, p<0.0001), not noise.
+# Fixed to boost-only (see _apply_game_environment_adjustment: gap <= 0 is
+# now a no-op) based on that result, then RE-backtested to confirm rather
+# than assumed: low tercile now shows EXACTLY zero change (739/4818 hits
+# under both baseline and adjusted - no variance in the difference at all,
+# t_stat/p_value both None), high tercile keeps its same validated
+# improvement, and the pooled P90 hit rate improved too (15.33% -> 14.56%,
+# closer to the true 10% target than before the fix). Unlike models/
 # matchups.py's TE adjustment, which cleared its backtest before shipping,
-# this one shipped first and was backtested after - flagged here rather
-# than silently left as "validated" once the real result came back mixed.
-# The asymmetry is worth revisiting (e.g. a smaller or zero downward
-# coefficient) but hasn't been changed based on this result without it
-# being a separate, explicit decision.
+# this one shipped first, was backtested after, found mixed, and was fixed
+# and re-verified in the same pass - all three steps disclosed here rather
+# than only the final "it's fine now."
 GAME_ENVIRONMENT_CEILING_BOOST_PER_POINT = 0.015
 
 
@@ -229,17 +231,23 @@ def _project_from_history(games, position):
 
 def _apply_game_environment_adjustment(proj, implied_total, league_average_implied_total):
     """Nudge only the ceiling-side percentiles (PERCENTILE_Z labels with
-    z > 0 - "75"/"90", i.e. proj_ceiling) by the real gap between this
-    player's team's current-week Vegas-implied total and the week's average
-    implied total across the whole slate - a positive gap (a real projected
-    shootout) scales the ceiling up, a negative one (a real projected
-    grind) scales it down, and a team sitting exactly at the week's average
-    is left unchanged. floor/median are untouched - see
-    GAME_ENVIRONMENT_CEILING_BOOST_PER_POINT for why this is ceiling-only
-    and not yet backtested.
+    z > 0 - "75"/"90", i.e. proj_ceiling) UP for a real projected shootout
+    (this player's team's current-week Vegas-implied total above the
+    week's average). floor/median are untouched.
+
+    Boost-only, not the originally-shipped symmetric version that also
+    scaled ceiling DOWN for a below-average implied total - see
+    GAME_ENVIRONMENT_CEILING_BOOST_PER_POINT for the real backtest that
+    found the downward half backwards (it moved P90 calibration away from
+    the true target, not toward it, a real and significant effect, not
+    noise) while the upward half was validated. A team at or below the
+    week's average is left completely unchanged now, rather than
+    penalized on a direction the data didn't support.
     """
     gap = implied_total - league_average_implied_total
-    multiplier = max(1.0 + GAME_ENVIRONMENT_CEILING_BOOST_PER_POINT * gap, 0.0)
+    if gap <= 0:
+        return dict(proj)
+    multiplier = 1.0 + GAME_ENVIRONMENT_CEILING_BOOST_PER_POINT * gap
     adjusted_percentiles = dict(proj["proj_percentiles"])
     for label, z in PERCENTILE_Z.items():
         if z > 0:
