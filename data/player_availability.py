@@ -1,3 +1,4 @@
+from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
 from sqlalchemy import text
@@ -163,3 +164,86 @@ def get_availability_gate(dk_players, season, week, engine=None):
             flagged[dk_id] = injury_status
 
     return excluded, flagged, injury_report_available
+
+
+# ---------------------------------------------------------------------------
+# Lock-time awareness.
+#
+# Every function above answers "is this player available" as of whenever the
+# data was last fetched - none of it knows what time it actually is right
+# now relative to any given game's real kickoff. That's never mattered on a
+# single-slate-start slate (every game locks at the same moment, so either
+# the whole slate is open or the whole thing's over), but a real Thu-Mon
+# slate has games locking at meaningfully different real times across
+# several days (this exact slate: BUF@DET locks Thu 2026-09-18 00:15 UTC,
+# the Sunday early games lock 2026-09-20 17:00 UTC, Monday's game locks
+# later still) - DraftKings itself only lets you edit a roster spot up
+# until THAT player's own game starts (late swap), and there was previously
+# no way for this codebase to know which of a lineup's spots were even
+# still editable.
+#
+# game_locked() is a hard, deterministic fact (a game has started or it
+# hasn't - no calibration risk the way the role-check thresholds had) - see
+# models/optimizer.py's _load_player_pool, which hard-excludes any player
+# whose game has already started from a freshly built lineup's pool, the
+# same way an injury/role exclusion already does. lineup_lock_report()
+# below is the reporting counterpart for an ALREADY-ENTERED lineup: which
+# of its specific roster spots are locked (can't be touched) vs still open
+# (still swappable before that player's own kickoff).
+# ---------------------------------------------------------------------------
+
+
+def game_locked(game_time, now=None):
+    """Whether a single game_time (a real, UTC-aware kickoff timestamp from
+    slate_player_pool) has already started as of `now` (defaults to the
+    real current time). A game with no recorded game_time is never treated
+    as locked - there's nothing to compare against, and silently excluding
+    a player over a missing timestamp would be a data gap masquerading as a
+    real finding, exactly what this project's conventions rule out.
+    """
+    if game_time is None:
+        return False
+    now = now or datetime.now(timezone.utc)
+    return game_time <= now
+
+
+def game_lock_status(dk_players, now=None):
+    """{player_id: locked bool} for a list of player dicts that already
+    carry game_time (e.g. models/optimizer.py's player pool once game_time
+    is selected). Pure - no DB access - so a caller who already has
+    game_time loaded doesn't pay for a second query just to check locks.
+    """
+    now = now or datetime.now(timezone.utc)
+    return {p["player_id"]: game_locked(p.get("game_time"), now) for p in dk_players}
+
+
+def lineup_lock_report(slate_id, player_ids, engine=None, now=None):
+    """For a SPECIFIC lineup (the exact player_ids in it, e.g. an already-
+    entered real lineup) - which roster spots are locked (that player's
+    game has already started - DK will not let you touch this spot) vs
+    still open (still swappable before kickoff), and how long until an open
+    spot's own lock, so a caller checking in on a multi-day slate mid-week
+    can see real remaining swap windows, not just a locked/open bit.
+
+    Returns a list of dicts: player_id, name, position, team, game_time,
+    locked, seconds_until_lock (None if already locked).
+    """
+    engine = engine or get_engine()
+    now = now or datetime.now(timezone.utc)
+
+    with engine.connect() as conn:
+        rows = conn.execute(
+            text(
+                "SELECT player_id, name, position, team, opponent, game_time FROM slate_player_pool "
+                "WHERE slate_id = :slate_id AND player_id = ANY(:player_ids)"
+            ),
+            {"slate_id": slate_id, "player_ids": list(player_ids)},
+        ).mappings().fetchall()
+
+    report = []
+    for row in rows:
+        row = dict(row)
+        locked = game_locked(row["game_time"], now)
+        seconds_until_lock = None if locked or row["game_time"] is None else (row["game_time"] - now).total_seconds()
+        report.append({**row, "locked": locked, "seconds_until_lock": seconds_until_lock})
+    return report

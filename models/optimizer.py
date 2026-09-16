@@ -5,7 +5,7 @@ import pulp
 from sqlalchemy import text
 
 from data.dk_salary_csv import CLASSIC_ROSTER, SHOWDOWN_ROSTER
-from data.player_availability import get_availability_gate, resolve_slate_season_week
+from data.player_availability import game_lock_status, get_availability_gate, resolve_slate_season_week
 from data.pre_lock_check import hard_role_exclusions
 from db.migrate import get_engine
 
@@ -28,7 +28,7 @@ def _load_player_pool(slate_id, projection_field, engine):
     # below needs both to build its variance-penalized objective.
     query = text(
         f"""
-        SELECT p.player_id, p.name, p.position, p.salary, p.team,
+        SELECT p.player_id, p.name, p.position, p.salary, p.team, p.game_time,
                proj.{projection_field} AS points,
                proj.proj_floor, proj.proj_ceiling
         FROM slate_player_pool p
@@ -76,6 +76,18 @@ def _load_player_pool(slate_id, projection_field, engine):
     role_excluded = hard_role_exclusions(available_players, engine)
     excluded = {**excluded, **role_excluded}
     available_players = [p for p in available_players if p["player_id"] not in role_excluded]
+
+    # Third hard gate: a player whose real game has already started can
+    # never legally be newly rostered - DraftKings itself enforces this
+    # (late swap only lets you touch a still-open slot), and unlike the two
+    # gates above this is a plain, deterministic fact (a kickoff time has
+    # passed or it hasn't), not a threshold call. Matters on any multi-day
+    # slate (Thu-Mon) where some games lock while others are still hours
+    # away - see data/player_availability.py's lock-time section.
+    locked = game_lock_status(available_players)
+    game_locked_ids = {pid for pid, is_locked in locked.items() if is_locked}
+    excluded = {**excluded, **{pid: "game already started" for pid in game_locked_ids}}
+    available_players = [p for p in available_players if p["player_id"] not in game_locked_ids]
 
     for p in available_players:
         p["availability_flag"] = flagged.get(p["player_id"])
