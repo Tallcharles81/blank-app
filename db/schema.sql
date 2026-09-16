@@ -125,3 +125,21 @@ ALTER TABLE calibration_weekly ADD COLUMN IF NOT EXISTS p20_hits INTEGER;
 ALTER TABLE calibration_weekly ADD COLUMN IF NOT EXISTS p20_opportunities INTEGER;
 ALTER TABLE calibration_weekly ADD COLUMN IF NOT EXISTS p50_hits INTEGER;
 ALTER TABLE calibration_weekly ADD COLUMN IF NOT EXISTS p50_opportunities INTEGER;
+
+-- Team-level pass defense performance, aggregated from PFR's real per-defender
+-- weekly coverage charting (see data/nflverse_fetch.py:fetch_pfr_def_advstats
+-- and models/matchups.py for what this is and, just as importantly, what real
+-- nflverse data does NOT support - per-play defender assignment and
+-- slot/wide receiver alignment are both confirmed absent). Summed across all
+-- of a team's charted defenders in a week, since a live DK slate can't know
+-- in advance which specific defender covers which specific receiver.
+CREATE TABLE IF NOT EXISTS team_pass_defense_weekly (
+    team                        TEXT NOT NULL,
+    season                      INTEGER NOT NULL,
+    week                        INTEGER NOT NULL,
+    def_targets                 INTEGER,
+    def_completions_allowed     INTEGER,
+    def_yards_allowed           NUMERIC(7, 2),
+    def_receiving_td_allowed    INTEGER,
+    PRIMARY KEY (team, season, week)
+);

@@ -169,6 +169,26 @@ def _red_zone_counts(pbp_df):
     return targets_by_key, carries_by_key
 
 
+def fetch_pfr_def_advstats(seasons):
+    # Confirmed by direct download (advstats_week_def_{season}.csv.gz under the
+    # pfr_advstats tag): per-defender, per-week targets/completions/yards/TDs
+    # allowed, as charted by PFR - the closest real, named-defender coverage-
+    # performance data that exists anywhere in nflverse. Checked before relying
+    # on it: NGS tables (ngs_passing/receiving/rushing) are pure weekly player
+    # aggregates with no opponent/defender fields at all, and pbp_participation
+    # has no field mapping a specific defender to a specific receiver, nor any
+    # slot-vs-wide alignment tag - see models/matchups.py for the full
+    # verification. This PFR data is real but still a charter's judgment call
+    # about who was in coverage on a given target, not a verified per-play
+    # assignment fact - models/matchups.py aggregates it to team level and
+    # labels every adjustment it produces MEDIUM confidence accordingly.
+    frames = _fetch_per_season("pfr_advstats", "advstats_week_def_{season}.csv.gz", seasons)
+    if not frames:
+        raise RuntimeError(f"No pfr_advstats def data could be fetched for any of seasons {seasons}")
+    df = pd.concat(frames, ignore_index=True)
+    return df[df["game_type"] == "REG"].copy()
+
+
 def fetch_stats_team_week(seasons):
     # Confirmed to exist by direct download (stats_team_week_{season}.csv.gz),
     # despite not appearing in the truncated release-asset listing checked
