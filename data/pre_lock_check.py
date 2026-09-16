@@ -433,13 +433,21 @@ def build_lineup_role_checklist(slate_id, player_ids, engine=None):
 # historical weeks, no-lookahead as-of evaluation): RB/WR/TE is strongly
 # validated as a real production-floor signal, not just a plausible-looking
 # live-pool spot check. 979 real RB/WR/TE player-weeks would have been
-# hard-excluded; they averaged 2.86 (RB) / 1.57 (WR) / 1.34 (TE) real PPR
-# points, versus 9.47 for everyone NOT excluded (t=-37.2, p<0.0001) - and the
+# hard-excluded; they averaged 2.89 (RB) / 1.56 (WR) / 1.34 (TE) real PPR
+# points, versus 9.83 for everyone NOT excluded (t=-36.6, p<0.0001) - and the
 # MISS rate (a would-be-excluded player-week that nonetheless scored above
 # 8.0 real PPR points - the real cost of this gate being wrong) was low:
 # 9.4% (RB) / 4.8% (WR) / 4.6% (TE). This is what makes a hard, silent gate
 # defensible - see MIN_SNAP_PCT_FOR_BENCHED below for the QB result, which
 # is NOT this clean.
+# Re-run after data/nflverse_fetch.py's real-DK-scoring fix (fantasy_points_
+# ppr was previously sourced from nflverse's own generic-PPR column - missing
+# DK's real 100+/300+ yardage bonuses and offensive fumble-recovery-TD
+# scoring, and double-penalizing INTs/fumbles lost at -2 instead of DK's real
+# -1 - see that module for the full story). The conclusion is unchanged
+# (these numbers moved by tenths of a point, not a different verdict); shown
+# here so this comment reflects the real, current ground truth rather than a
+# now-stale run.
 HARD_EXCLUDE_MAX_SNAP_PCT = 0.25
 
 # QB needs a DIFFERENT signal entirely, not this same max-snap-pct rule: a
@@ -476,10 +484,13 @@ HARD_EXCLUDE_MAX_SNAP_PCT = 0.25
 # BACKTESTED since (models/calibration.py::run_hard_exclude_backtest, same
 # 53-week no-lookahead run as HARD_EXCLUDE_MAX_SNAP_PCT above) - and this
 # one is NOT clean the same way RB/WR/TE is. 141 real QB player-weeks would
-# have been hard-excluded; they averaged 9.06 real PPR points when they
+# have been hard-excluded; they averaged 9.84 real PPR points when they
 # happened (not "on average were near zero" - a real, usable-if-not-great
 # QB score), and the miss rate (scored above 8.0 real PPR points anyway)
-# was 46.8% - roughly a coin flip, nothing like RB/WR/TE's 4-9% miss rates.
+# was 49.7% - roughly a coin flip, nothing like RB/WR/TE's 4-9% miss rates.
+# (Re-run after the real-DK-scoring fix noted above - moved from 46.8%
+# under the old, generic-PPR-derived scores; if anything a slightly weaker
+# case for a hard gate here now, not a stronger one.)
 # This isn't actually a contradiction of what this check is FOR, though:
 # unlike the RB/WR/TE rule, which claims "this player has no real role,"
 # this rule claims "this codebase can't confirm who's starting" - an

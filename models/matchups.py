@@ -78,6 +78,17 @@ from models.calibration import _asof_projections, _available_weeks, _played_gsis
 # helped / 788 hurt split. Real signal, provenance is fine, but not yet
 # validated to the MEDIUM bar - kept opt-in only, not wired into the default
 # pipeline, pending a larger sample (more slates/seasons) before revisiting.
+#
+# NOTE: this MAE/significance result predates data/nflverse_fetch.py's real-
+# DK-scoring fix (actual_score ground truth was generic-PPR-derived, not
+# real DK Classic scoring, until that fix - see the fix's own commit for the
+# full story). A re-run against the corrected data (run_matchup_backtest_
+# comparison, dk_thu_mon_2026_09_17) shows TE MAE 3.87 -> 3.85, still a
+# small, same-direction improvement, but the exact 1,762/t=1.93/780-vs-788
+# paired-significance figures above have not been reproduced against the
+# corrected scores - don't treat them as current without re-running that
+# specific check. Doesn't change this constant's value (still LOW - if
+# anything this strengthens "not yet validated to MEDIUM," not weakens it).
 MATCHUP_CONFIDENCE = "LOW"
 
 # Matches models/projections.py's own recency-decay half-life, for consistency.

@@ -74,15 +74,25 @@ CEILING_Z_BOOST = 0.3
 #     also real and highly significant (t=-8.79, p<0.0001), not noise.
 # Fixed to boost-only (see _apply_game_environment_adjustment: gap <= 0 is
 # now a no-op) based on that result, then RE-backtested to confirm rather
-# than assumed: low tercile now shows EXACTLY zero change (739/4818 hits
+# than assumed: low tercile now shows EXACTLY zero change (736/4818 hits
 # under both baseline and adjusted - no variance in the difference at all,
 # t_stat/p_value both None), high tercile keeps its same validated
-# improvement, and the pooled P90 hit rate improved too (15.33% -> 14.56%,
+# improvement, and the pooled P90 hit rate improved too (15.32% -> 14.57%,
 # closer to the true 10% target than before the fix). Unlike models/
 # matchups.py's TE adjustment, which cleared its backtest before shipping,
 # this one shipped first, was backtested after, found mixed, and was fixed
 # and re-verified in the same pass - all three steps disclosed here rather
 # than only the final "it's fine now."
+#
+# Re-run again after data/nflverse_fetch.py's real-DK-scoring fix (the
+# historical actual_score ground truth this whole backtest depends on was
+# previously generic-PPR-derived, not real DK Classic scoring - missing
+# DK's real yardage bonuses and using -2 instead of DK's real -1 for INTs/
+# fumbles lost). High tercile: baseline 14.88% -> adjusted 12.93% (t=9.79,
+# p<0.0001, was 14.78%->12.72%). Low tercile and pooled numbers above are
+# already the post-fix values. Same conclusion holds - the fix didn't change
+# which direction this adjustment should go, only these numbers by tenths of
+# a point.
 GAME_ENVIRONMENT_CEILING_BOOST_PER_POINT = 0.015
 
 
