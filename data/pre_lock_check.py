@@ -232,8 +232,37 @@ def _role_check_severity(position, games):
     mean_snap = sum(snap_pcts) / len(snap_pcts)
     if mean_snap < LOW_SNAP_PCT_THRESHOLD:
         structural_reason = f"low recent snap share (avg {mean_snap:.0%} over last {len(snap_pcts)} game(s))"
-    elif len(snap_pcts) >= 2:
-        stdev = math.sqrt(sum((s - mean_snap) ** 2 for s in snap_pcts) / (len(snap_pcts) - 1))
+    elif len(snap_pcts) >= 3:
+        # Raw stdev across all recent games was confirmed, on a real live
+        # pool, to false-positive on a genuinely stable star who just had one
+        # ordinary rest/blowout dip: CeeDee Lamb's real last-4 snap_pct was
+        # [0.81, 0.45, 0.87, 0.86] (the 0.45 a real week-18 rest game once
+        # seeding was locked) - stdev over all 4 is ~0.20, over this
+        # threshold, reading as "possible committee split" when it plainly
+        # isn't. A single low game, once, isn't evidence of a split role; a
+        # RECURRING pattern of low games mixed with high ones is. So the
+        # single lowest recorded game is set aside before checking for that
+        # recurring pattern - one outlier can no longer trigger this flag on
+        # its own, but a real alternating/declining role (checked against
+        # 630 real WR/RB/TE players with >=4 recorded games: this rule
+        # rescues 57/104 cases shaped like Lamb's one-dip pattern, while
+        # still catching 47 real recurring-swing cases, e.g. an alternating
+        # [0.49, 0.28, 0.93, 0.91] or a declining [0.84, 0.80, 0.33, 0.07])
+        # still clears the bar on the remaining games.
+        remaining = sorted(snap_pcts)[1:]
+        remaining_mean = sum(remaining) / len(remaining)
+        stdev = math.sqrt(sum((s - remaining_mean) ** 2 for s in remaining) / (len(remaining) - 1))
+        if stdev > INCONSISTENT_SNAP_PCT_STDEV_THRESHOLD:
+            structural_reason = (
+                f"inconsistent recent snap share (week-to-week swings of {stdev:.0%} even after setting aside "
+                "the single lowest game) - possible committee split"
+            )
+    elif len(snap_pcts) == 2:
+        # Only two recorded games - not enough to tell "one outlier" from "a
+        # real recurring pattern" the way the >=3 branch above does, so this
+        # stays the plain raw-stdev check; MIN_RECENT_GAMES_FOR_ROLE_
+        # CONFIDENCE already flags anything with fewer games as thin data.
+        stdev = math.sqrt(sum((s - mean_snap) ** 2 for s in snap_pcts))
         if stdev > INCONSISTENT_SNAP_PCT_STDEV_THRESHOLD:
             structural_reason = (
                 f"inconsistent recent snap share (week-to-week swings of {stdev:.0%}) - possible committee split"

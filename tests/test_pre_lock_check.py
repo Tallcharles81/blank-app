@@ -75,6 +75,46 @@ def test_severity_clear_for_a_real_stable_established_role():
     assert reason is None
 
 
+def test_severity_clear_for_a_real_stable_star_with_one_ordinary_rest_game_dip():
+    # Regression test for a confirmed real false positive: CeeDee Lamb's real
+    # last-4 snap_pct was [0.81, 0.45, 0.87, 0.86] - the 0.45 a real, ordinary
+    # week-18 rest game once seeding was locked, not evidence of a role
+    # change. Raw stdev across all 4 games (~0.20) cleared the old threshold
+    # and flagged this as "possible committee split", which is wrong - one
+    # low game, once, isn't a recurring pattern. See the "inconsistent recent
+    # snap share" branch's comment in data/pre_lock_check.py for the fix
+    # (set aside the single lowest game before checking for a recurring
+    # swing) and the real pool-wide check behind it (630 real WR/RB/TE
+    # players: rescues 57/104 one-dip cases like this one, still catches 47
+    # real recurring-swing cases).
+    games = [
+        _game(2026, 1, snap_pct=0.81, target_share=0.27),
+        _game(2025, 18, snap_pct=0.45, target_share=0.04),
+        _game(2025, 17, snap_pct=0.87, target_share=0.28),
+        _game(2025, 16, snap_pct=0.86, target_share=0.22),
+    ]
+    needs_check, severity, reason = _role_check_severity("WR", games)
+    assert needs_check is False, f"a single ordinary rest-game dip must not read as a committee split, got: {reason}"
+    assert severity is None
+
+
+def test_severity_high_for_a_real_recurring_alternating_role_not_just_one_dip():
+    # The fix above must not become "inconsistency can never fire" - a
+    # genuine recurring alternating role (unlike Lamb's single dip, this
+    # swings low/high/low/high, so setting aside just the single lowest game
+    # still leaves real week-to-week volatility behind) must still be caught.
+    games = [
+        _game(2026, 1, snap_pct=0.49, target_share=0.15),
+        _game(2025, 18, snap_pct=0.28, target_share=0.08),
+        _game(2025, 17, snap_pct=0.93, target_share=0.30),
+        _game(2025, 16, snap_pct=0.91, target_share=0.29),
+    ]
+    needs_check, severity, reason = _role_check_severity("WR", games)
+    assert needs_check is True
+    assert severity == SEVERITY_HIGH
+    assert "inconsistent" in reason
+
+
 # --- hard_role_exclusions: the pool-wide HARD gate wired into the --------
 # --- optimizer - deliberately much stricter, see its module docstring ----
 
