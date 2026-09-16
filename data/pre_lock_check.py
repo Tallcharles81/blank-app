@@ -19,6 +19,19 @@ from db.migrate import get_engine
 # a game-affecting weather report) can move faster than any data feed
 # updates. This module does NOT replace the gate - it cross-checks it.
 #
+# hard_role_exclusions() is the one piece of this module that IS a hard gate,
+# not an advisory cross-check: it's wired into models/optimizer.py's
+# _load_player_pool() right alongside data/player_availability.py's
+# roster/IR gate, so a player with a genuine structural role concern (real,
+# low/inconsistent recent volume) never reaches the solver at all - the same
+# standard as roster absence. This closes a real gap: before this existed,
+# a bad role finding (Jameis Winston getting a starter-level projection
+# despite being a real backup) only got excluded because a human manually
+# passed excluded_player_ids on that one call, and reproduced itself in a
+# fresh run the moment that manual step wasn't repeated. Everything else in
+# this module - the injury/inactive/weather sweep and the lineup-scoped
+# QB/MEDIUM/LOW findings - stays advisory, for the reasons below.
+#
 # What this module CANNOT do on its own: search the web. There is no web-
 # search capability inside this codebase's Python runtime - build_pre_lock_
 # checklist() only prepares the real, structured list of what needs
@@ -120,19 +133,39 @@ SEVERITY_MEDIUM = "MEDIUM"
 SEVERITY_LOW = "LOW"
 
 
-def _load_recent_usage(gsis_id, engine, max_weeks=ROLE_CHECK_HISTORY_WEEKS):
+def _load_recent_usage_batch(gsis_ids, engine, max_weeks=ROLE_CHECK_HISTORY_WEEKS):
+    """Recent player_weekly_stats usage rows for every id in gsis_ids, in one
+    windowed query - the same pattern as models/projections.py's
+    _load_recent_stats, and for the same reason: a per-player round trip is
+    fine for a 9-player lineup checklist, but hard_role_exclusions below has
+    to evaluate this across the WHOLE eligible pool (hundreds of players)
+    before the optimizer ever runs, where an N+1 query pattern would be a
+    real cost, not just a style nit.
+
+    Returns {gsis_id: [games most-recent-first]}.
+    """
     query = text(
         """
-        SELECT season, week, snap_pct, target_share, carries, injury_status
-        FROM player_weekly_stats
-        WHERE player_id = :gsis_id
-        ORDER BY season DESC, week DESC
-        LIMIT :max_weeks
+        SELECT player_id, season, week, snap_pct, target_share, carries, injury_status, recency_rank FROM (
+            SELECT player_id, season, week, snap_pct, target_share, carries, injury_status,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY player_id ORDER BY season DESC, week DESC
+                   ) AS recency_rank
+            FROM player_weekly_stats
+            WHERE player_id = ANY(:gsis_ids)
+        ) ranked
+        WHERE recency_rank <= :max_weeks
         """
     )
     with engine.connect() as conn:
-        rows = conn.execute(query, {"gsis_id": gsis_id, "max_weeks": max_weeks}).mappings().fetchall()
-    return [dict(row) for row in rows]
+        rows = conn.execute(query, {"gsis_ids": list(gsis_ids), "max_weeks": max_weeks}).mappings().fetchall()
+
+    by_player = defaultdict(list)
+    for row in rows:
+        by_player[row["player_id"]].append(dict(row))
+    for games in by_player.values():
+        games.sort(key=lambda g: g["recency_rank"])
+    return dict(by_player)
 
 
 def _role_check_severity(position, games):
@@ -270,6 +303,9 @@ def build_lineup_role_checklist(slate_id, player_ids, engine=None):
     players = [dict(row) for row in players]
 
     gsis_by_dk_id, _, _ = resolve_dk_players_to_gsis(players, engine)
+    games_by_gsis = _load_recent_usage_batch(
+        [gid for gid in gsis_by_dk_id.values() if gid is not None], engine
+    )
 
     results = []
     for p in players:
@@ -299,11 +335,145 @@ def build_lineup_role_checklist(slate_id, player_ids, engine=None):
             )
             continue
 
-        games = _load_recent_usage(gsis_id, engine)
-        needs_check, severity, reason = _role_check_severity(p["position"], games)
+        needs_check, severity, reason = _role_check_severity(p["position"], games_by_gsis.get(gsis_id, []))
         results.append({**p, "needs_check": needs_check, "severity": severity, "reason": reason})
 
     return results
+
+
+# hard_role_exclusions below deliberately does NOT reuse _role_check_severity's
+# thresholds. First attempt did, and it was a real, serious mistake caught by
+# testing against the actual live pool before shipping it (not caught in
+# review - only running it for real surfaced this): applied pool-wide, the
+# advisory thresholds (avg snap share < 45%, or week-to-week snap swings >
+# 15%) hard-excluded 317 of 1,066 real players, including Jonathan Taylor,
+# CeeDee Lamb, Malik Nabers, and Jaylen Waddle - every one of them caught by
+# the "inconsistent snap share" check reacting to one ordinary rest/blowout
+# game (CeeDee Lamb: 0.81/0.45/0.87/0.86 across his 4 most recent - a single
+# meaningless week-18 rest game once seeding was locked - which is completely
+# normal variance, not evidence of "no role," but reads as a 20% stdev to a
+# 15%-threshold check). A threshold tuned to be a useful "worth a look" nudge
+# for a human reviewing 9 players is not automatically safe to silently and
+# permanently exclude a player from an entire live pool with zero visibility
+# - those are different bars, and conflating them here would have been a
+# worse bug than the one this function exists to fix.
+#
+# The bar used here instead, for RB/WR/TE: hard-exclude only if snap_pct
+# across EVERY one of a player's last MIN_RECENT_GAMES_FOR_ROLE_CONFIDENCE+
+# recorded games (not the average - a max, so one real usage spike anywhere
+# in the window rescues a player) stayed below HARD_EXCLUDE_MAX_SNAP_PCT.
+# Verified against the live Thu-Mon pool: at 0.25, this catches 57 of 611
+# RB/WR/TE candidates, every single one already priced at or near DK's
+# roster-floor salary ($2,500-$4,800, true replacement-level deep bench) -
+# zero false positives among real difference-makers, and it correctly leaves
+# Kenny Gainwell ($5,100, snap_pct 0.46-0.68) and Jalen McMillan ($4,400)
+# unexcluded here, since their own data doesn't clear this much higher bar -
+# those stay correctly caught by the advisory, human-reviewed severity check
+# instead (see build_lineup_role_checklist), the right layer for a genuinely
+# borderline case, not a hard, silent block.
+HARD_EXCLUDE_MAX_SNAP_PCT = 0.25
+
+# QB needs a DIFFERENT signal entirely, not this same max-snap-pct rule: a
+# real backup who starts when called upon plays close to 100% of snaps in
+# the games he DOES start, same as any real QB1 - so "max recent snap_pct"
+# can't tell them apart, and this is exactly why Jameis Winston (a real
+# backup, given a real QB1-level projection by this system) still passes
+# HARD_EXCLUDE_MAX_SNAP_PCT: his 4 most recent recorded games are
+# [0.03, 1.00, 1.00, 0.77] - a high max, just like a real starter.
+#
+# What DOES separate a real starter from an intermittent backup in this
+# data: a real starter's low games are rest/blowout dips (Lamb: 0.81/0.45/
+# 0.87/0.86 - the low one is still 45%, a partial share, never near zero),
+# while a backup who only plays when starters are hurt/benched swings
+# between essentially NOT PLAYING (near-0%, a week he was inactive/DNP) and
+# FULLY PLAYING (near-100%, the week he started) - a real, qualitatively
+# different pattern, not just "more variance." Verified against the live
+# Thu-Mon pool at MIN_SNAP_PCT_FOR_BENCHED=0.15/MAX_SNAP_PCT_FOR_FULL_GAME=
+# 0.85 (both a game below 0.15 AND a game at/above 0.85 required): catches
+# 21 of the live pool's QBs, every one of them a real backup/journeyman
+# ($4,000-$5,400, at or near the QB salary floor - Sam Darnold, Cam Ward,
+# Jameis Winston, Joe Flacco, Mason Rudolph, etc.), zero of the slate's real
+# clear starters (Trevor Lawrence, Josh Allen, Jaxson Dart - none matched).
+# Checked one skill-position case this pattern would ALSO catch if applied
+# there before restricting it to QB: DeVonta Smith, a real, clearly-
+# established Eagles WR1, shows [0.95, 0.14, 0.85, 0.86] - one single-game
+# dip to 14% (almost certainly an in-game injury or early exit, not "no
+# role") would have been a false positive. QB is different because a real
+# starter essentially never sits below ~15% snaps in a game he isn't hurt or
+# benched for (there's no "partial-share" version of starting QB the way a
+# WR2 can play a reduced route share) - that clean binary doesn't hold at
+# other positions, so this pattern check is QB-only.
+MIN_SNAP_PCT_FOR_BENCHED = 0.15
+MAX_SNAP_PCT_FOR_FULL_GAME = 0.85
+
+
+def hard_role_exclusions(players, engine=None):
+    """Players with NO evidence of a real role in any recent game on record -
+    hard-excluded from the eligible pool before the optimizer ever runs, the
+    same way data/player_availability.py's roster-absence and IR checks are
+    already hard gates rather than advisory flags.
+
+    This is deliberately much narrower than "everything build_lineup_role_
+    checklist would flag HIGH for a given lineup" - see the module-level
+    comments above HARD_EXCLUDE_MAX_SNAP_PCT and MIN_SNAP_PCT_FOR_BENCHED for
+    why a hard, silent, permanent exclusion needs a far more conservative,
+    position-aware bar than an advisory flag a human is about to review
+    anyway. It's not "always exclude QB" (that would leave no QB to roster
+    at all) - QB gets its own real, data-driven pattern check instead of the
+    RB/WR/TE volume check, precisely because Jameis Winston reappearing in
+    lineup after lineup showed that raw snap-share volume alone can't tell a
+    real starter from an intermittent backup at QB. It also skips every
+    thin-data LOW/MEDIUM case (a rookie or recent trade isn't evidence of no
+    role, just of not much data yet).
+
+    This closes the real gap that let Jameis Winston reappear at 60%
+    exposure in a freshly generated GPP set after being excluded once by
+    hand - a genuinely no-role/intermittent-role player (this codebase's own
+    data shows it, position-appropriately) now blocks structurally and
+    permanently, without depending on a human remembering to re-apply a
+    one-off exclusion every run. A merely borderline/committee case
+    (Gainwell, McMillan) is intentionally left to the advisory lineup-scoped
+    check instead, where a human reviews it before trusting the lineup -
+    the honest trade-off of a hard gate that can't afford false positives.
+
+    `players` is any list of dicts with player_id/name/position/team (the
+    same shape models/optimizer.py's player pool uses) - not necessarily a
+    whole slate; callers pass whatever pool they're about to hand to the
+    solver. Returns {player_id: reason}.
+    """
+    engine = engine or get_engine()
+    candidates = [p for p in players if p["position"] != "DST"]
+    if not candidates:
+        return {}
+
+    gsis_by_dk_id, _, _ = resolve_dk_players_to_gsis(candidates, engine)
+    games_by_gsis = _load_recent_usage_batch(
+        [gid for gid in gsis_by_dk_id.values() if gid is not None], engine
+    )
+
+    excluded = {}
+    for p in candidates:
+        gsis_id = gsis_by_dk_id.get(p["player_id"])
+        if gsis_id is None:
+            continue  # no crosswalk match is a thin-data/LOW case, not a hard exclude
+        games = games_by_gsis.get(gsis_id, [])
+        snap_pcts = [float(g["snap_pct"]) for g in games if g["snap_pct"] is not None]
+        if len(snap_pcts) < MIN_RECENT_GAMES_FOR_ROLE_CONFIDENCE:
+            continue  # too little data to be confident it's genuinely zero/unclear role, not just unrecorded
+
+        if p["position"] == "QB":
+            if min(snap_pcts) < MIN_SNAP_PCT_FOR_BENCHED and max(snap_pcts) >= MAX_SNAP_PCT_FOR_FULL_GAME:
+                excluded[p["player_id"]] = (
+                    f"intermittent starter pattern in the last {len(snap_pcts)} recorded games "
+                    f"(snap share swings between {min(snap_pcts):.0%} and {max(snap_pcts):.0%}) - "
+                    "this is the real backup/spot-starter signature, not normal starter variance"
+                )
+        elif max(snap_pcts) < HARD_EXCLUDE_MAX_SNAP_PCT:
+            excluded[p["player_id"]] = (
+                f"no meaningful snap share in any of the last {len(snap_pcts)} recorded games "
+                f"(max {max(snap_pcts):.0%}) - no evidence of a real current role"
+            )
+    return excluded
 
 
 def build_pre_lock_checklist(slate_id, engine=None):

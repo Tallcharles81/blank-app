@@ -6,6 +6,7 @@ from sqlalchemy import text
 
 from data.dk_salary_csv import CLASSIC_ROSTER, SHOWDOWN_ROSTER
 from data.player_availability import get_availability_gate, resolve_slate_season_week
+from data.pre_lock_check import hard_role_exclusions
 from db.migrate import get_engine
 
 SALARY_CAP = 50000
@@ -64,6 +65,18 @@ def _load_player_pool(slate_id, projection_field, engine):
     excluded, flagged, injury_report_available = get_availability_gate(players, season, week, engine)
 
     available_players = [p for p in players if p["player_id"] not in excluded]
+
+    # Second hard gate, same standard as the roster/IR check above: a player
+    # can be rostered and healthy (passes get_availability_gate) and still
+    # have no real current role - a real backup with a starter-level
+    # projection (Jameis Winston, see data/pre_lock_check.py's module
+    # docstring). Checked against the pool that already survived the
+    # availability gate, not the raw pool, so this never does redundant work
+    # resolving a player who's excluded already.
+    role_excluded = hard_role_exclusions(available_players, engine)
+    excluded = {**excluded, **role_excluded}
+    available_players = [p for p in available_players if p["player_id"] not in role_excluded]
+
     for p in available_players:
         p["availability_flag"] = flagged.get(p["player_id"])
 
