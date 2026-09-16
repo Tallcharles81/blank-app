@@ -61,11 +61,35 @@ MATCHUP_CONFIDENCE = "MEDIUM"
 # Matches models/projections.py's own recency-decay half-life, for consistency.
 HALF_LIFE_WEEKS = 4
 LOOKBACK_WEEKS = 8
-# Caps how much one opponent can move a projection - a single small-sample bad
-# week for a defense (or a fluky one) shouldn't be allowed to swing a lineup
-# call on its own.
+# This was an arbitrary starting guess ("a single bad week shouldn't swing a
+# lineup call"), not derived from any variance analysis - see
+# run_matchup_backtest_comparison's `clamp` param, which was added specifically
+# to test that. Result: loosening it to +-30%/+-50%/uncapped made WR's MAE
+# monotonically WORSE at every step (never better, never flat) while TE's
+# improvement barely moved past +-15% - i.e. the cap width isn't why WR looks
+# bad, and it isn't propping up TE's result either. Left at +-15% since
+# nothing in that test argued for a different value.
 FACTOR_CLAMP = (0.85, 1.15)
-MATCHUP_ELIGIBLE_POSITIONS = {"WR", "TE"}
+# WR was deliberately removed after backtesting (see
+# run_matchup_backtest_comparison and models/matchups.py's module history):
+# across seasons 2024-2026, 97.7% of eligible WR/TE player-weeks had real
+# opponent coverage data (2025-2026 100%, 2024 94.9% - not a thin-sample
+# artifact), and loosening FACTOR_CLAMP from +-15% up to uncapped made WR's
+# MAE strictly worse at every step (4.84 baseline -> 4.88 -> 4.90 -> 4.91 ->
+# 4.91), never better and never flat. That's the signature of a genuinely
+# harmful signal for WR, not an under- or over-tuned magnitude - so WR is
+# excluded rather than shipped with a "best-guess" cap. TE's small MAE
+# improvement (3.735 -> ~3.71, ~0.7%) held steady across every cap width
+# tested on the same real data, which is consistent with a real, if modest,
+# effect - kept, and still opt-in only (see run_matchup_backtest_comparison's
+# own docstring for why it isn't the projection pipeline's default).
+MATCHUP_ELIGIBLE_POSITIONS = {"TE"}
+# Positions run_matchup_backtest_comparison evaluates, independent of which
+# ones are currently live in MATCHUP_ELIGIBLE_POSITIONS - kept broader so a
+# future re-run still shows WR's (expected no-op) numbers side by side with
+# TE's, rather than silently losing the comparison that justified excluding
+# WR in the first place.
+_BACKTEST_SCAN_POSITIONS = {"WR", "TE"}
 
 
 def _decay_weight(weeks_ago):
@@ -144,7 +168,7 @@ def _load_prior_weeks(engine, before_season, before_week):
         return conn.execute(query, {"before_season": before_season, "before_week": before_week}).fetchall()
 
 
-def compute_defense_factors(before, engine=None, lookback_weeks=LOOKBACK_WEEKS):
+def compute_defense_factors(before, engine=None, lookback_weeks=LOOKBACK_WEEKS, clamp=FACTOR_CLAMP):
     """Recency-weighted opponent pass-defense factor per team, as of strictly
     before `before=(season, week)` - the target week itself is never included,
     so this has no lookahead bias when used for backtesting, and works
@@ -181,8 +205,7 @@ def compute_defense_factors(before, engine=None, lookback_weeks=LOOKBACK_WEEKS):
 
     league_avg_ratio = league_weighted_yards / league_weighted_targets
     return {
-        team: min(max(ratio / league_avg_ratio, FACTOR_CLAMP[0]), FACTOR_CLAMP[1])
-        for team, ratio in team_ratio.items()
+        team: min(max(ratio / league_avg_ratio, clamp[0]), clamp[1]) for team, ratio in team_ratio.items()
     }
 
 
@@ -215,7 +238,7 @@ def _opponents_for_week(gsis_ids, season, week, engine):
     return {row.player_id: row.opponent for row in rows}
 
 
-def run_matchup_backtest_comparison(source_slate_id, seasons=None, engine=None):
+def run_matchup_backtest_comparison(source_slate_id, seasons=None, engine=None, clamp=FACTOR_CLAMP):
     """WR/TE-only: does layering the opponent pass-defense factor on top of
     the existing as-of projections improve MAE and p20/p50/p80 hit rates
     versus the current baseline, across every real historical week this can
@@ -226,15 +249,19 @@ def run_matchup_backtest_comparison(source_slate_id, seasons=None, engine=None):
     tests. Never writes to calibration_weekly - this is a side-by-side
     diagnostic, not a replacement for the stored baseline.
 
-    Returns a dict with pooled MAE and hit rates for both baseline and
-    matchup-adjusted, plus how many player-weeks actually got a real
-    adjustment applied (opponents with no prior team_pass_defense_weekly data
-    are correctly left unadjusted, not defaulted to a neutral factor).
+    Reports pooled metrics AND an "adjusted-only" subset: for the majority of
+    player-weeks with no prior team_pass_defense_weekly coverage for their
+    opponent, apply_matchup_adjustment is a literal no-op (adjusted == base),
+    so pooling those in with the ones that actually got a real factor dilutes
+    the pooled numbers toward "no difference" regardless of whether the
+    signal itself is any good. The adjusted-only subset isolates the actual
+    effect where the layer did something; per_season_coverage separately
+    reports what fraction of each season's sample that subset actually is.
     """
     engine = engine or get_engine()
 
     slate_players = load_slate_pool(source_slate_id, engine)
-    wr_te_players = [p for p in slate_players if p["position"] in MATCHUP_ELIGIBLE_POSITIONS]
+    wr_te_players = [p for p in slate_players if p["position"] in _BACKTEST_SCAN_POSITIONS]
     if not wr_te_players:
         raise ValueError(f"No WR/TE players found in slate_player_pool for slate {source_slate_id}")
     gsis_by_dk_id, _, _ = resolve_dk_players_to_gsis(wr_te_players, engine)
@@ -248,7 +275,13 @@ def run_matchup_backtest_comparison(source_slate_id, seasons=None, engine=None):
     matchup_mae = defaultdict(lambda: [0.0, 0])
     baseline_hits = {"p20": [0, 0], "p50": [0, 0], "p80": [0, 0]}
     matchup_hits = {"p20": [0, 0], "p50": [0, 0], "p80": [0, 0]}
-    players_adjusted = 0
+    # Adjusted-only subset - see docstring above for why this is tracked
+    # separately from the pooled (all-player) numbers.
+    adj_baseline_mae = defaultdict(lambda: [0.0, 0])
+    adj_matchup_mae = defaultdict(lambda: [0.0, 0])
+    adj_baseline_hits = {"p20": [0, 0], "p50": [0, 0], "p80": [0, 0]}
+    adj_matchup_hits = {"p20": [0, 0], "p50": [0, 0], "p80": [0, 0]}
+    per_season_coverage = defaultdict(lambda: [0, 0])  # season -> [adjusted, total]
     weeks_evaluated = 0
 
     for season, week in weeks:
@@ -264,7 +297,7 @@ def run_matchup_backtest_comparison(source_slate_id, seasons=None, engine=None):
             continue
         weeks_evaluated += 1
 
-        factors = compute_defense_factors(before=(season, week), engine=engine)
+        factors = compute_defense_factors(before=(season, week), engine=engine, clamp=clamp)
         opponents_by_gsis = _opponents_for_week(gsis_by_dk_id.values(), season, week, engine)
 
         for dk_id in eligible_dk_ids:
@@ -274,36 +307,32 @@ def run_matchup_backtest_comparison(source_slate_id, seasons=None, engine=None):
             opponent = opponents_by_gsis.get(gsis_id)
             actual = actual_points[dk_id]
             base = asof[dk_id]
+            per_season_coverage[season][1] += 1
 
-            baseline_mae[position][0] += abs(base["median"] - actual)
-            baseline_mae[position][1] += 1
-            if actual <= base["p20"]:
-                baseline_hits["p20"][0] += 1
-            baseline_hits["p20"][1] += 1
-            if actual >= base["median"]:
-                baseline_hits["p50"][0] += 1
-            baseline_hits["p50"][1] += 1
-            if actual >= base["p80"]:
-                baseline_hits["p80"][0] += 1
-            baseline_hits["p80"][1] += 1
+            def _score(mae_bucket, hit_bucket, proj):
+                mae_bucket[position][0] += abs(proj["median"] - actual)
+                mae_bucket[position][1] += 1
+                if actual <= proj["p20"]:
+                    hit_bucket["p20"][0] += 1
+                hit_bucket["p20"][1] += 1
+                if actual >= proj["median"]:
+                    hit_bucket["p50"][0] += 1
+                hit_bucket["p50"][1] += 1
+                if actual >= proj["p80"]:
+                    hit_bucket["p80"][0] += 1
+                hit_bucket["p80"][1] += 1
+
+            _score(baseline_mae, baseline_hits, base)
 
             adjusted, factor = apply_matchup_adjustment(
                 base, position, opponent, factors, fields=["median", "p20", "p80"]
             )
-            if factor is not None:
-                players_adjusted += 1
+            _score(matchup_mae, matchup_hits, adjusted)
 
-            matchup_mae[position][0] += abs(adjusted["median"] - actual)
-            matchup_mae[position][1] += 1
-            if actual <= adjusted["p20"]:
-                matchup_hits["p20"][0] += 1
-            matchup_hits["p20"][1] += 1
-            if actual >= adjusted["median"]:
-                matchup_hits["p50"][0] += 1
-            matchup_hits["p50"][1] += 1
-            if actual >= adjusted["p80"]:
-                matchup_hits["p80"][0] += 1
-            matchup_hits["p80"][1] += 1
+            if factor is not None:
+                per_season_coverage[season][0] += 1
+                _score(adj_baseline_mae, adj_baseline_hits, base)
+                _score(adj_matchup_mae, adj_matchup_hits, adjusted)
 
     def _mae_summary(pooled):
         return {pos: round(total / n, 4) for pos, (total, n) in pooled.items() if n}
@@ -311,11 +340,28 @@ def run_matchup_backtest_comparison(source_slate_id, seasons=None, engine=None):
     def _hit_rate_summary(pooled):
         return {key: round(hits / opps, 4) if opps else None for key, (hits, opps) in pooled.items()}
 
+    total_eligible = sum(total for _, total in per_season_coverage.values())
+    total_adjusted = sum(adj for adj, _ in per_season_coverage.values())
+
     return {
         "weeks_evaluated": weeks_evaluated,
-        "players_adjusted": players_adjusted,
-        "baseline_mae_by_position": _mae_summary(baseline_mae),
-        "matchup_mae_by_position": _mae_summary(matchup_mae),
-        "baseline_hit_rates": _hit_rate_summary(baseline_hits),
-        "matchup_hit_rates": _hit_rate_summary(matchup_hits),
+        "players_adjusted": total_adjusted,
+        "players_eligible": total_eligible,
+        "coverage_fraction": round(total_adjusted / total_eligible, 4) if total_eligible else None,
+        "per_season_coverage": {
+            season: {"adjusted": adj, "eligible": total, "fraction": round(adj / total, 4) if total else None}
+            for season, (adj, total) in sorted(per_season_coverage.items())
+        },
+        "pooled": {
+            "baseline_mae_by_position": _mae_summary(baseline_mae),
+            "matchup_mae_by_position": _mae_summary(matchup_mae),
+            "baseline_hit_rates": _hit_rate_summary(baseline_hits),
+            "matchup_hit_rates": _hit_rate_summary(matchup_hits),
+        },
+        "adjusted_only": {
+            "baseline_mae_by_position": _mae_summary(adj_baseline_mae),
+            "matchup_mae_by_position": _mae_summary(adj_matchup_mae),
+            "baseline_hit_rates": _hit_rate_summary(adj_baseline_hits),
+            "matchup_hit_rates": _hit_rate_summary(adj_matchup_hits),
+        },
     }
