@@ -44,9 +44,16 @@ from db.migrate import get_engine
 #        in the finding if it matters, don't guess dome vs outdoor)
 #   3. Once a specific lineup has been generated (not the whole eligible
 #      pool - just the players actually being entered), call
-#      build_lineup_role_checklist(slate_id, player_ids) and, for EVERY
-#      player it returns with needs_check=True, search specifically for
-#      current-week STARTER/ROLE status, not just health - "is he playing"
+#      build_lineup_role_checklist(slate_id, player_ids). Every player it
+#      returns with needs_check=True also carries a severity - HIGH (a real
+#      structural volume concern, or an always-on QB check), MEDIUM (an
+#      injury designation on an otherwise clearly-established player), or
+#      LOW (thin data only - a rookie/recent trade, not a known problem).
+#      Treat HIGH as the required short list to research every time; MEDIUM
+#      is worth a same-day check close to lock; LOW is informational and
+#      doesn't need the same urgency. For EVERY flagged player, search
+#      specifically for current-week STARTER/ROLE status, not just health -
+#      "is he playing"
 #      is not the same question as "is he confirmed as this week's starter/
 #      lead back/lead WR/every-down role." Use real current sources
 #      (official team site, ESPN, NFL.com, beat reporters covering that team
@@ -90,6 +97,28 @@ INCONSISTENT_SNAP_PCT_STDEV_THRESHOLD = 0.15
 LOW_TARGET_SHARE_THRESHOLD = 0.15
 LOW_CARRIES_PER_GAME_THRESHOLD = 8
 
+# Severity tiers - a flat "needs_check" told you something was worth a look,
+# but not whether it was a real problem or a thin-data footnote. Modeled on
+# models/matchups.py's HIGH/MEDIUM/LOW confidence scale for the same reason:
+# a flag only earns attention if its label tells you how much to give it.
+#   HIGH   - a real, structural role concern: this player's own recent usage
+#            (volume, consistency) doesn't look like a startable role, full
+#            stop, independent of health. This is Kenny Gainwell's case
+#            (6.5 carries/game) and the always-on QB check (this codebase
+#            cannot tell rostered from starting at all - see the Jameis
+#            Winston incident in the module docstring).
+#   MEDIUM - an active injury designation (Questionable/Doubtful) on a
+#            player whose own recent volume otherwise looks like a clear,
+#            established role. Worth a same-day check close to lock, but
+#            not, by itself, a reason to think the role has changed.
+#   LOW    - thin data only: too few recent games, no snap data recorded, or
+#            no crosswalk match at all - typically a rookie, a recent trade,
+#            or a data gap. The honest read here is "we don't have much
+#            signal," not "something is actually wrong."
+SEVERITY_HIGH = "HIGH"
+SEVERITY_MEDIUM = "MEDIUM"
+SEVERITY_LOW = "LOW"
+
 
 def _load_recent_usage(gsis_id, engine, max_weeks=ROLE_CHECK_HISTORY_WEEKS):
     query = text(
@@ -106,7 +135,7 @@ def _load_recent_usage(gsis_id, engine, max_weeks=ROLE_CHECK_HISTORY_WEEKS):
     return [dict(row) for row in rows]
 
 
-def _role_check_reason(position, games):
+def _role_check_severity(position, games):
     """Real, data-driven verdict on whether a player's recent usage shows a
     clear, current role - replacing the old "priced close to the team's top
     salary at that position" proxy, which missed cheap, deep-bench-priced
@@ -117,56 +146,81 @@ def _role_check_reason(position, games):
     "does this player's own recent usage show a clear, current role,"
     independent of price entirely.
 
-    `games` is recent player_weekly_stats rows for this player, most-recent
-    first. Returns (needs_check: bool, reason: str | None).
-    """
-    if not games:
-        return True, "no recent usage data on record - can't confirm a current role at all"
+    A structural volume problem (HIGH) is checked and reported ahead of a
+    plain injury designation (MEDIUM): a player whose own recent carries/
+    snaps/targets already look thin has a real role problem regardless of
+    the injury report, so that's the more important fact to lead with -
+    the injury note still gets folded into the HIGH reason when both are
+    present, rather than silently dropped.
 
+    `games` is recent player_weekly_stats rows for this player, most-recent
+    first. Returns (needs_check: bool, severity: str | None, reason: str | None).
+    """
     recent_injury = next((g["injury_status"] for g in games if g["injury_status"]), None)
-    if recent_injury:
-        return True, f"recent injury designation on record ({recent_injury}) - confirm current practice/game status"
+
+    if not games:
+        return True, SEVERITY_LOW, (
+            "no recent usage data on record - likely a rookie/first appearance or recently "
+            "traded; thin data, not a known problem"
+        )
 
     if len(games) < MIN_RECENT_GAMES_FOR_ROLE_CONFIDENCE:
-        return True, f"only {len(games)} recent game(s) of usage data on record - not enough to confirm a stable role"
+        reason = (
+            f"only {len(games)} recent game(s) of usage data on record - likely a rookie/first "
+            "appearance or recently traded; thin data, not a known problem"
+        )
+        if recent_injury:
+            reason += f"; also carries a recent {recent_injury} designation on that limited sample"
+            return True, SEVERITY_MEDIUM, reason
+        return True, SEVERITY_LOW, reason
 
     snap_pcts = [float(g["snap_pct"]) for g in games if g["snap_pct"] is not None]
     if not snap_pcts:
-        return True, "no snap-share data recorded in recent games - can't confirm role from usage"
+        reason = "no snap-share data recorded in recent games - can't confirm role from usage; thin data, not a known problem"
+        if recent_injury:
+            reason += f"; also carries a recent {recent_injury} designation"
+            return True, SEVERITY_MEDIUM, reason
+        return True, SEVERITY_LOW, reason
 
+    structural_reason = None
     mean_snap = sum(snap_pcts) / len(snap_pcts)
     if mean_snap < LOW_SNAP_PCT_THRESHOLD:
-        return True, (
-            f"low recent snap share (avg {mean_snap:.0%} over last {len(snap_pcts)} game(s)) - "
-            "confirm current role, not just health"
-        )
-    if len(snap_pcts) >= 2:
+        structural_reason = f"low recent snap share (avg {mean_snap:.0%} over last {len(snap_pcts)} game(s))"
+    elif len(snap_pcts) >= 2:
         stdev = math.sqrt(sum((s - mean_snap) ** 2 for s in snap_pcts) / (len(snap_pcts) - 1))
         if stdev > INCONSISTENT_SNAP_PCT_STDEV_THRESHOLD:
-            return True, (
-                f"inconsistent recent snap share (week-to-week swings of {stdev:.0%}) - "
-                "confirm this week's role isn't a committee split"
+            structural_reason = (
+                f"inconsistent recent snap share (week-to-week swings of {stdev:.0%}) - possible committee split"
             )
 
-    if position in ("WR", "TE"):
+    if structural_reason is None and position in ("WR", "TE"):
         target_shares = [float(g["target_share"]) for g in games if g["target_share"] is not None]
         if target_shares:
             mean_target = sum(target_shares) / len(target_shares)
             if mean_target < LOW_TARGET_SHARE_THRESHOLD:
-                return True, (
-                    f"low recent target share (avg {mean_target:.0%}) - confirm current role, not just health"
-                )
+                structural_reason = f"low recent target share (avg {mean_target:.0%})"
 
-    if position == "RB":
+    if structural_reason is None and position == "RB":
         carries = [g["carries"] for g in games if g["carries"] is not None]
         if carries:
             mean_carries = sum(carries) / len(carries)
             if mean_carries < LOW_CARRIES_PER_GAME_THRESHOLD:
-                return True, (
-                    f"low recent carries (avg {mean_carries:.1f}/game) - confirm current role, not just health"
-                )
+                structural_reason = f"low recent carries (avg {mean_carries:.1f}/game)"
 
-    return False, None
+    if structural_reason:
+        reason = f"{structural_reason} - real, structural role concern; confirm current role, not just health"
+        if recent_injury:
+            reason += f" (also carries a recent {recent_injury} designation)"
+        return True, SEVERITY_HIGH, reason
+
+    if recent_injury:
+        return True, SEVERITY_MEDIUM, (
+            f"recent injury designation on record ({recent_injury}) on an otherwise established, "
+            "high-usage player - confirm current practice/game status close to lock; not inherently "
+            "a reason to bench"
+        )
+
+    return False, None, None
 
 
 def build_lineup_role_checklist(slate_id, player_ids, engine=None):
@@ -186,17 +240,22 @@ def build_lineup_role_checklist(slate_id, player_ids, engine=None):
     The right trigger is simpler and has no such gap: if a player is
     actually in the lineup being entered, their role gets checked, full stop.
 
-    QB is still an unconditional check regardless of usage data - only one
-    player takes meaningful starter snaps most weeks, and this codebase's
-    own data has no way to tell which one that is, only who's on the
-    roster (see the Jameis Winston case in the module docstring above).
-    DST is skipped - a team defense doesn't have an individual "role."
-    Every other position is checked against real recent snap_pct/
-    target_share/carries/injury_status from player_weekly_stats (see
-    _role_check_reason) rather than any price signal.
+    QB is still an unconditional HIGH-severity check regardless of usage
+    data - only one player takes meaningful starter snaps most weeks, and
+    this codebase's own data has no way to tell which one that is, only
+    who's on the roster (see the Jameis Winston case in the module
+    docstring above) - that's the same class of real, structural role
+    concern as a committee back with thin volume, not a lesser one. DST is
+    skipped - a team defense doesn't have an individual "role." Every other
+    position is checked against real recent snap_pct/target_share/carries/
+    injury_status from player_weekly_stats (see _role_check_severity)
+    rather than any price signal, and comes back tagged HIGH/MEDIUM/LOW so
+    a caller can pull out the short list of real problems (HIGH) instead of
+    manually sorting every flag - see _role_check_severity's docstring for
+    what each tier means.
 
     Returns a list of dicts: player_id, name, position, team, needs_check,
-    reason.
+    severity, reason.
     """
     engine = engine or get_engine()
 
@@ -215,13 +274,14 @@ def build_lineup_role_checklist(slate_id, player_ids, engine=None):
     results = []
     for p in players:
         if p["position"] == "DST":
-            results.append({**p, "needs_check": False, "reason": None})
+            results.append({**p, "needs_check": False, "severity": None, "reason": None})
             continue
         if p["position"] == "QB":
             results.append(
                 {
                     **p,
                     "needs_check": True,
+                    "severity": SEVERITY_HIGH,
                     "reason": "QB - confirm which player is this week's actual starter, not just who's rostered",
                 }
             )
@@ -233,14 +293,15 @@ def build_lineup_role_checklist(slate_id, player_ids, engine=None):
                 {
                     **p,
                     "needs_check": True,
+                    "severity": SEVERITY_LOW,
                     "reason": "no crosswalk match to real usage history - can't confirm role from data at all",
                 }
             )
             continue
 
         games = _load_recent_usage(gsis_id, engine)
-        needs_check, reason = _role_check_reason(p["position"], games)
-        results.append({**p, "needs_check": needs_check, "reason": reason})
+        needs_check, severity, reason = _role_check_severity(p["position"], games)
+        results.append({**p, "needs_check": needs_check, "severity": severity, "reason": reason})
 
     return results
 
