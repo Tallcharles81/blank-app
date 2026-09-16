@@ -47,7 +47,7 @@ def contest_csv(tmp_path):
             (GIBBS["name"], "RB", 39.23, 37.6),
             (GIBBS["name"], "FLEX", 4.40, 37.6),  # same real player, second roster slot
             (ROBINSON["name"], "RB", 25.00, 29.8),
-            ("Bengals ", "CPT", 5.0, 10.0),  # DST trailing-space quirk from the real export
+            ("Bengals ", "DST", 5.0, 10.0),  # DST trailing-space quirk from the real export
             (FAKE_PLAYER_NAME, "WR", 1.0, 0.0),  # no real slate_player_pool match
         ],
     )
@@ -55,8 +55,9 @@ def contest_csv(tmp_path):
 
 
 def test_parse_contest_standings_csv_dedupes_and_sums_roster_slots(contest_csv):
-    parsed, skipped = parse_contest_standings_csv(contest_csv)
+    parsed, skipped, is_showdown = parse_contest_standings_csv(contest_csv)
     assert skipped == 0
+    assert is_showdown is False  # this fixture uses real Classic roster-position labels
     # Gibbs' two roster-slot rows (RB + FLEX) must sum into one real total.
     assert parsed[GIBBS["name"]]["pct_drafted"] == pytest.approx(39.23 + 4.40)
     assert parsed[GIBBS["name"]]["fpts_contest"] == 37.6
@@ -120,6 +121,51 @@ def test_import_contest_standings_upsert_does_not_duplicate(engine, imported_con
             text("SELECT count(*) FROM contest_ownership WHERE contest_id = :c"), {"c": TEST_CONTEST_ID}
         ).scalar()
     assert count == 4
+
+
+TEST_SHOWDOWN_CONTEST_ID = "TEST_CONTEST_OWNERSHIP_SHOWDOWN"
+
+
+def test_import_contest_standings_refuses_to_compute_proxy_for_a_real_showdown_contest(engine, tmp_path):
+    # Regression test for a real methodology bug caught before ever running
+    # a correlation on it: this codebase has never loaded a real Showdown
+    # slate_player_pool (no real Showdown CSV export was ever available -
+    # see data/player_crosswalk.py), so the only pool a Showdown contest's
+    # players can be name-matched against is Classic-priced. A Showdown
+    # CPT/FLEX slot's real DK salary is a different number from that same
+    # player's Classic salary, so computing ownership_proxy off the Classic
+    # price would silently produce a wrong result rather than an honest gap.
+    path = tmp_path / "contest-standings-SHOWDOWN-TEST.csv"
+    _write_contest_csv(
+        path,
+        [
+            (GIBBS["name"], "CPT", 45.0, 37.6),
+            (ROBINSON["name"], "FLEX", 20.0, 29.8),
+        ],
+    )
+    try:
+        result = import_contest_standings(
+            str(path), slate_id="dk_thu_mon_2026_09_17", contest_id=TEST_SHOWDOWN_CONTEST_ID, engine=engine
+        )
+        assert result["is_showdown"] is True
+        assert result["showdown_salary_mismatch"] == 2
+        assert result["matched_with_projection"] == 0
+
+        with engine.connect() as conn:
+            rows = {
+                r["name"]: dict(r)
+                for r in conn.execute(
+                    text("SELECT * FROM contest_ownership WHERE contest_id = :c"), {"c": TEST_SHOWDOWN_CONTEST_ID}
+                ).mappings()
+            }
+        gibbs_row = rows[GIBBS["name"]]
+        assert gibbs_row["player_id"] == GIBBS["player_id"]  # real identity still captured
+        assert gibbs_row["salary"] is None  # but salary/proxy intentionally withheld
+        assert gibbs_row["ownership_proxy"] is None
+        assert "Showdown" in gibbs_row["unmatched_reason"]
+    finally:
+        with engine.begin() as conn:
+            conn.execute(text("DELETE FROM contest_ownership WHERE contest_id = :c"), {"c": TEST_SHOWDOWN_CONTEST_ID})
 
 
 # --- _spearman: manual rank correlation, no scipy dependency --------------

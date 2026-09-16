@@ -71,17 +71,30 @@ def parse_contest_standings_csv(csv_path):
     put on skill-position names, stripped here during parsing rather than
     left as a silent matching failure downstream.
 
-    Returns {player_name: {"pct_drafted": float, "fpts_contest": float |
-    None}} - already deduplicated/summed across roster-slot rows.
+    Returns (totals, skipped, is_showdown): totals is {player_name:
+    {"pct_drafted": float, "fpts_contest": float | None}}, already
+    deduplicated/summed across roster-slot rows. is_showdown is True if any
+    row's real Roster Position is "CPT" - DK only uses that label on a
+    Showdown (single-game) slate, never a Classic one, and that distinction
+    matters downstream: a Showdown contest's real DK salaries are a
+    DIFFERENT, separate pricing structure (CPT costs 1.5x, and the overall
+    pool is priced independently of that week's Classic slate), so matching
+    a Showdown contest's players by name against a CLASSIC slate_player_pool
+    gets the real player and real position right, but NOT a valid salary -
+    see import_contest_standings for how that's handled rather than silently
+    computing ownership_proxy off the wrong price.
     """
     totals = defaultdict(lambda: {"pct_drafted": 0.0, "fpts_contest": None})
     skipped = 0
+    is_showdown = False
     with open(csv_path, encoding="utf-8-sig") as f:
         reader = csv.DictReader(f)
         for row in reader:
             name = (row.get("Player") or "").strip()
             if not name:
                 continue
+            if (row.get("Roster Position") or "").strip() == "CPT":
+                is_showdown = True
             pct_raw = (row.get("%Drafted") or "").strip().rstrip("%")
             try:
                 pct = float(pct_raw)
@@ -104,7 +117,7 @@ def parse_contest_standings_csv(csv_path):
             if fpts is not None:
                 totals[name]["fpts_contest"] = fpts
 
-    return dict(totals), skipped
+    return dict(totals), skipped, is_showdown
 
 
 def import_contest_standings(csv_path, slate_id, contest_id, engine=None):
@@ -122,11 +135,24 @@ def import_contest_standings(csv_path, slate_id, contest_id, engine=None):
     explains why) rather than silently dropped - an honest accounting of
     real coverage gaps, not just the players that happened to work.
 
+    A real Showdown contest (parse_contest_standings_csv's is_showdown)
+    matched by name against `slate_id`'s pool gets its real player identity
+    and real position stored, but salary/proj_median/ownership_proxy are
+    deliberately left NULL - this codebase has never loaded a real Showdown
+    slate_player_pool (see data/player_crosswalk.py's SHOWDOWN_PSEUDO_
+    POSITIONS comments: no real Showdown CSV export was ever available), so
+    the only pool available to match against is Classic-priced, and a
+    Showdown CPT/FLEX slot's real DK salary is NOT the same number as that
+    same player's Classic salary. Computing ownership_proxy off the wrong
+    price would silently corrupt the correlation test rather than honestly
+    report the gap - caught before ever doing that, not after.
+
     Returns {"total_players": int, "matched_with_projection": int,
-    "matched_no_projection": int, "unmatched": int, "csv_rows_skipped": int}.
+    "matched_no_projection": int, "showdown_salary_mismatch": int,
+    "unmatched": int, "csv_rows_skipped": int, "is_showdown": bool}.
     """
     engine = engine or get_engine()
-    ownership_by_name, skipped = parse_contest_standings_csv(csv_path)
+    ownership_by_name, skipped, is_showdown = parse_contest_standings_csv(csv_path)
 
     with engine.connect() as conn:
         pool_rows = conn.execute(
@@ -142,7 +168,7 @@ def import_contest_standings(csv_path, slate_id, contest_id, engine=None):
         proj_by_player_id = {row["player_id"]: float(row["proj_median"]) for row in proj_rows}
 
     to_upsert = []
-    matched_with_projection = matched_no_projection = unmatched = 0
+    matched_with_projection = matched_no_projection = unmatched = showdown_salary_mismatch = 0
     for name, stats in ownership_by_name.items():
         pool_match = pool_by_name.get(name)
         if pool_match is None:
@@ -165,6 +191,30 @@ def import_contest_standings(csv_path, slate_id, contest_id, engine=None):
             continue
 
         player_id = pool_match["player_id"]
+
+        if is_showdown:
+            showdown_salary_mismatch += 1
+            to_upsert.append(
+                {
+                    "contest_id": contest_id,
+                    "slate_id": slate_id,
+                    "player_id": player_id,
+                    "name": name,
+                    "position": pool_match["position"],
+                    "salary": None,
+                    "pct_drafted": stats["pct_drafted"],
+                    "fpts_contest": stats["fpts_contest"],
+                    "proj_median_at_import": None,
+                    "ownership_proxy": None,
+                    "unmatched_reason": (
+                        "real Showdown contest (CPT roster position) matched by name to a "
+                        "Classic-priced slate pool - Classic salary is not valid for Showdown "
+                        "ownership_proxy, so salary/proj_median/proxy are intentionally left unset"
+                    ),
+                }
+            )
+            continue
+
         proj_median = proj_by_player_id.get(player_id)
         proxy_value = None
         unmatched_reason = None
@@ -224,8 +274,10 @@ def import_contest_standings(csv_path, slate_id, contest_id, engine=None):
         "total_players": len(to_upsert),
         "matched_with_projection": matched_with_projection,
         "matched_no_projection": matched_no_projection,
+        "showdown_salary_mismatch": showdown_salary_mismatch,
         "unmatched": unmatched,
         "csv_rows_skipped": skipped,
+        "is_showdown": is_showdown,
     }
 
 
