@@ -1,6 +1,9 @@
+import pytest
+from sqlalchemy import text
+
 from data.player_availability import get_availability_gate
 from data.player_crosswalk import resolve_dk_players_to_gsis
-from data.pre_lock_check import hard_role_exclusions
+from data.pre_lock_check import build_lineup_role_checklist, hard_role_exclusions
 
 # Regression coverage for a real gap: DraftKings labels EVERY row of a
 # Showdown slate's player pool "CPT" or "FLEX" in the same field that
@@ -80,3 +83,66 @@ def test_hard_role_exclusions_catches_a_known_backup_qb_on_a_showdown_slate(engi
 def test_hard_role_exclusions_skips_a_showdown_dst_entirely(engine):
     excluded = hard_role_exclusions(DST_ROWS, engine)
     assert not excluded, f"a real Showdown defense must never be evaluated as a role-exclusion case, got {excluded}"
+
+
+TEST_SHOWDOWN_SLATE_ID = "TEST_SHOWDOWN_ROLE_CHECKLIST"
+
+
+@pytest.fixture
+def showdown_checklist_slate(engine):
+    # build_lineup_role_checklist reads from slate_player_pool by
+    # (slate_id, player_ids) rather than taking player dicts directly, so
+    # this needs real rows inserted under a dedicated test slate_id, unlike
+    # hard_role_exclusions/get_availability_gate above which take dicts.
+    rows = WINSTON_ROWS + CLEAN_ROWS + DST_ROWS
+    with engine.begin() as conn:
+        for row in rows:
+            conn.execute(
+                text(
+                    """
+                    INSERT INTO slate_player_pool (slate_id, player_id, name, position, salary, team)
+                    VALUES (:slate_id, :player_id, :name, :position, 5000, :team)
+                    ON CONFLICT (slate_id, player_id) DO NOTHING
+                    """
+                ),
+                {"slate_id": TEST_SHOWDOWN_SLATE_ID, **row},
+            )
+    try:
+        yield TEST_SHOWDOWN_SLATE_ID
+    finally:
+        with engine.begin() as conn:
+            conn.execute(
+                text("DELETE FROM slate_player_pool WHERE slate_id = :slate_id"),
+                {"slate_id": TEST_SHOWDOWN_SLATE_ID},
+            )
+
+
+def test_build_lineup_role_checklist_flags_a_showdown_qb_as_high_not_a_structural_rb_wr_te_check(
+    engine, showdown_checklist_slate
+):
+    player_ids = [row["player_id"] for row in WINSTON_ROWS + CLEAN_ROWS]
+    results = build_lineup_role_checklist(showdown_checklist_slate, player_ids, engine)
+    by_id = {r["player_id"]: r for r in results}
+
+    # Trevor Lawrence is the real QB on the slate here (as a CPT row) - must
+    # get the unconditional QB/HIGH flag, not be misrouted into the RB/WR/TE
+    # structural volume check the way the pre-fix code would have (checking
+    # raw position "CPT" instead of his real position).
+    lawrence = by_id["SD_CPT_LAWRENCE"]
+    assert lawrence["severity"] == "HIGH"
+    assert "QB" in lawrence["reason"]
+
+    # Jameis Winston (both rows) is also a real QB and must get the same flag.
+    for player_id in ("SD_CPT_WINSTON", "SD_FLEX_WINSTON"):
+        winston = by_id[player_id]
+        assert winston["severity"] == "HIGH"
+        assert "QB" in winston["reason"]
+
+
+def test_build_lineup_role_checklist_skips_a_showdown_dst_entirely(engine, showdown_checklist_slate):
+    player_ids = [row["player_id"] for row in DST_ROWS]
+    results = build_lineup_role_checklist(showdown_checklist_slate, player_ids, engine)
+
+    for result in results:
+        assert result["needs_check"] is False, f"a real Showdown defense must never be flagged, got {result}"
+        assert result["severity"] is None

@@ -302,6 +302,16 @@ def build_lineup_role_checklist(slate_id, player_ids, engine=None):
 
     Returns a list of dicts: player_id, name, position, team, needs_check,
     severity, reason.
+
+    Position-based branching below (QB unconditional, DST skipped, else
+    _role_check_severity) can't just trust p["position"] - true on Classic,
+    but a Showdown row is labeled "CPT"/"FLEX" regardless of the real
+    player's position (data/player_crosswalk.py's SHOWDOWN_PSEUDO_
+    POSITIONS), which silently made this function wrong for Showdown: a
+    real QB would fall into the RB/WR/TE structural check instead of the
+    unconditional QB flag, and a real DST would never get skipped. Same
+    fix as hard_role_exclusions: resolve real position from the player's
+    own history rather than the DK row when it's a pseudo-position.
     """
     engine = engine or get_engine()
 
@@ -322,10 +332,16 @@ def build_lineup_role_checklist(slate_id, player_ids, engine=None):
 
     results = []
     for p in players:
-        if p["position"] == "DST":
+        gsis_id = gsis_by_dk_id.get(p["player_id"])
+        games = games_by_gsis.get(gsis_id, []) if gsis_id is not None else []
+        real_position = p["position"] if p["position"] not in ("CPT", "FLEX") else (
+            games[0]["position"] if games else None
+        )
+
+        if real_position == "DST":
             results.append({**p, "needs_check": False, "severity": None, "reason": None})
             continue
-        if p["position"] == "QB":
+        if real_position == "QB":
             results.append(
                 {
                     **p,
@@ -336,8 +352,7 @@ def build_lineup_role_checklist(slate_id, player_ids, engine=None):
             )
             continue
 
-        gsis_id = gsis_by_dk_id.get(p["player_id"])
-        if gsis_id is None:
+        if gsis_id is None or real_position is None:
             results.append(
                 {
                     **p,
@@ -348,7 +363,7 @@ def build_lineup_role_checklist(slate_id, player_ids, engine=None):
             )
             continue
 
-        needs_check, severity, reason = _role_check_severity(p["position"], games_by_gsis.get(gsis_id, []))
+        needs_check, severity, reason = _role_check_severity(real_position, games)
         results.append({**p, "needs_check": needs_check, "severity": severity, "reason": reason})
 
     return results
