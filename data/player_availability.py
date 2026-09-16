@@ -1,8 +1,16 @@
+from zoneinfo import ZoneInfo
+
 from sqlalchemy import text
 
 from data.nflverse_fetch import download_csv, fetch_schedules
 from data.player_crosswalk import resolve_dk_players_to_gsis
 from db.migrate import get_engine
+
+# nflverse's schedule `gameday` is the game's real local date in US Eastern
+# time (confirmed against real data: BUF@DET week 2 2026's gametime column
+# reads "20:15", matching DK's own "08:15PM ET" for the same game exactly) -
+# not UTC, and not each team's own local timezone.
+_SCHEDULE_TZ = ZoneInfo("America/New_York")
 
 # From nflverse's own dictionary (github.com/nflverse/nflreadr/data-raw/
 # dictionary_roster_status.csv) - these are roster-level statuses, not weekly
@@ -60,7 +68,18 @@ def resolve_slate_season_week(slate_id, engine=None):
         return None
 
     schedules_df = fetch_schedules()
-    game_date = sample.game_time.date().isoformat()
+    # game_time is stored UTC-aware (converted from the DK CSV's real ET
+    # timestamp at parse time - see data/dk_salary_csv.py). Taking .date()
+    # directly on that UTC value is wrong for any night game: an 8:15 PM ET
+    # kickoff is 00:15 UTC the FOLLOWING calendar day, which would look for
+    # a schedule row on a date that doesn't exist - a real bug, caught for
+    # real on the Thursday-night game of a Thu-Mon slate (every game on the
+    # earlier Sunday-only slate started by 4:25 PM ET, never late enough to
+    # cross the UTC midnight boundary, so this never surfaced before).
+    # Converting back to the schedule's own real timezone (US Eastern) before
+    # extracting the date fixes this for every kickoff time, not just
+    # Thursday's.
+    game_date = sample.game_time.astimezone(_SCHEDULE_TZ).date().isoformat()
     match = schedules_df[
         (schedules_df["gameday"] == game_date)
         & ((schedules_df["home_team"] == sample.team) | (schedules_df["away_team"] == sample.team))
