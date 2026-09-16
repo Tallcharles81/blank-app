@@ -133,7 +133,14 @@ def get_availability_gate(dk_players, season, week, engine=None):
         # data/player_crosswalk.py), never a real GSIS id - team defenses
         # aren't people, so they'd never legitimately appear in a per-player
         # roster feed. The absence check below is about real players only.
-        if player["position"] != "DST" and gsis_id not in roster_status_by_gsis:
+        #
+        # Checked on the RESOLVED id, not player["position"] != "DST" - a
+        # Classic DST row's position really is "DST", but a Showdown DST row
+        # is labeled "CPT" or "FLEX" the same as every other Showdown row
+        # (see data/player_crosswalk.py's SHOWDOWN_PSEUDO_POSITIONS), so that
+        # check would wrongly treat a real Showdown defense as a missing
+        # person and exclude it - caught for real testing this exact fix.
+        if not gsis_id.startswith("DST_") and gsis_id not in roster_status_by_gsis:
             # Absent from the current week's roster feed entirely - not even
             # an explicit status, just missing. A real, actively-employed NFL
             # player (53-man roster, practice squad, or reserve/IR) always

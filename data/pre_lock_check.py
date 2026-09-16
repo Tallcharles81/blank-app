@@ -146,8 +146,8 @@ def _load_recent_usage_batch(gsis_ids, engine, max_weeks=ROLE_CHECK_HISTORY_WEEK
     """
     query = text(
         """
-        SELECT player_id, season, week, snap_pct, target_share, carries, injury_status, recency_rank FROM (
-            SELECT player_id, season, week, snap_pct, target_share, carries, injury_status,
+        SELECT player_id, season, week, position, snap_pct, target_share, carries, injury_status, recency_rank FROM (
+            SELECT player_id, season, week, position, snap_pct, target_share, carries, injury_status,
                    ROW_NUMBER() OVER (
                        PARTITION BY player_id ORDER BY season DESC, week DESC
                    ) AS recency_rank
@@ -440,28 +440,45 @@ def hard_role_exclusions(players, engine=None):
     same shape models/optimizer.py's player pool uses) - not necessarily a
     whole slate; callers pass whatever pool they're about to hand to the
     solver. Returns {player_id: reason}.
+
+    Position-aware branching below (QB pattern vs RB/WR/TE volume, and
+    skipping DST entirely) can't just trust `p["position"]` - true on a
+    Classic slate, but a Showdown row's position is "CPT" or "FLEX"
+    regardless of what the real player plays (see
+    data/player_crosswalk.py's SHOWDOWN_PSEUDO_POSITIONS), which silently
+    made this whole function inert for Showdown: DST rows never got
+    filtered out (never literally "DST"), and no real player ever hit the
+    QB branch either. Real position is resolved the same way identity
+    already is for these rows - from the player's own history - rather
+    than trusted from the DK row.
     """
     engine = engine or get_engine()
-    candidates = [p for p in players if p["position"] != "DST"]
-    if not candidates:
+    if not players:
         return {}
 
-    gsis_by_dk_id, _, _ = resolve_dk_players_to_gsis(candidates, engine)
+    gsis_by_dk_id, _, _ = resolve_dk_players_to_gsis(players, engine)
     games_by_gsis = _load_recent_usage_batch(
-        [gid for gid in gsis_by_dk_id.values() if gid is not None], engine
+        [gid for gid in gsis_by_dk_id.values() if gid is not None and not gid.startswith("DST_")], engine
     )
 
     excluded = {}
-    for p in candidates:
+    for p in players:
         gsis_id = gsis_by_dk_id.get(p["player_id"])
-        if gsis_id is None:
-            continue  # no crosswalk match is a thin-data/LOW case, not a hard exclude
+        if gsis_id is None or gsis_id.startswith("DST_"):
+            continue  # no crosswalk match (thin-data/LOW case), or a real defense - neither is a hard exclude here
+
         games = games_by_gsis.get(gsis_id, [])
+        real_position = p["position"] if p["position"] not in ("CPT", "FLEX") else (
+            games[0]["position"] if games else None
+        )
+        if real_position is None:
+            continue  # a Showdown pseudo-position row with no history to recover a real position from
+
         snap_pcts = [float(g["snap_pct"]) for g in games if g["snap_pct"] is not None]
         if len(snap_pcts) < MIN_RECENT_GAMES_FOR_ROLE_CONFIDENCE:
             continue  # too little data to be confident it's genuinely zero/unclear role, not just unrecorded
 
-        if p["position"] == "QB":
+        if real_position == "QB":
             if min(snap_pcts) < MIN_SNAP_PCT_FOR_BENCHED and max(snap_pcts) >= MAX_SNAP_PCT_FOR_FULL_GAME:
                 excluded[p["player_id"]] = (
                     f"intermittent starter pattern in the last {len(snap_pcts)} recorded games "
