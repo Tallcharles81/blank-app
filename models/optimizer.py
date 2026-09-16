@@ -1,5 +1,5 @@
 import math
-from collections import defaultdict
+from collections import Counter, defaultdict
 
 import pulp
 from sqlalchemy import text
@@ -14,8 +14,28 @@ CLASSIC_ROSTER_SIZE = len(CLASSIC_ROSTER)
 SHOWDOWN_ROSTER_SIZE = len(SHOWDOWN_ROSTER)
 CLASSIC_POSITION_MINIMUMS = {"QB": 1, "RB": 2, "WR": 3, "TE": 1, "DST": 1}
 CLASSIC_FLEX_ELIGIBLE = {"RB", "WR", "TE"}
+CLASSIC_SLOT_ELIGIBLE_POSITIONS = {
+    "QB": {"QB"},
+    "RB": {"RB"},
+    "WR": {"WR"},
+    "TE": {"TE"},
+    "FLEX": CLASSIC_FLEX_ELIGIBLE,
+    "DST": {"DST"},
+}
 
 ALLOWED_PROJECTION_FIELDS = {"proj_floor", "proj_median", "proj_ceiling"}
+
+
+class LineupValidationError(ValueError):
+    """Raised by validate_lineup() when a lineup isn't actually legal to
+    submit. A subclass of ValueError so it's still catchable anywhere that
+    already handles ValueError, but named distinctly so it's never confused
+    with - or silently swallowed by - the solver-infeasibility ValueError
+    build_lineups_from_pool's own loop already catches (see that function
+    for why validate_lineup is called OUTSIDE that try/except block: a real
+    validation failure must always raise, never be treated as "diversity/
+    exposure constraints exhausted the feasible pool").
+    """
 
 
 def _load_player_pool(slate_id, projection_field, engine):
@@ -281,6 +301,131 @@ def _solve_showdown(
     return [("CPT", cpt)] + [("FLEX", p) for p in flex]
 
 
+def _validate_classic_roster(roster):
+    problems = []
+    players = [p for _, p in roster]
+
+    if len(roster) != CLASSIC_ROSTER_SIZE:
+        problems.append(f"roster has {len(roster)} players, expected {CLASSIC_ROSTER_SIZE}")
+
+    # The slot-label template itself (exactly one QB/FLEX/TE/DST, two RB,
+    # three WR) - checked BEFORE per-slot eligibility below, because
+    # eligibility alone isn't enough: a real TE labeled "TE" twice (and
+    # "FLEX" zero times) passes every individual eligibility check (a TE
+    # really is eligible for a slot called "TE") while still not being the
+    # roster DraftKings actually requires. This is the check that would
+    # have caught the real incident directly - a FLEX slot mislabeled as a
+    # second dedicated TE slot in a human-written summary.
+    slot_counts = Counter(slot for slot, _ in roster)
+    expected_slot_counts = Counter(CLASSIC_ROSTER)
+    if slot_counts != expected_slot_counts:
+        problems.append(f"slot labels {dict(slot_counts)} don't match the required {dict(expected_slot_counts)}")
+
+    for slot, p in roster:
+        eligible = CLASSIC_SLOT_ELIGIBLE_POSITIONS.get(slot)
+        if eligible is None:
+            problems.append(f"unrecognized slot {slot!r} for {p.get('name')}")
+        elif p["position"] not in eligible:
+            problems.append(f"{p.get('name')} ({p['position']}) is not eligible for slot {slot!r}")
+
+    # Real position counts, derived from each player's own position - never
+    # from slot labels, which is exactly what let a legal roster get
+    # mislabeled as illegal in a human-written summary once already (see
+    # validate_lineup's docstring). A slot can say whatever it wants; this
+    # is the actual, independent source of truth.
+    position_counts = Counter(p["position"] for p in players)
+    if position_counts.get("QB", 0) != 1:
+        problems.append(f"expected exactly 1 QB, got {position_counts.get('QB', 0)}")
+    if position_counts.get("DST", 0) != 1:
+        problems.append(f"expected exactly 1 DST, got {position_counts.get('DST', 0)}")
+    for pos in ("RB", "WR", "TE"):
+        if position_counts.get(pos, 0) < CLASSIC_POSITION_MINIMUMS[pos]:
+            problems.append(
+                f"expected at least {CLASSIC_POSITION_MINIMUMS[pos]} {pos}, got {position_counts.get(pos, 0)}"
+            )
+    # The one extra RB/WR/TE beyond the position minimums fills FLEX - could
+    # legally be a 3rd RB, a 4th WR, or a 2nd TE. Any of those is fine;
+    # anything else (too many or too few total across RB+WR+TE) isn't.
+    flex_pool_count = sum(position_counts.get(pos, 0) for pos in CLASSIC_FLEX_ELIGIBLE)
+    expected_flex_pool_count = sum(CLASSIC_POSITION_MINIMUMS[pos] for pos in CLASSIC_FLEX_ELIGIBLE) + 1
+    if flex_pool_count != expected_flex_pool_count:
+        problems.append(f"RB+WR+TE count is {flex_pool_count}, expected exactly {expected_flex_pool_count}")
+
+    return problems
+
+
+def _validate_showdown_roster(roster):
+    problems = []
+    players = [p for _, p in roster]
+
+    if len(roster) != SHOWDOWN_ROSTER_SIZE:
+        problems.append(f"roster has {len(roster)} players, expected {SHOWDOWN_ROSTER_SIZE}")
+
+    cpt_count = sum(1 for p in players if p["position"] == "CPT")
+    if cpt_count != 1:
+        problems.append(f"expected exactly 1 CPT, got {cpt_count}")
+
+    # The CPT and FLEX rows for the same real player have different
+    # player_ids but are the same person - a real name showing up twice
+    # means that person got rostered in both slots.
+    names = [p["name"] for p in players]
+    if len(set(names)) != len(names):
+        dupes = sorted({n for n in names if names.count(n) > 1})
+        problems.append(f"same real player rostered twice (CPT and FLEX): {dupes}")
+
+    for slot, p in roster:
+        if slot not in ("CPT", "FLEX"):
+            problems.append(f"unrecognized slot {slot!r} for {p.get('name')}")
+
+    return problems
+
+
+def validate_lineup(lineup, salary_cap=SALARY_CAP):
+    """The final, independent legality check every lineup passes through
+    before it can ever leave build_lineups_from_pool - real position counts
+    and salary re-derived from the actual roster data (never from slot
+    labels, never from solver internals, never from a caller's own summary
+    of it), so this catches a real solver bug the same way it would catch a
+    downstream reporting bug.
+
+    Added after a real incident: a lineup reported to the user labeled a
+    FLEX slot - correctly filled by a second TE, which is legal under
+    DraftKings' own rules (FLEX accepts RB/WR/TE) - as a second dedicated
+    "TE" slot in a human-written summary table, making a fully legal 2 RB/
+    3 WR/1 TE/1 FLEX-as-TE roster read as an illegal 2 RB/2 TE roster
+    missing an RB. The underlying optimizer output was correct the whole
+    time - nothing had ever independently re-verified the REPORTED lineup
+    against real DK roster rules before this, so a presentation mistake
+    was indistinguishable from a real solver bug until counted by hand.
+
+    Auto-detects classic vs showdown the same way build_lineups_from_pool
+    does (a "CPT" position anywhere in the roster). Raises
+    LineupValidationError listing every problem found at once (not just
+    the first) if the lineup is illegal - never returns a partial or
+    best-effort verdict, and never silently drops a bad lineup instead of
+    raising.
+    """
+    roster = lineup.get("roster", [])
+    players = [p for _, p in roster]
+    problems = []
+
+    player_ids = [p["player_id"] for p in players]
+    if len(set(player_ids)) != len(player_ids):
+        dupes = sorted({pid for pid in player_ids if player_ids.count(pid) > 1})
+        problems.append(f"duplicate player(s) in roster: {dupes}")
+
+    total_salary = sum(p["salary"] for p in players)
+    if total_salary > salary_cap:
+        problems.append(f"total salary ${total_salary} exceeds cap ${salary_cap}")
+
+    is_showdown = any(p["position"] == "CPT" for p in players)
+    problems.extend(_validate_showdown_roster(roster) if is_showdown else _validate_classic_roster(roster))
+
+    if problems:
+        raise LineupValidationError("; ".join(problems))
+    return True
+
+
 def _resolve_exposure(spec, player_id):
     # spec is None (no cap/floor at all), a single float/int (applies to every
     # player), or a dict of per-player overrides with an optional "default" for
@@ -396,18 +541,25 @@ def build_lineups_from_pool(
                 raise
             break  # diversity/exposure constraints have exhausted the feasible pool
 
+        lineup = {
+            "roster": slots,
+            "total_salary": sum(p["salary"] for _, p in slots),
+            "total_points": sum(p["points"] for _, p in slots),
+        }
+        # The first, hard gate on the OUTPUT side, the same way the availability/
+        # role/lock-time gates are hard gates on the input side - deliberately
+        # OUTSIDE the try/except above, so a real validation failure always
+        # raises LineupValidationError and is never mistaken for the solver
+        # simply running out of feasible lineups (see that exception's
+        # docstring). No lineup this function returns has skipped this check.
+        validate_lineup(lineup, salary_cap=salary_cap)
+
         lineup_ids = [p["player_id"] for _, p in slots]
         previous_lineups.append(set(lineup_ids))
         for pid in lineup_ids:
             exposure_counts[pid] += 1
 
-        lineups.append(
-            {
-                "roster": slots,
-                "total_salary": sum(p["salary"] for _, p in slots),
-                "total_points": sum(p["points"] for _, p in slots),
-            }
-        )
+        lineups.append(lineup)
 
     built = len(lineups)
     exposure_report = {
