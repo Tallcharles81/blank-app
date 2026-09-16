@@ -109,6 +109,29 @@ def get_availability_gate(dk_players, season, week, engine=None):
         if gsis_id is None:
             continue  # a crosswalk gap is data.player_crosswalk's concern, not this gate's
 
+        # DST rows resolve to a synthetic "DST_{team}" id (see
+        # data/player_crosswalk.py), never a real GSIS id - team defenses
+        # aren't people, so they'd never legitimately appear in a per-player
+        # roster feed. The absence check below is about real players only.
+        if player["position"] != "DST" and gsis_id not in roster_status_by_gsis:
+            # Absent from the current week's roster feed entirely - not even
+            # an explicit status, just missing. A real, actively-employed NFL
+            # player (53-man roster, practice squad, or reserve/IR) always
+            # appears in this feed with SOME status; total absence means
+            # retired, released-and-unsigned, or an edge-case designation this
+            # feed doesn't capture under a normal code. Caught for real:
+            # Brandon Aiyuk (real ACL/MCL/meniscus tear Oct 2024, hasn't
+            # played since, his own GM has said he'll never play for the team
+            # again, on a "Reserve/Left Squad" designation) is completely
+            # absent from the 2026 week-2 roster feed - not listed as RES,
+            # not listed at all - and was passing through this gate as
+            # eligible before this check existed, since `.get()` on a missing
+            # key returned None, which isn't in HARD_EXCLUDE_ROSTER_STATUSES
+            # either. Absence is treated as MORE suspicious than an explicit
+            # status, not less.
+            excluded[dk_id] = "not found on any team's current roster"
+            continue
+
         roster_status = roster_status_by_gsis.get(gsis_id)
         if roster_status in HARD_EXCLUDE_ROSTER_STATUSES:
             excluded[dk_id] = f"roster status: {roster_status}"
