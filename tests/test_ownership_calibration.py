@@ -5,8 +5,10 @@ from sqlalchemy import text
 
 from data.ownership_calibration import (
     MIN_MATCHED_PLAYERS_FOR_CORRELATION,
+    _classify_qb_starter_certainty,
     _rank,
     _spearman,
+    analyze_qb_ownership_gap,
     import_contest_standings,
     parse_contest_standings_csv,
     run_ownership_correlation_test,
@@ -204,3 +206,59 @@ def test_run_ownership_correlation_test_stores_results_when_requested(engine, im
             text("SELECT proxy_basis FROM ownership_calibration_runs WHERE contest_id = :c"), {"c": TEST_CONTEST_ID}
         ).scalars().fetchall()
     assert set(stored) == {"proj_median", "realized_fpts", "realized_fpts_full_sample"}
+
+
+# --- QB starter-certainty dig ----------------------------------------------
+
+
+def _game(snap_pct):
+    return {"snap_pct": snap_pct}
+
+
+def test_classify_qb_starter_certainty_thin_data():
+    assert _classify_qb_starter_certainty([_game(0.9)]) == "thin_data"
+
+
+def test_classify_qb_starter_certainty_intermittent_backup_pattern():
+    # Real Jameis Winston shape - the exact pattern data/pre_lock_check.py's
+    # hard gate is built to catch.
+    games = [_game(0.03), _game(1.0), _game(1.0), _game(0.77)]
+    assert _classify_qb_starter_certainty(games) == "intermittent_backup_pattern"
+
+
+def test_classify_qb_starter_certainty_clean_starter():
+    games = [_game(1.0), _game(0.99), _game(0.95), _game(1.0)]
+    assert _classify_qb_starter_certainty(games) == "clean_starter"
+
+
+def test_classify_qb_starter_certainty_uncertain_other():
+    # Real variability that doesn't fit the extreme backup signature (never
+    # near-zero) and doesn't clear the clean-starter bar either.
+    games = [_game(1.0), _game(0.39), _game(0.98), _game(0.92)]
+    assert _classify_qb_starter_certainty(games) == "uncertain_other"
+
+
+def test_analyze_qb_ownership_gap_runs_on_real_contest_and_reports_every_category(engine):
+    # Uses the real, permanently-imported contest 193028208 - see the
+    # comment on test_run_ownership_correlation_test_uses_the_same_
+    # intersected_sample_for_both_bases above for why this dependency is
+    # deliberate, matching this codebase's existing real-fixture-dependent
+    # test pattern.
+    result = analyze_qb_ownership_gap("193028208", slate_id="dk_thu_mon_2026_09_17", engine=engine)
+
+    assert len(result["qbs"]) >= MIN_MATCHED_PLAYERS_FOR_CORRELATION  # a real, non-trivial number of real QBs
+    for qb in result["qbs"]:
+        assert qb["starter_certainty"] in {"thin_data", "intermittent_backup_pattern", "clean_starter", "uncertain_other"}
+
+    summary = result["summary_by_starter_certainty"]
+    # Real result on this contest: starter uncertainty is a REAL contributing
+    # factor (intermittent-backup QBs show a clearly more negative mean
+    # rank_diff than clean starters) but does NOT explain most of QB's
+    # overall bias - clean, obviously-certain starters still carry a
+    # substantial negative rank_diff of their own. Asserting the direction
+    # (backups worse than clean starters) since that's the real, structural
+    # relationship; not asserting exact numbers, which will shift as more
+    # contests are added to this same real dev-DB fixture over time.
+    assert "clean_starter" in summary
+    assert "intermittent_backup_pattern" in summary
+    assert summary["intermittent_backup_pattern"]["mean_rank_diff"] < summary["clean_starter"]["mean_rank_diff"]

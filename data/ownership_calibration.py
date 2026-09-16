@@ -5,6 +5,13 @@ from collections import defaultdict
 
 from sqlalchemy import text
 
+from data.player_crosswalk import resolve_dk_players_to_gsis
+from data.pre_lock_check import (
+    MAX_SNAP_PCT_FOR_FULL_GAME,
+    MIN_RECENT_GAMES_FOR_ROLE_CONFIDENCE,
+    MIN_SNAP_PCT_FOR_BENCHED,
+    _load_recent_usage_batch,
+)
 from db.migrate import get_engine
 from models.field_simulation import ownership_proxy
 from models.simulation import _standard_normal_cdf
@@ -475,3 +482,139 @@ def _run_one_basis(rows, proxy_key, proxy_value_getter):
         "p_value": round(p_value, 6) if p_value is not None else None,
         "systematic_miss_check": systematic_miss_check,
     }
+
+
+# QB's real, structural rank_diff bias in every contest analyzed so far
+# (-67.1 on this contest's proj_median basis) raised a concrete, testable
+# question: is this actually "QB projections are bad," or specifically
+# "QB projections don't account for the field's own uncertainty about who's
+# playing" - the exact Jameis Winston/Marcus Mariota shape already found
+# elsewhere in this codebase (a real backup given a real starter-level
+# projection because nothing checks who's actually confirmed to start).
+# _classify_qb_starter_certainty reuses data/pre_lock_check.py's own
+# intermittent-backup-pattern rule (MIN_SNAP_PCT_FOR_BENCHED/MAX_SNAP_PCT_
+# FOR_FULL_GAME) rather than inventing a second, parallel definition of
+# "uncertain starter" - same real signal, same real thresholds, applied
+# here to explain an ownership gap instead of to hard-exclude a player.
+CLEAN_STARTER_MIN_SNAP_PCT = 0.75
+
+
+def _classify_qb_starter_certainty(games):
+    """Real, data-driven starter-certainty label for one QB, from his own
+    recent player_weekly_stats snap_pct history:
+      - "thin_data": fewer than MIN_RECENT_GAMES_FOR_ROLE_CONFIDENCE recent
+        games on record (a rookie, a recent trade, a Week 1 unknown) - not
+        evidence of anything, just not enough signal either way.
+      - "intermittent_backup_pattern": the same real backup/spot-starter
+        signature data/pre_lock_check.py's hard gate uses (a game with
+        near-zero snaps AND a game with near-full snaps in the same recent
+        window) - the field would have real, legitimate reason to hesitate
+        on this player regardless of what a raw projection says.
+      - "clean_starter": every recent recorded game at or above
+        CLEAN_STARTER_MIN_SNAP_PCT - about as close to "no real starter
+        uncertainty" as this codebase's own data can confirm.
+      - "uncertain_other": neither extreme - some real variability that
+        doesn't fit the clean backup signature either (a genuine QB
+        competition, a recent in-season change, a bye/injury-shortened
+        game) - still real uncertainty, just not the specific pattern the
+        hard gate looks for.
+    """
+    snap_pcts = [float(g["snap_pct"]) for g in games if g["snap_pct"] is not None]
+    if len(snap_pcts) < MIN_RECENT_GAMES_FOR_ROLE_CONFIDENCE:
+        return "thin_data"
+    if min(snap_pcts) < MIN_SNAP_PCT_FOR_BENCHED and max(snap_pcts) >= MAX_SNAP_PCT_FOR_FULL_GAME:
+        return "intermittent_backup_pattern"
+    if min(snap_pcts) >= CLEAN_STARTER_MIN_SNAP_PCT:
+        return "clean_starter"
+    return "uncertain_other"
+
+
+def analyze_qb_ownership_gap(contest_id, slate_id=None, engine=None):
+    """For every real QB matched in this contest (real stored proj_median +
+    real ownership_proxy), pairs their real ownership rank_diff (see
+    _systematic_miss_check - proxy_rank minus ownership_rank on the
+    proj_median basis, computed here across the WHOLE real matched pool so
+    ranks are relative to every position, not just QBs) with a real,
+    data-driven starter-certainty label from their own recent usage
+    history. Tests a concrete, falsifiable hypothesis: is QB's real,
+    structural rank_diff bias actually explained by starter uncertainty
+    (a real backup/committee/rookie situation the projection doesn't know
+    to discount), rather than "QB projections are bad" in general?
+
+    Returns {"qbs": [...], "summary_by_starter_certainty": {...}} - the
+    summary is what answers the hypothesis: if clean_starter QBs show a
+    real rank_diff near zero while every other category shows a real,
+    large negative rank_diff (proxy overrating them relative to a field
+    that correctly hesitated), that's the concrete, fixable finding; if
+    clean_starter QBs ALSO show a large gap, the uncertainty explanation
+    doesn't hold and the bias is coming from somewhere else.
+    """
+    engine = engine or get_engine()
+    with engine.connect() as conn:
+        all_rows = conn.execute(
+            text("SELECT * FROM contest_ownership WHERE contest_id = :c AND ownership_proxy IS NOT NULL"),
+            {"c": contest_id},
+        ).mappings().fetchall()
+    all_rows = [dict(r) for r in all_rows]
+    if not all_rows:
+        raise ValueError(f"No matched contest_ownership rows for contest_id={contest_id} - import it first")
+
+    qb_rows = [r for r in all_rows if r["position"] == "QB"]
+    if not qb_rows:
+        raise ValueError(f"No matched QB rows for contest_id={contest_id}")
+
+    if slate_id is None:
+        slate_ids = {r["slate_id"] for r in all_rows if r["slate_id"]}
+        slate_id = slate_ids.pop() if len(slate_ids) == 1 else None
+
+    pct_values = [float(r["pct_drafted"]) for r in all_rows]
+    proxy_values = [float(r["ownership_proxy"]) for r in all_rows]
+    ownership_rank = _rank(pct_values)
+    proxy_rank = _rank(proxy_values)
+    rank_diff_by_name = {
+        r["name"]: p_rank - o_rank for r, o_rank, p_rank in zip(all_rows, ownership_rank, proxy_rank)
+    }
+
+    with engine.connect() as conn:
+        team_rows = conn.execute(
+            text("SELECT player_id, team FROM slate_player_pool WHERE slate_id = :s AND player_id = ANY(:ids)"),
+            {"s": slate_id, "ids": [r["player_id"] for r in qb_rows]},
+        ).fetchall()
+    team_by_player_id = dict(team_rows)
+
+    dk_players = [
+        {"player_id": r["player_id"], "name": r["name"], "position": "QB", "team": team_by_player_id.get(r["player_id"], "")}
+        for r in qb_rows
+    ]
+    gsis_by_dk_id, _, _ = resolve_dk_players_to_gsis(dk_players, engine)
+    games_by_gsis = _load_recent_usage_batch(
+        [gid for gid in gsis_by_dk_id.values() if gid is not None], engine
+    )
+
+    qb_results = []
+    for r in qb_rows:
+        gsis_id = gsis_by_dk_id.get(r["player_id"])
+        games = games_by_gsis.get(gsis_id, []) if gsis_id is not None else []
+        certainty = _classify_qb_starter_certainty(games)
+        qb_results.append(
+            {
+                "name": r["name"],
+                "salary": r["salary"],
+                "pct_drafted": float(r["pct_drafted"]),
+                "proj_median": float(r["proj_median_at_import"]),
+                "rank_diff": round(rank_diff_by_name[r["name"]], 1),
+                "starter_certainty": certainty,
+                "recent_snap_pcts": [float(g["snap_pct"]) for g in games if g["snap_pct"] is not None],
+            }
+        )
+    qb_results.sort(key=lambda r: r["rank_diff"])
+
+    by_category = defaultdict(list)
+    for r in qb_results:
+        by_category[r["starter_certainty"]].append(r["rank_diff"])
+    summary_by_starter_certainty = {
+        category: {"n": len(diffs), "mean_rank_diff": round(sum(diffs) / len(diffs), 2)}
+        for category, diffs in by_category.items()
+    }
+
+    return {"qbs": qb_results, "summary_by_starter_certainty": summary_by_starter_certainty}
