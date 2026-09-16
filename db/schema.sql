@@ -166,3 +166,47 @@ CREATE TABLE IF NOT EXISTS pre_lock_checks (
 
 CREATE INDEX IF NOT EXISTS idx_pre_lock_checks_slate_id
     ON pre_lock_checks (slate_id);
+
+-- Real, measured post-contest ownership - see data/ownership_calibration.py.
+-- One row per (contest, player) from a real DraftKings contest-standings
+-- export the user has actually entered. Not tied to slate_player_pool via a
+-- foreign key: a real contest export can include players our own pool never
+-- had a row for (deep bench, late scratches, name-format mismatches), and
+-- those unmatched rows are still worth keeping on record rather than
+-- silently dropped - see unmatched_reason.
+CREATE TABLE IF NOT EXISTS contest_ownership (
+    contest_id              TEXT NOT NULL,
+    slate_id                TEXT,
+    player_id               TEXT,
+    name                    TEXT NOT NULL,
+    position                TEXT,
+    salary                  INTEGER,
+    pct_drafted             NUMERIC(6, 3) NOT NULL,
+    fpts_contest            NUMERIC(6, 2),
+    proj_median_at_import   NUMERIC(6, 2),
+    ownership_proxy         NUMERIC(10, 4),
+    unmatched_reason        TEXT,
+    imported_at             TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (contest_id, name)
+);
+
+CREATE INDEX IF NOT EXISTS idx_contest_ownership_slate_id
+    ON contest_ownership (slate_id);
+
+-- One row per real correlation-test run against an imported contest, so the
+-- accumulating history of "how good is ownership_proxy really" over
+-- multiple real contests is itself queryable, not just the latest number.
+CREATE TABLE IF NOT EXISTS ownership_calibration_runs (
+    id                  BIGSERIAL PRIMARY KEY,
+    contest_id          TEXT NOT NULL,
+    slate_id            TEXT,
+    n_matched           INTEGER NOT NULL,
+    spearman_rho        NUMERIC(6, 4),
+    p_value             NUMERIC(10, 8),
+    proxy_basis         TEXT NOT NULL,
+    notes               JSONB,
+    run_at              TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_ownership_calibration_runs_contest_id
+    ON ownership_calibration_runs (contest_id);
