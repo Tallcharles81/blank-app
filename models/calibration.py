@@ -5,7 +5,7 @@ from collections import defaultdict
 
 from sqlalchemy import text
 
-from data.nflverse_fetch import _team_implied_totals, fetch_schedules
+from data.nflverse_fetch import _team_implied_totals, _team_points_scored, fetch_schedules
 from data.player_crosswalk import resolve_dk_players_to_gsis
 from data.pre_lock_check import MIN_RECENT_GAMES_FOR_ROLE_CONFIDENCE, _load_recent_usage_batch, _would_be_hard_excluded
 from db.migrate import get_engine
@@ -1074,3 +1074,187 @@ def run_situational_backtest(source_slate_id, seasons=None, engine=None):
         }
 
     return result
+
+
+# A sharper, more mechanistic version of run_situational_backtest's blunt
+# rematch flag: within real divisional rematches specifically, does it
+# matter HOW the first meeting went - specifically, did the offense score
+# well above its own season norm against this same rival? "Season norm"
+# deliberately excludes both meetings against that rival (not just meeting
+# 1) - the point is comparing the rival matchup to how this offense
+# performs against everyone else, not letting the rematch itself leak into
+# its own baseline.
+#
+# MIN_OTHER_GAMES_FOR_SEASON_BASELINE=3: a team's non-rival scoring average
+# needs a real minimum sample to mean anything (a rookie-season team with
+# only 1-2 non-rival games so far, e.g. very early in a season, would make
+# "season average" mostly noise) - mirrors MIN_RECENT_GAMES_FOR_ROLE_
+# CONFIDENCE's role elsewhere in this codebase.
+MIN_OTHER_GAMES_FOR_SEASON_BASELINE = 3
+
+
+def _real_divisional_rematch_torch_margins(schedules_df):
+    """For every real divisional rematch pair (season, {team_a, team_b}),
+    both teams' own real "did this offense torch this rival in meeting 1"
+    margin - real meeting-1 points scored against the rival, minus that
+    team's own real season average points scored against everyone ELSE
+    that season (see MIN_OTHER_GAMES_FOR_SEASON_BASELINE). Both teams in
+    the pair are evaluated independently (team A's offense vs team B's
+    defense is a different real question from team B's offense vs team
+    A's defense, even though it's the same two games) - a real division
+    rivalry produces two independent torch/no-torch observations, not one.
+
+    Returns [{"team", "season", "rival", "week1", "week2", "margin"}, ...] -
+    week2 is the real rematch week whose player-level outcomes get
+    evaluated; week1 is the meeting being scored for "did they torch them."
+    """
+    df = schedules_df[(schedules_df["game_type"] == "REG")].dropna(subset=["home_score", "away_score"])
+    points_scored_by_team_week = _team_points_scored(df)
+
+    team_season_games = defaultdict(list)  # (team, season) -> [(week, points_scored, opponent)]
+    for (team, season, week), (opponent, points) in points_scored_by_team_week.items():
+        team_season_games[(team, season)].append((week, points, opponent))
+
+    weeks_by_matchup = defaultdict(list)
+    for row in df[df["div_game"] == 1].itertuples():
+        weeks_by_matchup[(row.season, frozenset({row.home_team, row.away_team}))].append(row.week)
+
+    observations = []
+    for (season, teams), weeks in weeks_by_matchup.items():
+        weeks = sorted(weeks)
+        if len(weeks) < 2:
+            continue  # only one real meeting this season - no rematch to evaluate
+        week1, week2 = weeks[0], weeks[1]
+        for team, rival in ((t, next(iter(teams - {t}))) for t in teams):
+            games = team_season_games.get((team, season), [])
+            meeting1 = next((pts for w, pts, opp in games if w == week1 and opp == rival), None)
+            if meeting1 is None:
+                continue
+            other_games = [pts for w, pts, opp in games if opp != rival]
+            if len(other_games) < MIN_OTHER_GAMES_FOR_SEASON_BASELINE:
+                continue
+            season_baseline = sum(other_games) / len(other_games)
+            observations.append(
+                {
+                    "team": team,
+                    "season": season,
+                    "rival": rival,
+                    "week1": week1,
+                    "week2": week2,
+                    "margin": meeting1 - season_baseline,
+                }
+            )
+    return observations
+
+
+def run_divisional_rematch_torch_backtest(source_slate_id, seasons=None, engine=None):
+    """Splits real divisional rematches by HOW the first meeting went,
+    rather than treating every rematch identically (see
+    run_situational_backtest's blunt divisional_rematch flag, which found
+    no significant effect pooled). Real observations are split by a median
+    cut of _real_divisional_rematch_torch_margins' real margin distribution
+    into "torched" (this offense scored well above its own season norm
+    against this rival in meeting 1) vs "did_not_torch" (at or below
+    median) - a median split rather than a hand-picked absolute point
+    threshold, so it reflects the real distribution's own shape rather
+    than an invented cutoff.
+
+    For each group, evaluates real, no-lookahead as-of P90 ceiling hit
+    rate and central-tendency bias (actual - proj_median) for that
+    offense's own real skill-position players (QB/RB/WR/TE - not DST,
+    which doesn't have an "offense torched them" mechanism) in the REMATCH
+    week specifically, then a two-sample significance test comparing the
+    two groups directly - the sharper, mechanistic version of "does
+    familiarity cap upside" the user asked for, versus the blunt yes/no
+    rematch flag already tested.
+
+    Returns {"n_torched_player_weeks", "n_did_not_torch_player_weeks",
+    "median_margin_split", "p90_hit_rate_torched",
+    "p90_hit_rate_did_not_torch", "hit_rate_t_stat", "hit_rate_p_value",
+    "mean_bias_torched", "mean_bias_did_not_torch", "bias_t_stat",
+    "bias_p_value"} - or a dict with None numbers and a "note" if the real
+    sample is too small to trust (see MIN_MATCHED_PLAYERS_FOR_CORRELATION's
+    role elsewhere in this codebase for the same reasoning applied here).
+    """
+    engine = engine or get_engine()
+
+    slate_players = load_slate_pool(source_slate_id, engine)
+    if not slate_players:
+        raise ValueError(f"No players found in slate_player_pool for slate {source_slate_id}")
+    skill_players = [p for p in slate_players if p["position"] in ("QB", "RB", "WR", "TE")]
+    gsis_by_dk_id, _, _ = resolve_dk_players_to_gsis(skill_players, engine)
+    players_by_id = {p["player_id"]: p for p in skill_players}
+
+    available_weeks = set(_available_weeks(engine))
+    if seasons is not None:
+        available_weeks = {(s, w) for s, w in available_weeks if s in seasons}
+
+    observations = _real_divisional_rematch_torch_margins(fetch_schedules())
+    observations = [o for o in observations if (o["season"], o["week2"]) in available_weeks]
+    if not observations:
+        raise ValueError(f"No real divisional rematch observations fall within the evaluated weeks for {source_slate_id}")
+
+    margins = sorted(o["margin"] for o in observations)
+    median_margin = margins[len(margins) // 2] if len(margins) % 2 else (margins[len(margins) // 2 - 1] + margins[len(margins) // 2]) / 2
+    torch_by_team_season_week2 = {
+        (o["team"], o["season"], o["week2"]): o["margin"] > median_margin for o in observations
+    }
+
+    records = {"torched": [], "did_not_torch": []}  # each: (p90_hit, bias)
+    for season, week in sorted(available_weeks):
+        relevant = {(team, s, w): torched for (team, s, w), torched in torch_by_team_season_week2.items() if s == season and w == week}
+        if not relevant:
+            continue
+
+        history = _load_recent_stats(gsis_by_dk_id.values(), engine, before=(season, week))
+        actual_points, _ = load_actual_scores(skill_players, season, week, engine)
+        played_gsis_ids = _played_gsis_ids(gsis_by_dk_id.values(), season, week, engine)
+        teams_by_gsis = _teams_for_week(gsis_by_dk_id.values(), season, week, engine)
+
+        for dk_id, gsis_id in gsis_by_dk_id.items():
+            if dk_id not in actual_points or gsis_id not in played_gsis_ids:
+                continue
+            real_team = teams_by_gsis.get(gsis_id)
+            torched = relevant.get((real_team, season, week))
+            if torched is None:
+                continue  # this player's real team wasn't in a rematch this week
+
+            games = history.get(gsis_id)
+            if not games:
+                continue
+            player = players_by_id[dk_id]
+            proj = _project_from_history(games, player["position"])
+            actual = actual_points[dk_id]
+            p90_hit = 1 if actual >= proj["proj_ceiling"] else 0
+            bias = actual - proj["proj_median"]
+            records["torched" if torched else "did_not_torch"].append((p90_hit, bias))
+
+    n_torched, n_did_not = len(records["torched"]), len(records["did_not_torch"])
+    if n_torched < 20 or n_did_not < 20:
+        return {
+            "n_torched_player_weeks": n_torched,
+            "n_did_not_torch_player_weeks": n_did_not,
+            "note": "too few real player-weeks in one or both groups to trust a comparison (need >= 20 each)",
+        }
+
+    torched_hits = [r[0] for r in records["torched"]]
+    did_not_hits = [r[0] for r in records["did_not_torch"]]
+    torched_bias = [r[1] for r in records["torched"]]
+    did_not_bias = [r[1] for r in records["did_not_torch"]]
+
+    _, _, hit_t, hit_p = _two_sample_significance(torched_hits, did_not_hits)
+    mean_bias_torched, mean_bias_did_not, bias_t, bias_p = _two_sample_significance(torched_bias, did_not_bias)
+
+    return {
+        "n_torched_player_weeks": n_torched,
+        "n_did_not_torch_player_weeks": n_did_not,
+        "median_margin_split": round(median_margin, 2),
+        "p90_hit_rate_torched": round(sum(torched_hits) / n_torched, 4),
+        "p90_hit_rate_did_not_torch": round(sum(did_not_hits) / n_did_not, 4),
+        "hit_rate_t_stat": round(hit_t, 4) if hit_t is not None else None,
+        "hit_rate_p_value": round(hit_p, 4) if hit_p is not None else None,
+        "mean_bias_torched": round(mean_bias_torched, 3) if mean_bias_torched is not None else None,
+        "mean_bias_did_not_torch": round(mean_bias_did_not, 3) if mean_bias_did_not is not None else None,
+        "bias_t_stat": round(bias_t, 4) if bias_t is not None else None,
+        "bias_p_value": round(bias_p, 4) if bias_p is not None else None,
+    }

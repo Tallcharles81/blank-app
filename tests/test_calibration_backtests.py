@@ -1,8 +1,14 @@
+from collections import defaultdict
+
+import pytest
+
 from data.nflverse_fetch import fetch_schedules
 from models.calibration import (
     MIN_PAIRS_FOR_FITTED_CORRELATION,
     _classify_situational_games,
+    _real_divisional_rematch_torch_margins,
     fit_real_correlation_matrix,
+    run_divisional_rematch_torch_backtest,
     run_game_environment_backtest_comparison,
     run_hard_exclude_backtest,
     run_situational_backtest,
@@ -121,3 +127,53 @@ def test_run_situational_backtest_runs_and_reports_all_three_categories(engine):
             assert 0.0 <= stats["hit_rate_p_value"] <= 1.0
         if stats["bias_p_value"] is not None:
             assert 0.0 <= stats["bias_p_value"] <= 1.0
+
+
+# --- run_divisional_rematch_torch_backtest ---------------------------------
+# A sharper refinement of divisional_rematch above: within real rematches,
+# does it matter whether the offense scored well above its own season norm
+# against this same rival in meeting 1?
+
+
+def test_real_divisional_rematch_torch_margins_finds_real_observations():
+    observations = _real_divisional_rematch_torch_margins(fetch_schedules())
+    assert observations, "real divisional rematches with a computable margin must exist"
+
+    for obs in observations[:5]:
+        assert obs["week2"] > obs["week1"]  # the rematch is chronologically after meeting 1
+        assert obs["team"] != obs["rival"]
+
+    # Both teams in a real rematch pair get their own independent margin -
+    # team A's offense-vs-team-B's-defense is a different real question
+    # from team B's offense-vs-team-A's-defense, even in the same two games.
+    pairs = {(o["season"], frozenset({o["team"], o["rival"]})) for o in observations}
+    teams_per_pair = defaultdict(set)
+    for o in observations:
+        teams_per_pair[(o["season"], frozenset({o["team"], o["rival"]}))].add(o["team"])
+    both_sides_present = sum(1 for pair in pairs if len(teams_per_pair[pair]) == 2)
+    assert both_sides_present > 0
+
+
+def test_run_divisional_rematch_torch_backtest_runs_and_reports_real_numbers(engine):
+    # Scoped to 2023 for the same reason as the situational backtest above -
+    # a full real season is needed for a meaningful rematch sample.
+    result = run_divisional_rematch_torch_backtest("dk_thu_mon_2026_09_17", seasons={2023}, engine=engine)
+
+    assert "note" not in result, f"expected a real comparison, got: {result}"
+    assert result["n_torched_player_weeks"] >= 20
+    assert result["n_did_not_torch_player_weeks"] >= 20
+    assert 0.0 <= result["p90_hit_rate_torched"] <= 1.0
+    assert 0.0 <= result["p90_hit_rate_did_not_torch"] <= 1.0
+    if result["hit_rate_p_value"] is not None:
+        assert 0.0 <= result["hit_rate_p_value"] <= 1.0
+    if result["bias_p_value"] is not None:
+        assert 0.0 <= result["bias_p_value"] <= 1.0
+
+
+def test_run_divisional_rematch_torch_backtest_reports_too_small_a_sample_honestly(engine):
+    # 2026 has only one real week of data so far - no real rematch (which
+    # needs two meetings) can exist yet. Must report that honestly via the
+    # "note" field rather than silently returning a comparison built on an
+    # empty or near-empty sample.
+    with pytest.raises(ValueError, match="No real divisional rematch observations"):
+        run_divisional_rematch_torch_backtest("dk_thu_mon_2026_09_17", seasons={2026}, engine=engine)

@@ -216,6 +216,27 @@ def _team_points_allowed(schedules_df):
     return {(row.team, row.season, row.week): row.points_allowed for row in combined.itertuples()}
 
 
+def _team_points_scored(schedules_df):
+    """The mirror image of _team_points_allowed - each team's OWN real
+    points scored per (team, season, week), not what they gave up. Used by
+    models/calibration.py's divisional-rematch-torch backtest to measure
+    whether an offense scored well above its own season average against a
+    specific rival in their first meeting, not what that rival's defense
+    allowed in general.
+    """
+    df = schedules_df.dropna(subset=["home_score", "away_score"])
+    home = df[["season", "week", "home_team", "away_team", "home_score"]].rename(
+        columns={"home_team": "team", "away_team": "opponent", "home_score": "points_scored"}
+    )
+    away = df[["season", "week", "away_team", "home_team", "away_score"]].rename(
+        columns={"away_team": "team", "home_team": "opponent", "away_score": "points_scored"}
+    )
+    combined = pd.concat([home, away], ignore_index=True)
+    return {
+        (row.team, row.season, row.week): (row.opponent, row.points_scored) for row in combined.itertuples()
+    }
+
+
 # DraftKings' published Classic-contest DST scoring: tiers are keyed by the
 # upper bound of a "points allowed" bracket, first match wins.
 _POINTS_ALLOWED_TIERS = [(0, 10), (6, 7), (13, 4), (20, 1), (27, 0), (34, -1)]
