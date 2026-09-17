@@ -1,8 +1,11 @@
+from data.nflverse_fetch import fetch_schedules
 from models.calibration import (
     MIN_PAIRS_FOR_FITTED_CORRELATION,
+    _classify_situational_games,
     fit_real_correlation_matrix,
     run_game_environment_backtest_comparison,
     run_hard_exclude_backtest,
+    run_situational_backtest,
 )
 
 # These validate that the backtest MACHINERY works correctly (real as-of
@@ -75,3 +78,46 @@ def test_fit_real_correlation_matrix_can_be_scoped_to_a_season(engine):
     scoped = fit_real_correlation_matrix(seasons={2026}, engine=engine)
 
     assert scoped["same_team"]["sample_size"] < full["same_team"]["sample_size"]
+
+
+# --- run_situational_backtest / _classify_situational_games ---------------
+
+
+def test_classify_situational_games_finds_real_examples_of_all_three():
+    situational = _classify_situational_games(fetch_schedules())
+
+    short_rest = [k for k, v in situational.items() if v["short_rest_both"]]
+    rematches = [k for k, v in situational.items() if v["divisional_rematch"]]
+    cross_country = [k for k, v in situational.items() if v["cross_country_early"]]
+
+    assert short_rest, "real short-rest-into-short-rest games must exist (Thursday games are common)"
+    assert rematches, "real divisional rematches must exist (every division pair plays twice a season)"
+    assert cross_country, "real Pacific-away/Eastern-home 1pm ET games must exist"
+
+    # cross_country_early is scoped to the TRAVELING team only - the real
+    # Eastern home team in that same game must never be tagged (it isn't
+    # the one crossing time zones).
+    cross_country_teams = {team for team, _, _ in cross_country}
+    assert cross_country_teams <= {"SEA", "SF", "LAR", "LAC", "LV"}
+
+
+def test_run_situational_backtest_runs_and_reports_all_three_categories(engine):
+    # Scoped to 2023 (a full 18-week real season), not 2026 like the other
+    # backtests in this file - 2026 only has one real week of data so far,
+    # which can't contain a real divisional rematch (needs two meetings) or
+    # a meaningful short-rest sample, and would make every assertion below
+    # vacuous (None vs None).
+    result = run_situational_backtest("dk_thu_mon_2026_09_17", seasons={2023}, engine=engine)
+
+    assert set(result.keys()) == {"short_rest_both", "divisional_rematch", "cross_country_early"}
+    for category, stats in result.items():
+        assert stats["n_in_situation"] > 0, f"{category} found zero real examples in 2023 - suspicious"
+        assert stats["n_complement"] > 0
+        assert 0.0 <= stats["p90_hit_rate_in_situation"] <= 1.0
+        assert 0.0 <= stats["p90_hit_rate_complement"] <= 1.0
+        # A real p-value must be a real probability, not a leftover of a
+        # broken significance calculation.
+        if stats["hit_rate_p_value"] is not None:
+            assert 0.0 <= stats["hit_rate_p_value"] <= 1.0
+        if stats["bias_p_value"] is not None:
+            assert 0.0 <= stats["bias_p_value"] <= 1.0

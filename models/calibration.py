@@ -889,3 +889,188 @@ def fit_real_correlation_matrix(seasons=None, engine=None):
         }
 
     return results
+
+
+# Three situational categories cleanly derivable from data already fetched
+# for other purposes (schedules.csv.gz's home_rest/away_rest/div_game/
+# gametime columns - no new data source needed) - checked whether real
+# baseline projections are miscalibrated in each, the same way the Vegas
+# ceiling adjustment was checked before being trusted.
+#
+# SHORT_REST_MAX_DAYS=6: real distribution of home_rest/away_rest across
+# 2023-2026 (schedules.csv.gz) clusters sharply at 7 (703/697 real games -
+# the normal Sunday-to-Sunday week) with the next-biggest cluster at 4 (70/72
+# games - a Thursday game following a normal week). 6 cleanly separates
+# "short week" from "normal or bye-adjusted week" without cutting through
+# either real cluster.
+#
+# PACIFIC_TEAMS/EASTERN_TEAMS: real, static NFL team-to-timezone groupings
+# (Las Vegas observes Pacific time; Indianapolis observes Eastern) - not
+# derived from any fetched data, since nflverse's schedule file has no
+# stadium timezone column, but a fixed real-world fact, same status as
+# other static team mappings already in this codebase (e.g.
+# data/player_crosswalk.py's team/city tables).
+#
+# EARLY_KICKOFF_TIME="13:00": confirmed empirically before relying on it -
+# gametime in schedules.csv.gz is Eastern-normalized regardless of stadium
+# (real Pacific-market HOME games show "16:05"/"16:25", the standard late-
+# afternoon window scheduled so West Coast fans get an early local start -
+# never "10:xx" local time), and "13:00" is the single most common real
+# Sunday kickoff slot (542 of ~1,700 real 2023-2026 REG Sunday games),
+# cleanly distinct from the late-afternoon (16:05/16:25) and primetime
+# (20:xx) windows. A Pacific AWAY team at a "13:00" kickoff in an Eastern
+# stadium is a real 10am-body-clock start - confirmed 44 such real games
+# exist across 2023-2026, not a hypothetical scenario with zero real cases.
+SHORT_REST_MAX_DAYS = 6
+PACIFIC_TEAMS = {"SEA", "SF", "LAR", "LAC", "LV"}
+EASTERN_TEAMS = {
+    "BUF", "MIA", "NE", "NYJ", "NYG", "PHI", "PIT", "BAL",
+    "CIN", "CLE", "ATL", "CAR", "JAX", "TB", "WAS", "IND",
+}
+EARLY_KICKOFF_TIME = "13:00"
+
+
+def _classify_situational_games(schedules_df):
+    """{(team, season, week): {"short_rest_both": bool, "cross_country_
+    early": bool, "divisional_rematch": bool}} for every real REG-season
+    game. short_rest_both and divisional_rematch apply to BOTH teams in the
+    game (both squads are equally short-rested; both are equally facing a
+    familiar division opponent); cross_country_early applies ONLY to the
+    traveling Pacific team's own (team, season, week) entry, not the
+    Eastern home team's - the home team isn't the one crossing time zones.
+
+    divisional_rematch: the SECOND (by week) meeting between the same two
+    teams in the same real season among real div_game=1 rows - grouped by
+    (season, frozenset({home_team, away_team})) rather than assuming a
+    fixed team order, since a division pair's two real meetings swap home/
+    away.
+    """
+    df = schedules_df[schedules_df["game_type"] == "REG"]
+
+    weeks_by_matchup = defaultdict(list)
+    for row in df[df["div_game"] == 1].itertuples():
+        weeks_by_matchup[(row.season, frozenset({row.home_team, row.away_team}))].append(row.week)
+    rematch_weeks = set()
+    for (season, teams), weeks_list in weeks_by_matchup.items():
+        for week in sorted(weeks_list)[1:]:
+            rematch_weeks.add((season, teams, week))
+
+    result = {}
+    for row in df.itertuples():
+        short_rest_both = row.home_rest <= SHORT_REST_MAX_DAYS and row.away_rest <= SHORT_REST_MAX_DAYS
+        is_rematch = bool(row.div_game) and (row.season, frozenset({row.home_team, row.away_team}), row.week) in rematch_weeks
+        cross_country_early = (
+            row.gametime == EARLY_KICKOFF_TIME
+            and row.away_team in PACIFIC_TEAMS
+            and row.home_team in EASTERN_TEAMS
+        )
+        for team in (row.home_team, row.away_team):
+            result[(team, row.season, row.week)] = {
+                "short_rest_both": short_rest_both,
+                "divisional_rematch": is_rematch,
+                "cross_country_early": cross_country_early and team == row.away_team,
+            }
+    return result
+
+
+def run_situational_backtest(source_slate_id, seasons=None, engine=None):
+    """For each of the three situational categories in _classify_
+    situational_games, splits every real, no-lookahead as-of player-week
+    into "in this situation" vs every other player-week (the complement -
+    the natural baseline for "is this specific situation different from
+    everything else," not a hand-picked control group), and reports real
+    P90 ceiling calibration (hit rate - see run_game_environment_backtest_
+    comparison for why hit rate, not MAE, is the right ceiling metric) and
+    real central-tendency bias (actual - proj_median) for both sides, with
+    a two-sample significance test on each (models/calibration.py's own
+    _two_sample_significance, same normal-approximation method used
+    throughout this module).
+
+    Same as-of/no-lookahead methodology as every other backtest here
+    (_load_recent_stats(before=(season, week)), played-only filter via
+    _played_gsis_ids, DST exempted from that filter). Never writes
+    anywhere - a diagnostic, like the other run_*_backtest* functions.
+
+    Returns {category: {"n_in_situation", "n_complement",
+    "p90_hit_rate_in_situation", "p90_hit_rate_complement",
+    "hit_rate_t_stat", "hit_rate_p_value", "mean_bias_in_situation",
+    "mean_bias_complement", "bias_t_stat", "bias_p_value"}}.
+    """
+    engine = engine or get_engine()
+
+    slate_players = load_slate_pool(source_slate_id, engine)
+    if not slate_players:
+        raise ValueError(f"No players found in slate_player_pool for slate {source_slate_id}")
+    gsis_by_dk_id, _, _ = resolve_dk_players_to_gsis(slate_players, engine)
+    players_by_id = {p["player_id"]: p for p in slate_players}
+
+    weeks = _available_weeks(engine)
+    if seasons is not None:
+        weeks = [(s, w) for s, w in weeks if s in seasons]
+
+    # Fetched once, same reasoning as run_game_environment_backtest_
+    # comparison's own implied-totals fetch - real schedule data doesn't
+    # change within one backtest run, so there's no reason to re-fetch it
+    # once per evaluated week.
+    situational_by_team_week = _classify_situational_games(fetch_schedules())
+
+    categories = ("short_rest_both", "divisional_rematch", "cross_country_early")
+    records = defaultdict(list)  # category -> [(in_situation: bool, p90_hit: 0/1, bias: float)]
+
+    for season, week in weeks:
+        history = _load_recent_stats(gsis_by_dk_id.values(), engine, before=(season, week))
+        actual_points, _ = load_actual_scores(slate_players, season, week, engine)
+        played_gsis_ids = _played_gsis_ids(gsis_by_dk_id.values(), season, week, engine)
+        teams_by_gsis = _teams_for_week(gsis_by_dk_id.values(), season, week, engine)
+
+        for dk_id, gsis_id in gsis_by_dk_id.items():
+            player = players_by_id.get(dk_id)
+            if player is None or dk_id not in actual_points:
+                continue
+            if player["position"] != "DST" and gsis_id not in played_gsis_ids:
+                continue
+            games = history.get(gsis_id)
+            if not games:
+                continue
+
+            real_team = teams_by_gsis.get(gsis_id)
+            situational = situational_by_team_week.get((real_team, season, week)) if real_team else None
+            if situational is None:
+                continue  # real team not found in this week's real schedule (shouldn't happen, but no data to classify with)
+
+            proj = _project_from_history(games, player["position"])
+            actual = actual_points[dk_id]
+            p90_hit = 1 if actual >= proj["proj_ceiling"] else 0
+            bias = actual - proj["proj_median"]
+
+            for category in categories:
+                records[category].append((situational[category], p90_hit, bias))
+
+    if not any(records.values()):
+        raise ValueError(f"No real player-weeks could be evaluated for slate {source_slate_id}")
+
+    result = {}
+    for category in categories:
+        rows = records[category]
+        in_situation = [r for r in rows if r[0]]
+        complement = [r for r in rows if not r[0]]
+
+        mean_bias_in, mean_bias_comp, bias_t, bias_p = _two_sample_significance(
+            [r[2] for r in in_situation], [r[2] for r in complement]
+        )
+        _, _, hit_t, hit_p = _two_sample_significance([r[1] for r in in_situation], [r[1] for r in complement])
+
+        result[category] = {
+            "n_in_situation": len(in_situation),
+            "n_complement": len(complement),
+            "p90_hit_rate_in_situation": round(sum(r[1] for r in in_situation) / len(in_situation), 4) if in_situation else None,
+            "p90_hit_rate_complement": round(sum(r[1] for r in complement) / len(complement), 4) if complement else None,
+            "hit_rate_t_stat": round(hit_t, 4) if hit_t is not None else None,
+            "hit_rate_p_value": round(hit_p, 4) if hit_p is not None else None,
+            "mean_bias_in_situation": round(mean_bias_in, 3) if mean_bias_in is not None else None,
+            "mean_bias_complement": round(mean_bias_comp, 3) if mean_bias_comp is not None else None,
+            "bias_t_stat": round(bias_t, 4) if bias_t is not None else None,
+            "bias_p_value": round(bias_p, 4) if bias_p is not None else None,
+        }
+
+    return result
