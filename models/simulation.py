@@ -3,6 +3,8 @@ import json
 import numpy as np
 from sqlalchemy import text
 
+from data.player_crosswalk import SHOWDOWN_PSEUDO_POSITIONS, resolve_dk_players_to_gsis
+from data.pre_lock_check import _load_recent_usage_batch
 from db.migrate import get_engine
 
 DEFAULT_NUM_SIMULATIONS = 10000
@@ -57,7 +59,15 @@ def _player_correlation(a, b):
 
     same_team = a["team"] == b["team"]
     opponents = a["team"] == b["opponent"] or b["team"] == a["opponent"]
-    positions = {a["position"], b["position"]}
+    # real_position, not position: on a Showdown slate DK labels every row's
+    # position "CPT" or "FLEX" regardless of the real player's football
+    # position (data/player_crosswalk.py's SHOWDOWN_PSEUDO_POSITIONS) - see
+    # _load_players, which resolves this from each player's own history
+    # before this function ever sees them. Trusting raw "position" here
+    # would silently collapse every Showdown pair to the same-team/no-
+    # correlation fallback below, exactly the failure this real, fitted
+    # correlation matrix exists to avoid.
+    positions = {a["real_position"], b["real_position"]}
 
     if same_team:
         if "QB" in positions and positions & {"WR", "TE"}:
@@ -126,6 +136,47 @@ def _quantile_to_scores(percentile_ranks, percentiles):
     return np.clip(scores, 0.0, None)
 
 
+def _resolve_real_positions(rows, engine):
+    """{player_id: real_position} for every row - the actual football
+    position for a Showdown row (DK labels these "CPT"/"FLEX" regardless of
+    the real player's position, see SHOWDOWN_PSEUDO_POSITIONS), resolved
+    from that player's own recent history the same way data/pre_lock_check.py's
+    hard_role_exclusions/build_lineup_role_checklist already do - reusing
+    that exact machinery rather than a third, potentially-drifting
+    reimplementation. A Classic row's position is already real and passes
+    through unchanged, no history lookup needed.
+    """
+    pseudo_rows = [dict(row) for row in rows if row["position"] in SHOWDOWN_PSEUDO_POSITIONS]
+    real_position_by_id = {row["player_id"]: row["position"] for row in rows if row["position"] not in SHOWDOWN_PSEUDO_POSITIONS}
+    if not pseudo_rows:
+        return real_position_by_id
+
+    # resolve_dk_players_to_gsis needs name/team for its Showdown DST-
+    # nickname and name-only matching - not selected by _load_players'
+    # own query (which only needs position/team/opponent/percentiles for
+    # everything else), so fetched separately here, only for the rows that
+    # actually need it.
+    with engine.connect() as conn:
+        name_rows = conn.execute(
+            text("SELECT player_id, name, team FROM slate_player_pool WHERE player_id = ANY(:ids)"),
+            {"ids": [row["player_id"] for row in pseudo_rows]},
+        ).mappings().fetchall()
+    name_by_id = {row["player_id"]: row for row in name_rows}
+    for row in pseudo_rows:
+        row.update(name_by_id.get(row["player_id"], {}))
+
+    gsis_by_dk_id, _, _ = resolve_dk_players_to_gsis(pseudo_rows, engine)
+    games_by_gsis = _load_recent_usage_batch(
+        [gid for gid in gsis_by_dk_id.values() if gid is not None], engine
+    )
+    for row in pseudo_rows:
+        gsis_id = gsis_by_dk_id.get(row["player_id"])
+        games = games_by_gsis.get(gsis_id, []) if gsis_id is not None else []
+        real_position_by_id[row["player_id"]] = games[0]["position"] if games else None
+
+    return real_position_by_id
+
+
 def _load_players(slate_id, player_ids, engine):
     query = text(
         """
@@ -138,6 +189,8 @@ def _load_players(slate_id, player_ids, engine):
     with engine.connect() as conn:
         rows = conn.execute(query, {"slate_id": slate_id, "player_ids": list(player_ids)}).mappings().fetchall()
 
+    real_position_by_id = _resolve_real_positions(rows, engine)
+
     players_by_id = {}
     for row in rows:
         percentiles = row["proj_percentiles"]
@@ -146,6 +199,7 @@ def _load_players(slate_id, player_ids, engine):
         players_by_id[row["player_id"]] = {
             "player_id": row["player_id"],
             "position": row["position"],
+            "real_position": real_position_by_id.get(row["player_id"]),
             "team": row["team"],
             "opponent": row["opponent"],
             "percentiles": percentiles,
