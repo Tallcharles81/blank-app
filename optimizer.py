@@ -1,274 +1,129 @@
-"""Core lineup-optimization logic for DraftKings NBA Classic contests.
+"""
+optimizer.py
+------------
+Solves the DraftKings NBA classic-contest lineup problem as a linear
+program: maximize total projected fantasy points subject to salary cap
+and roster/position constraints.
 
-Uses integer linear programming (PuLP) to build salary-cap-constrained,
-position-eligible lineups that maximize projected fantasy points.
+DK Classic NBA roster:
+    PG, SG, SF, PF, C, G (PG/SG), F (SF/PF), UTIL (any)
+    Salary cap: $50,000
+
+Usage:
+    python optimizer.py --projections data/projections.csv --lineups 1
+
+For multiple lineups (GPP tournament entries), use --lineups N and the
+script will force diversity by excluding the top lineup's exact player
+set from subsequent solves.
 """
 
-from __future__ import annotations
-
-from dataclasses import dataclass, field
-
+import argparse
 import pandas as pd
 import pulp
 
-SALARY_CAP = 50_000
-ROSTER_SLOTS = ["PG", "SG", "SF", "PF", "C", "G", "F", "UTIL"]
-
-SLOT_ELIGIBILITY = {
-    "PG": {"PG"},
-    "SG": {"SG"},
-    "SF": {"SF"},
-    "PF": {"PF"},
-    "C": {"C"},
-    "G": {"PG", "SG"},
-    "F": {"SF", "PF"},
-    "UTIL": {"PG", "SG", "SF", "PF", "C"},
-}
-
-MIN_GAMES_REQUIRED = 2
-
-REQUIRED_COLUMNS = ["Name", "Salary", "Position"]
-
-_COLUMN_ALIASES = {
-    "name": "Name",
-    "player": "Name",
-    "salary": "Salary",
-    "position": "Position",
-    "roster position": "Position",
-    "pos": "Position",
-    "team": "Team",
-    "teamabbrev": "Team",
-    "game info": "Game",
-    "game": "Game",
-    "avgpointspergame": "Projection",
-    "projection": "Projection",
-    "fppg": "Projection",
-    "proj": "Projection",
+SALARY_CAP = 50000
+ROSTER_SLOTS = {
+    "PG": ["PG"],
+    "SG": ["SG"],
+    "SF": ["SF"],
+    "PF": ["PF"],
+    "C": ["C"],
+    "G": ["PG", "SG"],
+    "F": ["SF", "PF"],
+    "UTIL": ["PG", "SG", "SF", "PF", "C"],
 }
 
 
-def normalize_positions(pos_str: str) -> set:
-    """Turn a DK-style position string ("PG/SG") into a set of positions."""
-    if not isinstance(pos_str, str):
-        return set()
-    parts = pos_str.replace(",", "/").split("/")
-    return {p.strip().upper() for p in parts if p.strip()}
-
-
-def extract_game(game_info: str, team: str) -> str:
-    """Derive a stable game identifier from a DK 'Game Info' field.
-
-    Falls back to the team name when no game info is available, so every
-    player still has *some* grouping key (single-game slates degrade to
-    "everyone shares one game", which is handled by the caller).
-    """
-    if isinstance(game_info, str) and game_info.strip():
-        # DK format looks like "BOS@NYK 07:30PM ET" - the matchup is the
-        # part before the first space, and is unique per game.
-        return game_info.strip().split(" ")[0]
-    return str(team) if team else "UNKNOWN"
-
-
-def load_player_pool(df: pd.DataFrame) -> pd.DataFrame:
-    """Normalize an arbitrary DK-ish CSV into the columns the optimizer needs.
-
-    Produces: Name, Salary, Positions (set), Team, Game, Projection, PlayerId
-    """
-    rename_map = {}
-    for col in df.columns:
-        key = col.strip().lower()
-        if key in _COLUMN_ALIASES:
-            rename_map[col] = _COLUMN_ALIASES[key]
-    normalized = df.rename(columns=rename_map).copy()
-
-    missing = [c for c in REQUIRED_COLUMNS if c not in normalized.columns]
+def load_projections(path: str) -> pd.DataFrame:
+    df = pd.read_csv(path)
+    required = {"Name", "Salary", "Position", "PROJECTION"}
+    missing = required - set(df.columns)
     if missing:
-        raise ValueError(
-            f"Player pool is missing required column(s): {', '.join(missing)}"
-        )
-
-    if "Team" not in normalized.columns:
-        normalized["Team"] = ""
-    if "Game" not in normalized.columns:
-        normalized["Game"] = ""
-    if "Projection" not in normalized.columns:
-        normalized["Projection"] = 0.0
-
-    normalized["Salary"] = (
-        normalized["Salary"].astype(str).str.replace(r"[^0-9.-]", "", regex=True)
-    )
-    normalized["Salary"] = pd.to_numeric(normalized["Salary"], errors="coerce")
-    normalized["Projection"] = pd.to_numeric(
-        normalized["Projection"], errors="coerce"
-    ).fillna(0.0)
-
-    normalized["Positions"] = normalized["Position"].apply(normalize_positions)
-    normalized["Game"] = [
-        extract_game(g, t) for g, t in zip(normalized["Game"], normalized["Team"])
-    ]
-
-    normalized = normalized.dropna(subset=["Salary", "Name"])
-    normalized = normalized[normalized["Positions"].map(len) > 0]
-    normalized["Salary"] = normalized["Salary"].astype(int)
-    normalized = normalized.reset_index(drop=True)
-    normalized["PlayerId"] = normalized.index.astype(str)
-    return normalized
+        raise ValueError(f"projections.csv is missing columns: {missing}")
+    return df
 
 
-@dataclass
-class LineupResult:
-    slots: dict = field(default_factory=dict)  # slot -> player row (dict)
-    total_salary: int = 0
-    total_projection: float = 0.0
+def solve_lineup(df: pd.DataFrame, excluded_lineups=None) -> pd.DataFrame:
+    excluded_lineups = excluded_lineups or []
+    prob = pulp.LpProblem("DK_NBA_Lineup", pulp.LpMaximize)
 
-    def as_dataframe(self) -> pd.DataFrame:
-        rows = []
-        for slot in ROSTER_SLOTS:
-            p = self.slots[slot]
-            rows.append(
-                {
-                    "Slot": slot,
-                    "Name": p["Name"],
-                    "Team": p["Team"],
-                    "Position": "/".join(sorted(p["Positions"])),
-                    "Salary": p["Salary"],
-                    "Projection": p["Projection"],
-                }
-            )
-        return pd.DataFrame(rows)
+    player_vars = {i: pulp.LpVariable(f"player_{i}", cat="Binary") for i in df.index}
+    slot_vars = {
+        (i, slot): pulp.LpVariable(f"slot_{i}_{slot}", cat="Binary")
+        for i in df.index
+        for slot in ROSTER_SLOTS
+    }
 
+    # Objective: maximize total projected points
+    prob += pulp.lpSum(player_vars[i] * df.loc[i, "PROJECTION"] for i in df.index)
 
-def optimize_lineup(
-    pool: pd.DataFrame,
-    salary_cap: int = SALARY_CAP,
-    locked_ids=None,
-    excluded_ids=None,
-    banned_player_sets=None,
-    max_overlap=None,
-) -> LineupResult | None:
-    """Solve for a single optimal lineup.
+    # Salary cap
+    prob += pulp.lpSum(player_vars[i] * df.loc[i, "Salary"] for i in df.index) <= SALARY_CAP
 
-    banned_player_sets / max_overlap: a list of previously-generated lineups
-    (as sets of PlayerId). Each new lineup may share at most `max_overlap`
-    players with any one of them, used to produce diverse multi-lineup output.
-    """
-    locked_ids = set(locked_ids or [])
-    excluded_ids = set(excluded_ids or [])
-    candidates = pool[~pool["PlayerId"].isin(excluded_ids)].reset_index(drop=True)
+    # Exactly 8 players
+    prob += pulp.lpSum(player_vars[i] for i in df.index) == 8
 
-    if candidates.empty:
-        return None
+    # Each player assigned to at most one slot, and only if selected
+    for i in df.index:
+        prob += pulp.lpSum(slot_vars[(i, slot)] for slot in ROSTER_SLOTS) == player_vars[i]
 
-    prob = pulp.LpProblem("dk_nba_lineup", pulp.LpMaximize)
+    # Each slot filled exactly once, only by eligible positions
+    for slot, eligible_positions in ROSTER_SLOTS.items():
+        prob += pulp.lpSum(
+            slot_vars[(i, slot)]
+            for i in df.index
+            if any(pos in str(df.loc[i, "Position"]).split("/") for pos in eligible_positions)
+        ) == 1
+        # Zero out ineligible assignments
+        for i in df.index:
+            if not any(pos in str(df.loc[i, "Position"]).split("/") for pos in eligible_positions):
+                prob += slot_vars[(i, slot)] == 0
 
-    x = {}
-    for _, row in candidates.iterrows():
-        pid = row["PlayerId"]
-        for slot in ROSTER_SLOTS:
-            if row["Positions"] & SLOT_ELIGIBILITY[slot]:
-                x[(pid, slot)] = pulp.LpVariable(f"x_{pid}_{slot}", cat="Binary")
+    # Exclude previously generated lineups (for multi-lineup diversity)
+    for prev_lineup_indices in excluded_lineups:
+        prob += pulp.lpSum(player_vars[i] for i in prev_lineup_indices) <= 7
 
-    # Objective: maximize total projected points.
-    proj_by_id = dict(zip(candidates["PlayerId"], candidates["Projection"]))
-    prob += pulp.lpSum(
-        x[(pid, slot)] * proj_by_id[pid] for (pid, slot) in x
-    )
+    status = prob.solve(pulp.PULP_CBC_CMD(msg=0))
 
-    # Each slot filled by exactly one eligible player.
-    for slot in ROSTER_SLOTS:
-        prob += (
-            pulp.lpSum(x[(pid, s)] for (pid, s) in x if s == slot) == 1,
-            f"fill_{slot}",
-        )
-
-    # Each player used at most once across all slots.
-    for pid in candidates["PlayerId"]:
-        player_vars = [x[(pid, s)] for (p, s) in x if p == pid]
-        if player_vars:
-            prob += pulp.lpSum(player_vars) <= 1, f"once_{pid}"
-
-    # Salary cap.
-    salary_by_id = dict(zip(candidates["PlayerId"], candidates["Salary"]))
-    prob += (
-        pulp.lpSum(x[(pid, slot)] * salary_by_id[pid] for (pid, slot) in x)
-        <= salary_cap
-    )
-
-    # Locked players must appear somewhere in the lineup.
-    for pid in locked_ids:
-        player_vars = [x[(p, s)] for (p, s) in x if p == pid]
-        if not player_vars:
-            # Locked player isn't a valid/eligible candidate; infeasible.
-            return None
-        prob += pulp.lpSum(player_vars) == 1, f"locked_{pid}"
-
-    # At least two distinct games represented (DK Classic rule).
-    games = candidates["Game"].unique().tolist()
-    if len(games) > 1:
-        game_indicator = {
-            g: pulp.LpVariable(f"game_{g}", cat="Binary") for g in games
-        }
-        game_by_id = dict(zip(candidates["PlayerId"], candidates["Game"]))
-        for g in games:
-            players_in_game = [
-                x[(pid, s)] for (pid, s) in x if game_by_id[pid] == g
-            ]
-            if players_in_game:
-                prob += game_indicator[g] <= pulp.lpSum(players_in_game)
-        prob += pulp.lpSum(game_indicator.values()) >= min(
-            MIN_GAMES_REQUIRED, len(games)
-        )
-
-    # Diversity constraints against previously generated lineups.
-    if banned_player_sets and max_overlap is not None:
-        for i, prior in enumerate(banned_player_sets):
-            overlap_vars = [x[(pid, s)] for (pid, s) in x if pid in prior]
-            if overlap_vars:
-                prob += pulp.lpSum(overlap_vars) <= max_overlap, f"diverse_{i}"
-
-    status = prob.solve(pulp.PULP_CBC_CMD(msg=False))
     if pulp.LpStatus[status] != "Optimal":
-        return None
+        raise RuntimeError(f"Solver did not find an optimal solution: {pulp.LpStatus[status]}")
 
-    result = LineupResult()
-    id_to_row = candidates.set_index("PlayerId").to_dict("index")
-    for (pid, slot), var in x.items():
-        if var.value() and var.value() > 0.5:
-            row = dict(id_to_row[pid])
-            row["PlayerId"] = pid
-            result.slots[slot] = row
-            result.total_salary += row["Salary"]
-            result.total_projection += row["Projection"]
+    selected_indices = [i for i in df.index if player_vars[i].value() == 1]
+    lineup_slots = {}
+    for i in selected_indices:
+        for slot in ROSTER_SLOTS:
+            if slot_vars[(i, slot)].value() == 1:
+                lineup_slots[i] = slot
 
-    return result
+    result = df.loc[selected_indices].copy()
+    result["SLOT"] = result.index.map(lineup_slots)
+    slot_order = list(ROSTER_SLOTS.keys())
+    result["SLOT_ORDER"] = result["SLOT"].map({s: n for n, s in enumerate(slot_order)})
+    result = result.sort_values("SLOT_ORDER").drop(columns="SLOT_ORDER")
+    return result, selected_indices
 
 
-def generate_lineups(
-    pool: pd.DataFrame,
-    n_lineups: int,
-    salary_cap: int = SALARY_CAP,
-    locked_ids=None,
-    excluded_ids=None,
-    max_overlap: int = 5,
-) -> list[LineupResult]:
-    """Generate multiple diverse lineups, one at a time, each differing from
-    every previous lineup by at least (8 - max_overlap) players."""
-    lineups: list[LineupResult] = []
-    prior_sets: list[set] = []
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--projections", required=True)
+    parser.add_argument("--lineups", type=int, default=1, help="Number of unique lineups to generate")
+    args = parser.parse_args()
 
-    for _ in range(n_lineups):
-        result = optimize_lineup(
-            pool,
-            salary_cap=salary_cap,
-            locked_ids=locked_ids,
-            excluded_ids=excluded_ids,
-            banned_player_sets=prior_sets,
-            max_overlap=max_overlap,
-        )
-        if result is None:
-            break
-        lineups.append(result)
-        player_ids = {row["PlayerId"] for row in result.slots.values()}
-        prior_sets.append(player_ids)
+    df = load_projections(args.projections)
+    excluded = []
 
-    return lineups
+    for n in range(args.lineups):
+        lineup, indices = solve_lineup(df, excluded_lineups=excluded)
+        excluded.append(indices)
+
+        total_salary = lineup["Salary"].sum()
+        total_projection = lineup["PROJECTION"].sum()
+
+        print(f"\n=== Lineup {n + 1} ===")
+        print(lineup[["SLOT", "Name", "Position", "Salary", "PROJECTION"]].to_string(index=False))
+        print(f"Total Salary: ${total_salary:,} / ${SALARY_CAP:,}")
+        print(f"Total Projection: {total_projection:.2f} DK points")
+
+
+if __name__ == "__main__":
+    main()

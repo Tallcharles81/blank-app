@@ -1,5 +1,8 @@
 .streamlit/secrets.toml
 
+# Generated pipeline data (fetched stats, daily DK salary exports, projections)
+data/
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]

@@ -1,3 +1,5 @@
-streamlit
-pandas
-pulp
+nba_api>=1.4.1
+pandas>=2.0.0
+numpy>=1.24.0
+pulp>=2.7.0
+requests>=2.31.0
