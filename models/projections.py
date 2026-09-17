@@ -111,6 +111,32 @@ GAME_ENVIRONMENT_CEILING_BOOST_PER_POINT = 0.015
 # all while both rows carried an identical points estimate.
 SHOWDOWN_CAPTAIN_MULTIPLIER = 1.5
 
+# ---------------------------------------------------------------------------
+# NOT IMPLEMENTED - a real future upgrade path, not urgent.
+#
+# _project_from_history()/_apply_game_environment_adjustment() below combine
+# real signals (own recency-weighted history, real Vegas-implied-total gap)
+# through hand-picked formulas (RECENCY_HALF_LIFE_WEEKS's decay constant,
+# GAME_ENVIRONMENT_CEILING_BOOST_PER_POINT's coefficient, CEILING_Z_BOOST's
+# skew). A trained model (real regression/gradient-boosted trees on real
+# historical (features -> actual outcome) pairs, not an LLM) could in
+# principle blend these same signals - plus others already computed
+# elsewhere in this codebase but not fed into projections today, e.g.
+# models/matchups.py's opponent-strength read - into one calibrated
+# projection the way real commercial projection sites do, instead of the
+# formulas here being fixed constants tuned once and left alone.
+#
+# This is a real, legitimate upgrade path ONLY once there is enough real
+# historical data to train and validate it properly, and it must clear the
+# exact same bar as every other change to this codebase: backtested against
+# the CURRENT formula-based approach using this module's own real methods
+# (models/calibration.py's run_game_environment_p80_hit_rate_backtest and
+# friends), on the same real historical player-weeks, and kept only if it
+# measurably improves real calibration (hit rates closer to their true
+# target percentages, not just a lower training-set error). Not attempted
+# here - flagged as a real direction, not built speculatively.
+# ---------------------------------------------------------------------------
+
 
 def _scale_projection(proj, factor):
     return {
