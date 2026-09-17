@@ -136,16 +136,22 @@ def import_contest_standings(csv_path, slate_id, contest_id, engine=None):
     real coverage gaps, not just the players that happened to work.
 
     A real Showdown contest (parse_contest_standings_csv's is_showdown)
-    matched by name against `slate_id`'s pool gets its real player identity
-    and real position stored, but salary/proj_median/ownership_proxy are
-    deliberately left NULL - this codebase has never loaded a real Showdown
-    slate_player_pool (see data/player_crosswalk.py's SHOWDOWN_PSEUDO_
-    POSITIONS comments: no real Showdown CSV export was ever available), so
-    the only pool available to match against is Classic-priced, and a
-    Showdown CPT/FLEX slot's real DK salary is NOT the same number as that
-    same player's Classic salary. Computing ownership_proxy off the wrong
-    price would silently corrupt the correlation test rather than honestly
-    report the gap - caught before ever doing that, not after.
+    matched by name against a CLASSIC-priced `slate_id` gets its real player
+    identity and real position stored, but salary/proj_median/ownership_
+    proxy are deliberately left NULL - a Showdown CPT/FLEX slot's real DK
+    salary is NOT the same number as that same player's Classic salary, and
+    computing ownership_proxy off the wrong price would silently corrupt
+    the correlation test rather than honestly report the gap.
+
+    If `slate_id` is itself a real Showdown pool (this codebase can load one
+    for real now - see data/dk_salary_csv.py), pricing IS valid: each real
+    player's FLEX row (not their CPT row, which prices the same real person
+    1.5x for a different roster slot) is used as that player's one real
+    base salary/projection for the proxy, matching the real quantity a
+    field member is actually choosing to roster or not at all - a real
+    player's CPT-vs-FLEX split is a separate, later decision this contest's
+    %Drafted already sums across (see parse_contest_standings_csv), not a
+    second independent ownership event this proxy is trying to predict.
 
     Returns {"total_players": int, "matched_with_projection": int,
     "matched_no_projection": int, "showdown_salary_mismatch": int,
@@ -156,16 +162,48 @@ def import_contest_standings(csv_path, slate_id, contest_id, engine=None):
 
     with engine.connect() as conn:
         pool_rows = conn.execute(
-            text("SELECT player_id, name, position, salary FROM slate_player_pool WHERE slate_id = :slate_id"),
+            text("SELECT player_id, name, position, salary, team FROM slate_player_pool WHERE slate_id = :slate_id"),
             {"slate_id": slate_id},
         ).mappings().fetchall()
-        pool_by_name = {row["name"].strip(): dict(row) for row in pool_rows}
+        # A real Showdown pool has TWO rows per real player (CPT/FLEX, same
+        # name, different player_id/salary) - keep the FLEX row as that
+        # player's one real base price/identity for this matching (see this
+        # function's own docstring for why FLEX specifically). A Classic
+        # pool has exactly one row per name already, so this is a no-op
+        # there regardless of dict-comprehension iteration order.
+        slate_pool_is_showdown = any(row["position"] in ("CPT", "FLEX") for row in pool_rows)
+        pool_by_name = {}
+        for row in pool_rows:
+            name = row["name"].strip()
+            if slate_pool_is_showdown and row["position"] != "FLEX":
+                continue
+            pool_by_name[name] = dict(row)
 
         proj_rows = conn.execute(
             text("SELECT player_id, proj_median FROM projections WHERE slate_id = :slate_id"),
             {"slate_id": slate_id},
         ).mappings().fetchall()
         proj_by_player_id = {row["player_id"]: float(row["proj_median"]) for row in proj_rows}
+
+    # A matched Showdown row's own position is "FLEX" (see above) regardless
+    # of the real player's real football position - resolved from game
+    # history instead, the same way every other real position-aware check
+    # in this codebase already does for a Showdown row (see data/pre_lock_
+    # check.py's hard_role_exclusions), so e.g. analyze_qb_ownership_gap's
+    # own `position == "QB"` filter can still find a real Showdown QB.
+    real_position_by_player_id = {}
+    if slate_pool_is_showdown:
+        gsis_by_dk_id, _, _ = resolve_dk_players_to_gsis(list(pool_by_name.values()), engine)
+        usage_by_gsis = _load_recent_usage_batch(
+            [gid for gid in gsis_by_dk_id.values() if gid is not None and not gid.startswith("DST_")], engine
+        )
+        for p in pool_by_name.values():
+            gsis_id = gsis_by_dk_id.get(p["player_id"])
+            if gsis_id is not None and gsis_id.startswith("DST_"):
+                real_position_by_player_id[p["player_id"]] = "DST"
+                continue
+            games = usage_by_gsis.get(gsis_id, []) if gsis_id else []
+            real_position_by_player_id[p["player_id"]] = games[0]["position"] if games else None
 
     to_upsert = []
     matched_with_projection = matched_no_projection = unmatched = showdown_salary_mismatch = 0
@@ -191,8 +229,9 @@ def import_contest_standings(csv_path, slate_id, contest_id, engine=None):
             continue
 
         player_id = pool_match["player_id"]
+        real_position = real_position_by_player_id.get(player_id, pool_match["position"])
 
-        if is_showdown:
+        if is_showdown and not slate_pool_is_showdown:
             showdown_salary_mismatch += 1
             to_upsert.append(
                 {
@@ -233,7 +272,7 @@ def import_contest_standings(csv_path, slate_id, contest_id, engine=None):
                 "slate_id": slate_id,
                 "player_id": player_id,
                 "name": name,
-                "position": pool_match["position"],
+                "position": real_position,
                 "salary": pool_match["salary"],
                 "pct_drafted": stats["pct_drafted"],
                 "fpts_contest": stats["fpts_contest"],

@@ -169,6 +169,56 @@ def test_import_contest_standings_refuses_to_compute_proxy_for_a_real_showdown_c
             conn.execute(text("DELETE FROM contest_ownership WHERE contest_id = :c"), {"c": TEST_SHOWDOWN_CONTEST_ID})
 
 
+TEST_SHOWDOWN_MATCH_CONTEST_ID = "TEST_CONTEST_OWNERSHIP_SHOWDOWN_MATCHED"
+
+# Real players/prices from dk_showdown_det_buf_2026_09_17, the first real
+# Showdown slate this codebase has ever loaded (see data/dk_salary_csv.py) -
+# Amon-Ra St. Brown's real FLEX row.
+ST_BROWN_FLEX = {"name": "Amon-Ra St. Brown", "player_id": "44138434", "salary": 10400}
+
+
+def test_import_contest_standings_computes_real_proxy_for_showdown_vs_showdown(engine, tmp_path):
+    # Once this codebase actually has a real Showdown slate_player_pool to
+    # match against (unlike the Classic-pool case above), a real Showdown
+    # contest's pricing IS valid and a real ownership_proxy should be
+    # computed, not silently withheld - the whole reason
+    # slate_pool_is_showdown exists in import_contest_standings.
+    path = tmp_path / "contest-standings-SHOWDOWN-MATCH-TEST.csv"
+    _write_contest_csv(path, [(ST_BROWN_FLEX["name"], "CPT", 30.0, 54.86)])
+    try:
+        result = import_contest_standings(
+            str(path),
+            slate_id="dk_showdown_det_buf_2026_09_17",
+            contest_id=TEST_SHOWDOWN_MATCH_CONTEST_ID,
+            engine=engine,
+        )
+        assert result["is_showdown"] is True
+        assert result["showdown_salary_mismatch"] == 0
+        assert result["matched_with_projection"] == 1
+
+        with engine.connect() as conn:
+            row = dict(
+                conn.execute(
+                    text("SELECT * FROM contest_ownership WHERE contest_id = :c"),
+                    {"c": TEST_SHOWDOWN_MATCH_CONTEST_ID},
+                ).mappings().fetchone()
+            )
+        # Priced off the real FLEX row, not the CPT row that this contest's
+        # own %Drafted rows happened to be filed under - see this function's
+        # own docstring for why FLEX is the one real base price.
+        assert row["salary"] == ST_BROWN_FLEX["salary"]
+        assert row["ownership_proxy"] is not None
+        # Resolved from real game history, not left as the literal "FLEX"
+        # roster-slot label - otherwise analyze_qb_ownership_gap's own
+        # `position == "QB"` filter could never match a real Showdown QB.
+        assert row["position"] == "WR"
+    finally:
+        with engine.begin() as conn:
+            conn.execute(
+                text("DELETE FROM contest_ownership WHERE contest_id = :c"), {"c": TEST_SHOWDOWN_MATCH_CONTEST_ID}
+            )
+
+
 # --- _spearman: manual rank correlation, no scipy dependency --------------
 
 
