@@ -665,9 +665,8 @@ def run_hard_exclude_backtest(source_slate_id, seasons=None, engine=None):
     if seasons is not None:
         weeks = [(s, w) for s, w in weeks if s in seasons]
 
-    excluded_scores = []
+    excluded_records = []  # (name, position, season, week, actual_score, reason)
     not_excluded_scores = []
-    excluded_scores_by_position = defaultdict(list)
     weeks_evaluated = 0
 
     for season, week in weeks:
@@ -684,11 +683,10 @@ def run_hard_exclude_backtest(source_slate_id, seasons=None, engine=None):
             if len(games) < MIN_RECENT_GAMES_FOR_ROLE_CONFIDENCE:
                 continue  # not enough as-of history to make this call either way - same as the live gate
 
-            is_excluded, _reason = _would_be_hard_excluded(player["position"], games)
+            is_excluded, reason = _would_be_hard_excluded(player["position"], games)
             actual = actual_points[dk_id]
             if is_excluded:
-                excluded_scores.append(actual)
-                excluded_scores_by_position[player["position"]].append(actual)
+                excluded_records.append((player["name"], player["position"], season, week, actual, reason))
             else:
                 not_excluded_scores.append(actual)
             week_had_data = True
@@ -696,14 +694,19 @@ def run_hard_exclude_backtest(source_slate_id, seasons=None, engine=None):
         if week_had_data:
             weeks_evaluated += 1
 
-    if not excluded_scores:
+    if not excluded_records:
         raise ValueError(
             f"No real player-weeks would have been hard-excluded for slate {source_slate_id} - "
             "nothing to evaluate (this itself is worth knowing, not just an error)"
         )
 
+    excluded_scores = [r[4] for r in excluded_records]
+    excluded_scores_by_position = defaultdict(list)
+    for r in excluded_records:
+        excluded_scores_by_position[r[1]].append(r[4])
+
     mean_excluded, mean_not_excluded, t_stat, p_value = _two_sample_significance(excluded_scores, not_excluded_scores)
-    misses = sum(1 for s in excluded_scores if s > MEANINGFUL_SCORE_THRESHOLD)
+    misses = [r for r in excluded_records if r[4] > MEANINGFUL_SCORE_THRESHOLD]
 
     return {
         "weeks_evaluated": weeks_evaluated,
@@ -714,8 +717,8 @@ def run_hard_exclude_backtest(source_slate_id, seasons=None, engine=None):
         "t_stat": round(t_stat, 4) if t_stat is not None else None,
         "p_value": round(p_value, 4) if p_value is not None else None,
         "meaningful_score_threshold": MEANINGFUL_SCORE_THRESHOLD,
-        "miss_rate": round(misses / len(excluded_scores), 4),
-        "misses": misses,
+        "miss_rate": round(len(misses) / len(excluded_scores), 4),
+        "misses": len(misses),
         "avg_actual_score_if_excluded_by_position": {
             pos: round(sum(scores) / len(scores), 2) for pos, scores in excluded_scores_by_position.items()
         },
@@ -732,6 +735,16 @@ def run_hard_exclude_backtest(source_slate_id, seasons=None, engine=None):
             pos: round(sum(1 for s in scores if s > MEANINGFUL_SCORE_THRESHOLD) / len(scores), 4)
             for pos, scores in excluded_scores_by_position.items()
         },
+        # The real, named worst cases - a miss_rate percentage alone doesn't
+        # tell you whether "false exclusion" means "a real bench player
+        # scraped 8.1 points once" or "a real difference-maker had a huge
+        # week and got cut anyway." Sorted by real actual score descending,
+        # capped at 15 so this stays a spot-check list, not a dump of every
+        # miss (miss_rate/misses above already give the real, complete count).
+        "top_misses": [
+            {"name": name, "position": position, "season": season, "week": week, "actual_score": actual, "reason": reason}
+            for name, position, season, week, actual, reason in sorted(misses, key=lambda r: -r[4])[:15]
+        ],
     }
 
 
@@ -1258,3 +1271,137 @@ def run_divisional_rematch_torch_backtest(source_slate_id, seasons=None, engine=
         "bias_t_stat": round(bias_t, 4) if bias_t is not None else None,
         "bias_p_value": round(bias_p, 4) if bias_p is not None else None,
     }
+
+
+def run_game_environment_p80_hit_rate_backtest(source_slate_id, seasons=None, engine=None):
+    """Does the Vegas ceiling adjustment actually improve REAL calibration
+    on a DIFFERENT percentile than the one it was tuned against, or does
+    boosting the "75"/"90" percentiles by the same multiplier just shift
+    every number up without the shape of the distribution actually getting
+    more accurate? run_game_environment_backtest_comparison only ever
+    checked P90 (proj_ceiling itself); _apply_game_environment_adjustment
+    boosts BOTH "75" and "90" (every PERCENTILE_Z label with z > 0) by the
+    same multiplier, so P80 - interpolated between them, the same way
+    run_weekly_calibration's own p80_hits already does - is a real, held-
+    out check of whether the fix generalizes across the percentile ladder
+    or was only ever validated at the one point it happened to improve.
+
+    Same as-of/no-lookahead methodology and same real implied-total-gap
+    tercile split as run_game_environment_backtest_comparison (fetches
+    schedules once, not per week, for the same reason). True target for a
+    well-calibrated P80 is 20%, not P90's 10%.
+
+    Returns the same shape as run_game_environment_backtest_comparison
+    (pooled + tercile p80 hit rates, paired significance test on the
+    per-player-week hit-indicator difference) so the two are directly
+    comparable side by side.
+    """
+    engine = engine or get_engine()
+
+    slate_players = load_slate_pool(source_slate_id, engine)
+    if not slate_players:
+        raise ValueError(f"No players found in slate_player_pool for slate {source_slate_id}")
+    gsis_by_dk_id, _, _ = resolve_dk_players_to_gsis(slate_players, engine)
+    players_by_id = {p["player_id"]: p for p in slate_players}
+
+    weeks = _available_weeks(engine)
+    if seasons is not None:
+        weeks = [(s, w) for s, w in weeks if s in seasons]
+
+    try:
+        implied_totals_by_team_season_week = _team_implied_totals(fetch_schedules())
+    except Exception:
+        implied_totals_by_team_season_week = {}
+
+    def _p80(percentiles):
+        return _interpolate(percentiles, 0.80, _P80_LOWER, _P80_UPPER)
+
+    records = []  # (position, gap_or_None, baseline_hit, adjusted_hit)
+    weeks_evaluated = 0
+
+    for season, week in weeks:
+        history = _load_recent_stats(gsis_by_dk_id.values(), engine, before=(season, week))
+        actual_points, _ = load_actual_scores(slate_players, season, week, engine)
+        played_gsis_ids = _played_gsis_ids(gsis_by_dk_id.values(), season, week, engine)
+        teams_by_gsis = _teams_for_week(gsis_by_dk_id.values(), season, week, engine)
+
+        implied_totals_by_team = {
+            team: total
+            for (team, s, w), total in implied_totals_by_team_season_week.items()
+            if s == season and w == week
+        }
+        league_average = (
+            sum(implied_totals_by_team.values()) / len(implied_totals_by_team) if implied_totals_by_team else None
+        )
+
+        week_had_data = False
+        for dk_id, gsis_id in gsis_by_dk_id.items():
+            player = players_by_id.get(dk_id)
+            if player is None or dk_id not in actual_points:
+                continue
+            if player["position"] != "DST" and gsis_id not in played_gsis_ids:
+                continue
+            games = history.get(gsis_id)
+            if not games:
+                continue
+
+            proj = _project_from_history(games, player["position"])
+            actual = actual_points[dk_id]
+            baseline_hit = 1 if actual >= _p80(proj["proj_percentiles"]) else 0
+
+            real_team = teams_by_gsis.get(gsis_id)
+            implied_total = implied_totals_by_team.get(real_team) if real_team else None
+            if implied_total is not None and league_average is not None:
+                adjusted = _apply_game_environment_adjustment(proj, implied_total, league_average)
+                gap = implied_total - league_average
+            else:
+                adjusted = proj
+                gap = None
+            adjusted_hit = 1 if actual >= _p80(adjusted["proj_percentiles"]) else 0
+
+            records.append((player["position"], gap, baseline_hit, adjusted_hit))
+            week_had_data = True
+
+        if week_had_data:
+            weeks_evaluated += 1
+
+    if not records:
+        raise ValueError(f"No real player-weeks could be evaluated for slate {source_slate_id}")
+
+    def _hit_rate_summary(rows, hit_index):
+        hits = sum(r[hit_index] for r in rows)
+        return {"hits": hits, "opportunities": len(rows), "rate": round(hits / len(rows), 4) if rows else None}
+
+    with_gap = [r for r in records if r[1] is not None]
+    with_gap.sort(key=lambda r: r[1])
+    n = len(with_gap)
+    tercile_size = n // 3
+
+    result = {
+        "weeks_evaluated": weeks_evaluated,
+        "players_evaluated": len(records),
+        "players_with_real_implied_total": n,
+        "true_target_hit_rate": 0.20,
+        "pooled": {
+            "baseline_p80_hit_rate": _hit_rate_summary(records, 2),
+            "adjusted_p80_hit_rate": _hit_rate_summary(records, 3),
+        },
+    }
+
+    if tercile_size >= 20:
+        low_tercile = with_gap[:tercile_size]
+        high_tercile = with_gap[-tercile_size:]
+        for label, tercile in (("low_implied_total_tercile", low_tercile), ("high_implied_total_tercile", high_tercile)):
+            baseline_diffs = [r[2] - r[3] for r in tercile]
+            mean_diff, t_stat, p_value = _paired_significance(baseline_diffs)
+            result[label] = {
+                "n": len(tercile),
+                "avg_gap": round(sum(r[1] for r in tercile) / len(tercile), 2),
+                "baseline_p80_hit_rate": _hit_rate_summary(tercile, 2),
+                "adjusted_p80_hit_rate": _hit_rate_summary(tercile, 3),
+                "baseline_minus_adjusted_hit_rate_diff": round(mean_diff, 4),
+                "t_stat": round(t_stat, 4) if t_stat is not None else None,
+                "p_value": round(p_value, 4) if p_value is not None else None,
+            }
+
+    return result

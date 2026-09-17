@@ -10,6 +10,7 @@ from models.calibration import (
     fit_real_correlation_matrix,
     run_divisional_rematch_torch_backtest,
     run_game_environment_backtest_comparison,
+    run_game_environment_p80_hit_rate_backtest,
     run_hard_exclude_backtest,
     run_situational_backtest,
 )
@@ -34,6 +35,16 @@ def test_hard_exclude_backtest_runs_and_shows_excluded_players_score_lower(engin
     assert result["avg_actual_score_if_excluded"] < result["avg_actual_score_if_not_excluded"]
     assert 0.0 <= result["miss_rate"] <= 1.0
 
+    # Real, named false-exclusion examples - a miss_rate percentage alone
+    # doesn't tell you whether a "miss" is a real difference-maker or a
+    # replacement-level scrub who scraped 8.1 once. Every entry must be a
+    # real player above the real threshold, sorted worst-case-first.
+    assert len(result["top_misses"]) <= 15
+    for miss in result["top_misses"]:
+        assert miss["actual_score"] > result["meaningful_score_threshold"]
+    scores = [m["actual_score"] for m in result["top_misses"]]
+    assert scores == sorted(scores, reverse=True)
+
 
 def test_game_environment_backtest_runs_and_reports_tercile_structure(engine):
     result = run_game_environment_backtest_comparison("dk_thu_mon_2026_09_17", seasons={2026}, engine=engine)
@@ -49,6 +60,34 @@ def test_game_environment_backtest_runs_and_reports_tercile_structure(engine):
     if "high_implied_total_tercile" in result:
         assert result["high_implied_total_tercile"]["avg_gap"] > 0
         assert result["low_implied_total_tercile"]["avg_gap"] < 0
+
+
+def test_game_environment_p80_backtest_runs_and_reports_tercile_structure(engine):
+    result = run_game_environment_p80_hit_rate_backtest("dk_thu_mon_2026_09_17", seasons={2026}, engine=engine)
+
+    assert result["weeks_evaluated"] >= 1
+    assert result["players_evaluated"] > 0
+    assert result["true_target_hit_rate"] == 0.20
+    assert "pooled" in result
+    assert 0.0 <= result["pooled"]["baseline_p80_hit_rate"]["rate"] <= 1.0
+    assert 0.0 <= result["pooled"]["adjusted_p80_hit_rate"]["rate"] <= 1.0
+    if "high_implied_total_tercile" in result:
+        assert result["high_implied_total_tercile"]["avg_gap"] > 0
+        assert result["low_implied_total_tercile"]["avg_gap"] < 0
+
+
+def test_game_environment_p80_backtest_low_tercile_shows_zero_change(engine):
+    # The adjustment is boost-only (gap <= 0 is a no-op) - the low tercile's
+    # P80 hit rate must be IDENTICAL under baseline and adjusted, the same
+    # real property already confirmed for P90 in models/projections.py's
+    # GAME_ENVIRONMENT_CEILING_BOOST_PER_POINT disclosure comment. Needs the
+    # full real dataset (not seasons={2026}) to clear the >=20-per-tercile
+    # reporting threshold reliably.
+    result = run_game_environment_p80_hit_rate_backtest("dk_thu_mon_2026_09_17", engine=engine)
+    assert "low_implied_total_tercile" in result
+    low = result["low_implied_total_tercile"]
+    assert low["baseline_p80_hit_rate"]["hits"] == low["adjusted_p80_hit_rate"]["hits"]
+    assert low["baseline_minus_adjusted_hit_rate_diff"] == 0.0
 
 
 def test_fit_real_correlation_matrix_runs_and_shows_real_relationships(engine):
