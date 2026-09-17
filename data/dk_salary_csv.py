@@ -80,10 +80,29 @@ def parse_dk_salary_csv(file_path):
         fields = row[col_offset : col_offset + len(PLAYER_POOL_HEADER)]
         if len(fields) < len(PLAYER_POOL_HEADER) or not fields[0].strip():
             continue
-        position, _name_and_id, name, player_id, _roster_position, salary, game_info, team, avg_pts = fields
+        real_position, _name_and_id, name, player_id, roster_position, salary, game_info, team, avg_pts = fields
         away_team, home_team, kickoff_time = parse_game_info(game_info)
         team = team.strip()
         opponent = home_team if team == away_team else away_team
+        # DraftKings' real "Position" column is the true football position
+        # (QB/RB/WR/TE/DST) on EVERY slate type, including Showdown - it's
+        # "Roster Position" that carries the CPT/FLEX slot label there
+        # (confirmed against a real Showdown CSV export, e.g. the same real
+        # player appearing as two rows, "Jahmyr Gibbs"/RB/CPT at 1.5x salary
+        # and "Jahmyr Gibbs"/RB/FLEX at base salary - both with real
+        # position "RB" in that column). The rest of this codebase's
+        # Showdown handling (data/player_crosswalk.py's
+        # SHOWDOWN_PSEUDO_POSITIONS, models/optimizer.py's _solve_showdown,
+        # hard_role_exclusions, get_availability_gate, the correlation
+        # model) was all built and tested against CPT/FLEX sitting in
+        # slate_player_pool.position specifically (with real position
+        # re-derived from game history when needed) - so a Showdown row
+        # stores its roster slot label there instead of the real position,
+        # to match that existing, already-tested contract; a Classic row
+        # keeps using its real position as always (Classic's own "Roster
+        # Position" is just each row's fixed slot template label, e.g. "RB"
+        # or "FLEX", not something any existing code depends on).
+        position = roster_position if slate_type == "showdown" else real_position
         players.append(
             {
                 "player_id": player_id.strip(),
@@ -129,18 +148,40 @@ def load_slate_player_pool(slate_id, file_path, engine=None):
 
 
 def write_dk_upload_csv(slate_id, player_ids_in_slot_order, output_path, engine=None):
+    """`player_ids_in_slot_order`: either ONE lineup's flat list of ids in
+    slot order, or a list of such lists for several lineups at once (DK's
+    own real bulk-upload template is exactly this - one shared header row,
+    then one data row per lineup, all uploaded together in a single file).
+    """
     engine = engine or get_engine()
 
-    if len(player_ids_in_slot_order) == len(CLASSIC_ROSTER):
-        roster = CLASSIC_ROSTER
-    elif len(player_ids_in_slot_order) == len(SHOWDOWN_ROSTER):
-        roster = SHOWDOWN_ROSTER
+    # Normalize to "a list of lineups" either way, so the single-lineup case
+    # is just the n=1 case of the loop below rather than separate code paths
+    # that could drift apart.
+    if player_ids_in_slot_order and isinstance(player_ids_in_slot_order[0], str):
+        lineups_ids = [player_ids_in_slot_order]
     else:
-        raise ValueError(
-            f"Expected {len(CLASSIC_ROSTER)} (classic) or {len(SHOWDOWN_ROSTER)} "
-            f"(showdown) player IDs, got {len(player_ids_in_slot_order)}"
-        )
+        lineups_ids = list(player_ids_in_slot_order)
+    if not lineups_ids:
+        raise ValueError("No lineups given")
 
+    roster = None
+    for ids in lineups_ids:
+        if len(ids) == len(CLASSIC_ROSTER):
+            this_roster = CLASSIC_ROSTER
+        elif len(ids) == len(SHOWDOWN_ROSTER):
+            this_roster = SHOWDOWN_ROSTER
+        else:
+            raise ValueError(
+                f"Expected {len(CLASSIC_ROSTER)} (classic) or {len(SHOWDOWN_ROSTER)} "
+                f"(showdown) player IDs, got {len(ids)}"
+            )
+        if roster is None:
+            roster = this_roster
+        elif this_roster != roster:
+            raise ValueError("All lineups in one upload file must be the same roster shape (classic vs showdown)")
+
+    all_ids = {pid for ids in lineups_ids for pid in ids}
     select_sql = text(
         """
         SELECT player_id, name FROM slate_player_pool
@@ -148,16 +189,15 @@ def write_dk_upload_csv(slate_id, player_ids_in_slot_order, output_path, engine=
         """
     )
     with engine.connect() as conn:
-        rows = conn.execute(
-            select_sql, {"slate_id": slate_id, "player_ids": list(player_ids_in_slot_order)}
-        ).fetchall()
+        rows = conn.execute(select_sql, {"slate_id": slate_id, "player_ids": list(all_ids)}).fetchall()
     names_by_id = {row.player_id: row.name for row in rows}
 
-    missing = [pid for pid in player_ids_in_slot_order if pid not in names_by_id]
+    missing = sorted(all_ids - names_by_id.keys())
     if missing:
         raise ValueError(f"Player ID(s) not found in slate_player_pool for slate {slate_id}: {missing}")
 
     with open(output_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
         writer.writerow(roster)
-        writer.writerow([f"{names_by_id[pid]} ({pid})" for pid in player_ids_in_slot_order])
+        for ids in lineups_ids:
+            writer.writerow([f"{names_by_id[pid]} ({pid})" for pid in ids])
