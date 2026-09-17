@@ -102,7 +102,15 @@ def fetch_injuries(seasons):
     # Multiple injury reports get filed across a week (Wed/Thu/Fri practice
     # reports) - keep only the most recent one per player-week, since that's the
     # one that actually reflects their final status for that week's games.
-    df = df.sort_values("date_modified").drop_duplicates(subset=["gsis_id", "season", "week"], keep="last")
+    # date_modified is missing entirely from nflverse's real 2025 injuries
+    # release (present in 2023/2024) - verified there are zero real duplicate
+    # (gsis_id, season, week) rows in either season regardless, so sorting is
+    # only ever a tie-breaker that never actually triggers; skip it rather than
+    # crash on the missing column when 2025 is fetched without an older season
+    # alongside it to mask the gap.
+    if "date_modified" in df.columns:
+        df = df.sort_values("date_modified")
+    df = df.drop_duplicates(subset=["gsis_id", "season", "week"], keep="last")
     return df
 
 
