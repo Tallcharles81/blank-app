@@ -7,6 +7,7 @@ from sqlalchemy import text
 from data.nflverse_fetch import fetch_team_implied_totals
 from data.player_availability import resolve_slate_season_week
 from data.player_crosswalk import resolve_dk_players_to_gsis
+from data.pre_lock_check import _load_recent_usage_batch
 from db.migrate import get_engine
 
 # player_weekly_stats.player_id is nflverse's GSIS ID (e.g. "00-0034857"), which
@@ -94,6 +95,30 @@ CEILING_Z_BOOST = 0.3
 # which direction this adjustment should go, only these numbers by tenths of
 # a point.
 GAME_ENVIRONMENT_CEILING_BOOST_PER_POINT = 0.015
+
+# DraftKings' real Showdown Captain slot scores the SAME real outcome at
+# 1.5x - a real fact already relied on elsewhere (models/optimizer.py's
+# _solve_showdown deliberately does NOT re-apply this to DK's own
+# AvgPointsPerGame/salary columns, since DK already bakes it in there) but
+# never applied to THIS module's own generated proj_floor/median/ceiling,
+# which are computed from a player's real historical fantasy-point history
+# independent of DK's columns entirely, and are IDENTICAL for a player's
+# CPT and FLEX row (same real gsis_id, same history) before this scaling.
+# Caught for real: a first real Showdown build using these projections
+# unscaled put a $1,500 punt play at Captain in 4 of 5 lineups, real
+# stud plays. Paying 1.5x salary for 1.5x projected points is normally a
+# strong real captain choice - the solver could never see that trade at
+# all while both rows carried an identical points estimate.
+SHOWDOWN_CAPTAIN_MULTIPLIER = 1.5
+
+
+def _scale_projection(proj, factor):
+    return {
+        "proj_floor": round(proj["proj_floor"] * factor, 2),
+        "proj_median": round(proj["proj_median"] * factor, 2),
+        "proj_ceiling": round(proj["proj_ceiling"] * factor, 2),
+        "proj_percentiles": {label: round(value * factor, 2) for label, value in proj["proj_percentiles"].items()},
+    }
 
 
 def _real_week_sequence(engine):
@@ -277,6 +302,18 @@ def generate_projections(slate_id, engine=None):
     gsis_by_dk_id, unmatched, ambiguous = resolve_dk_players_to_gsis(players, engine)
     history_by_gsis = _load_recent_stats(gsis_by_dk_id.values(), engine)
 
+    # Real position resolution for the COV fallback below (POSITION_COV_
+    # FALLBACK is keyed by real position - "CPT"/"FLEX" would silently miss
+    # every lookup and always fall back to DEFAULT_COV_FALLBACK for every
+    # Showdown player) and for the Captain-multiplier check right after it -
+    # a Showdown row's own position is "CPT"/"FLEX" regardless of what the
+    # real player plays (see data/player_crosswalk.py's
+    # SHOWDOWN_PSEUDO_POSITIONS), the same real gap already fixed elsewhere
+    # in this codebase (data/pre_lock_check.py's hard_role_exclusions).
+    usage_by_gsis = _load_recent_usage_batch(
+        [gid for gid in gsis_by_dk_id.values() if gid is not None and not gid.startswith("DST_")], engine
+    )
+
     # Real, current-week game-environment signal (see
     # GAME_ENVIRONMENT_CEILING_BOOST_PER_POINT) - best-effort per this
     # project's convention of wrapping external-data fetches in try/except:
@@ -320,10 +357,18 @@ def generate_projections(slate_id, engine=None):
             if not games:
                 skipped_no_history.append(player["player_id"])
                 continue
-            proj = _project_from_history(games, player["position"])
+            if player["position"] in ("CPT", "FLEX"):
+                usage_games = usage_by_gsis.get(gsis_id, [])
+                real_position = usage_games[0]["position"] if usage_games else None
+            else:
+                real_position = player["position"]
+
+            proj = _project_from_history(games, real_position)
             implied_total = implied_totals_by_team.get(player["team"])
             if implied_total is not None and league_average_implied_total is not None:
                 proj = _apply_game_environment_adjustment(proj, implied_total, league_average_implied_total)
+            if player["position"] == "CPT":
+                proj = _scale_projection(proj, SHOWDOWN_CAPTAIN_MULTIPLIER)
             conn.execute(
                 upsert_sql,
                 {
