@@ -41,6 +41,17 @@ DST_ROWS = [
     {"player_id": "SD_CPT_DST", "name": "Seahawks", "position": "CPT", "team": "SEA"},
     {"player_id": "SD_FLEX_DST", "name": "Seahawks", "position": "FLEX", "team": "SEA"},
 ]
+# A real kicker only ever appears in a player pool on a Showdown slate (DK
+# Classic has no K roster slot) - never exercised until a real Showdown CSV
+# was actually parsed through this codebase (see tests/test_dk_salary_csv.py),
+# which exposed a real bug: nflverse's snap-count feed only tracks
+# offense/defense snaps, so a real kicker's snap_pct is ~0.00 in every
+# recorded game regardless of how much he plays, and the RB/WR/TE volume
+# floor would otherwise hard-exclude every real kicker, every time.
+K_ROWS = [
+    {"player_id": "SD_CPT_BASS", "name": "Tyler Bass", "position": "CPT", "team": "BUF"},
+    {"player_id": "SD_FLEX_BASS", "name": "Tyler Bass", "position": "FLEX", "team": "BUF"},
+]
 
 
 def test_crosswalk_resolves_showdown_player_rows_by_name(engine):
@@ -83,6 +94,11 @@ def test_hard_role_exclusions_catches_a_known_backup_qb_on_a_showdown_slate(engi
 def test_hard_role_exclusions_skips_a_showdown_dst_entirely(engine):
     excluded = hard_role_exclusions(DST_ROWS, engine)
     assert not excluded, f"a real Showdown defense must never be evaluated as a role-exclusion case, got {excluded}"
+
+
+def test_hard_role_exclusions_skips_a_real_kicker_entirely(engine):
+    excluded = hard_role_exclusions(K_ROWS, engine)
+    assert not excluded, f"a real, active kicker must never be excluded by the RB/WR/TE volume floor, got {excluded}"
 
 
 TEST_SHOWDOWN_SLATE_ID = "TEST_SHOWDOWN_ROLE_CHECKLIST"

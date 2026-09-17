@@ -541,7 +541,7 @@ def hard_role_exclusions(players, engine=None, unavailable_gsis_ids=None):
     solver. Returns {player_id: reason}.
 
     Position-aware branching below (QB pattern vs RB/WR/TE volume, and
-    skipping DST entirely) can't just trust `p["position"]` - true on a
+    skipping DST and K entirely) can't just trust `p["position"]` - true on a
     Classic slate, but a Showdown row's position is "CPT" or "FLEX"
     regardless of what the real player plays (see
     data/player_crosswalk.py's SHOWDOWN_PSEUDO_POSITIONS), which silently
@@ -588,6 +588,19 @@ def hard_role_exclusions(players, engine=None, unavailable_gsis_ids=None):
             games[0]["position"] if games else None
         )
 
+    # Kickers only ever appear in a real player pool on a Showdown slate
+    # (DK Classic has no K roster slot at all) - never exercised before a
+    # real Showdown CSV was actually parsed through this codebase. A real
+    # kicker's snap_pct is ~0.00 in EVERY recorded game regardless of how
+    # much he plays (nflverse's snap-count feed only tracks offense/defense
+    # snaps, never special teams - confirmed for real against every K row
+    # in player_weekly_stats), so the RB/WR/TE volume floor below would
+    # wrongly hard-exclude every single real kicker, every time - caught
+    # for real on this exact Showdown slate (Tyler Bass and Jake Bates,
+    # both real starting kickers, both got flagged "no evidence of a real
+    # current role"). Skipped the same way DST already is, for the same
+    # reason: this check's signal doesn't apply to the position at all.
+
     # Real teammate QBs in THIS pool, by team - so a candidate QB's "is my
     # real teammate starter confirmed out this week" check never depends on
     # trusting a Showdown row's raw "CPT"/"FLEX" label (this reuses the
@@ -608,6 +621,8 @@ def hard_role_exclusions(players, engine=None, unavailable_gsis_ids=None):
         real_position = real_position_by_dk_id.get(p["player_id"])
         if real_position is None:
             continue  # a Showdown pseudo-position row with no history to recover a real position from
+        if real_position == "K":
+            continue  # see this function's own docstring above the resolution loop - this check doesn't apply to K
 
         games = games_by_gsis.get(gsis_id, [])
         teammate_starter_unavailable = False
