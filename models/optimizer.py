@@ -6,6 +6,7 @@ from sqlalchemy import text
 
 from data.dk_salary_csv import CLASSIC_ROSTER, SHOWDOWN_ROSTER
 from data.player_availability import game_lock_status, get_availability_gate, resolve_slate_season_week
+from data.player_crosswalk import resolve_dk_players_to_gsis
 from data.pre_lock_check import hard_role_exclusions
 from db.migrate import get_engine
 from models.simulation import DEFAULT_NUM_SIMULATIONS, select_best_by_simulation
@@ -87,6 +88,18 @@ def _load_player_pool(slate_id, projection_field, engine):
 
     available_players = [p for p in players if p["player_id"] not in excluded]
 
+    # Real "is a teammate QB confirmed out this week" signal for hard_role_
+    # exclusions' QB pattern check - reuses the availability gate's OWN
+    # real, already-computed exclusions above (no separate fetch) rather
+    # than re-deriving injury status a second way. Resolved for every
+    # excluded player regardless of position (not just ones already known
+    # to be QBs) - hard_role_exclusions' own real_position resolution
+    # (Showdown-safe) decides which of these are actually teammate QBs; a
+    # DST or WR's gsis_id here is harmless, it just won't match anything.
+    excluded_players = [p for p in players if p["player_id"] in excluded]
+    gsis_by_excluded_id, _, _ = resolve_dk_players_to_gsis(excluded_players, engine) if excluded_players else ({}, [], [])
+    unavailable_gsis_ids = {gid for gid in gsis_by_excluded_id.values() if gid is not None}
+
     # Second hard gate, same standard as the roster/IR check above: a player
     # can be rostered and healthy (passes get_availability_gate) and still
     # have no real current role - a real backup with a starter-level
@@ -94,7 +107,7 @@ def _load_player_pool(slate_id, projection_field, engine):
     # docstring). Checked against the pool that already survived the
     # availability gate, not the raw pool, so this never does redundant work
     # resolving a player who's excluded already.
-    role_excluded = hard_role_exclusions(available_players, engine)
+    role_excluded = hard_role_exclusions(available_players, engine, unavailable_gsis_ids=unavailable_gsis_ids)
     excluded = {**excluded, **role_excluded}
     available_players = [p for p in available_players if p["player_id"] not in role_excluded]
 

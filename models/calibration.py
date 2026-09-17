@@ -6,6 +6,7 @@ from collections import defaultdict
 from sqlalchemy import text
 
 from data.nflverse_fetch import _team_implied_totals, _team_points_scored, fetch_schedules
+from data.player_availability import HARD_EXCLUDE_ROSTER_STATUSES, fetch_roster_status_for_season
 from data.player_crosswalk import resolve_dk_players_to_gsis
 from data.pre_lock_check import MIN_RECENT_GAMES_FOR_ROLE_CONFIDENCE, _load_recent_usage_batch, _would_be_hard_excluded
 from db.migrate import get_engine
@@ -73,6 +74,124 @@ def _played_gsis_ids(gsis_ids, season, week, engine):
     )
     with engine.connect() as conn:
         return {row.player_id for row in conn.execute(query, {"ids": list(gsis_ids), "season": season, "week": week})}
+
+
+def _team_qb_availability_by_season(season):
+    """Real per-week QB roster/gameday-active data for one season, sourced
+    directly from nflverse's actual weekly roster feed (the same real feed
+    data/player_availability.py's live gate uses) - NOT player_weekly_stats.
+    player_weekly_stats only gets a row for a player who ALSO recorded real
+    box-score participation that week (see fetch_player_stats), so a QB who
+    didn't play AT ALL that week - traded away, released, on IR, or a
+    healthy scratch who never dressed - is invisible to it regardless of
+    what nflverse's real roster/injury data actually says. Confirmed for
+    real: Daniel Jones (NYG's real QB1 for most of 2024) has zero
+    player_weekly_stats row for week 17 2024 because he'd been released and
+    signed to Minnesota's practice squad by then - but the real roster feed
+    shows exactly that (status "DEV" under team "MIN", not "NYG") - which is
+    what let Drew Lock's real spot start that week happen.
+
+    Returns (team_by_gsis_week, season_team_qbs, status_by_team_gsis):
+    - team_by_gsis_week: {(gsis_id, week): team} for every real player that
+      week, any position - used to find a QB's own REAL team for the
+      specific historical week being evaluated, not whatever team he's on
+      TODAY (a real gap in this backtest before this fix: a well-traveled
+      backup QB - exactly the population this whole check exists for - can
+      easily be on a different team now than the one his flagged historical
+      week actually happened on).
+    - season_team_qbs: {team: set of real gsis_ids who appeared at
+      position "QB" for that team in ANY week this season}.
+    - status_by_team_gsis: {(team, gsis_id): {week: status}} - the real
+      per-week roster status ("ACT"/"INA"/"RES"/"CUT"/"DEV"/etc) for every
+      real QB, keyed to the specific team he held that status under (a
+      traded/released player's row moves to his new team, so a week key
+      missing here for his OLD team is itself real signal - see
+      _teammate_qb_starter_unavailable).
+    """
+    try:
+        roster_df = fetch_roster_status_for_season(season)
+    except RuntimeError:
+        return {}, defaultdict(set), {}
+
+    team_by_gsis_week = {(row.gsis_id, row.week): row.team for row in roster_df.itertuples()}
+
+    qb_df = roster_df[roster_df["position"] == "QB"]
+    season_team_qbs = defaultdict(set)
+    status_by_team_gsis = defaultdict(dict)
+    for row in qb_df.itertuples():
+        season_team_qbs[row.team].add(row.gsis_id)
+        status_by_team_gsis[(row.team, row.gsis_id)][row.week] = row.status
+    return team_by_gsis_week, season_team_qbs, status_by_team_gsis
+
+
+# How many of a team's real PRIOR weeks a teammate QB must have actually been
+# ACT before his current absence counts as a real "the starter is out"
+# signal at all. Needed for real: an every-week-inactive QB3 (completely
+# normal NFL roster construction, not evidence of anything) would otherwise
+# trigger a false positive on almost every team every week - confirmed for
+# real on the 2025 Giants, who carried 3 real roster QBs (Wilson, Dart,
+# Winston) - Winston sat real-INA in 9 of his first 10 weeks as the
+# emergency third arm, which would wrongly "explain" Dart's real Week 7
+# start (Wilson, the guy Dart actually took the job from, was still
+# real-ACT and healthy that week - a real benching, not an injury - see
+# this module's own backtest disclosure) if Winston's routine inactivity
+# alone were treated as a signal.
+MIN_PRIOR_ACTIVE_WEEKS_FOR_ESTABLISHED_STARTER = 2
+
+# A single "INA" week only counts as fresh news if the OTHER established
+# teammate QB was real-ACT within this many weeks beforehand - otherwise a
+# QB who's simply been the permanent, months-stale inactive QB2 (e.g. real
+# 2024 Washington: Jeff Driskel was ACT weeks 1-4 backing up an uninjured
+# Jayden Daniels, then real-INA every week after including week 18 - still
+# "established" by the >=2 rule above, but his week-18 inactivity is old
+# news, not a signal that Daniels was unavailable that week - confirmed
+# real: Daniels himself was real-ACT that same week 18, just given a lighter
+# real snap share in a game already clinched) doesn't wrongly count. A
+# persistent roster-level exit (RES/CUT/etc, or no longer even listed under
+# this team - see PERSISTENT_QB_UNAVAILABLE_STATUSES below) has no such
+# recency requirement: once a real starter is on IR or released, that's not
+# a "stale, no longer relevant" fact the way a bench demotion can be.
+INA_RECENCY_WINDOW_WEEKS = 5
+
+# Real roster statuses that mean "not competing for this team's starting job
+# this week" regardless of how long ago that became true - unlike a single
+# "INA" week (see INA_RECENCY_WINDOW_WEEKS above), these don't get stale.
+# Reuses data/player_availability.py's own real HARD_EXCLUDE_ROSTER_STATUSES
+# (RES/PUP/SUS/RET/CUT/etc - the exact same live-gate definition) plus "DEV"
+# (practice squad) - a real demotion off the 53-man roster, the same real
+# signal as being released, even though the live gate itself doesn't
+# hard-exclude a DK-listed player over it (a live DK slate would never list
+# a practice-squad player as rosterable in the first place, so the live gate
+# has never needed to consider it - this backtest is asking a different
+# question: was the historical TEAMMATE, not the DK pool candidate, off the
+# team's active roster).
+PERSISTENT_QB_UNAVAILABLE_STATUSES = HARD_EXCLUDE_ROSTER_STATUSES | {"DEV"}
+
+
+def _teammate_qb_starter_unavailable(team, own_gsis_id, week, season_team_qbs, status_by_team_gsis):
+    """True if some OTHER real QB who was an ESTABLISHED recent starter for
+    `team` (real-ACT in at least MIN_PRIOR_ACTIVE_WEEKS_FOR_ESTABLISHED_
+    STARTER weeks strictly before this one) is genuinely unavailable this
+    specific week - either a persistent roster-level exit (see
+    PERSISTENT_QB_UNAVAILABLE_STATUSES, including no longer being listed
+    under this team's roster at all that week - e.g. traded or released) or
+    a single real "INA" week that's still recent enough to be this week's
+    actual news (see INA_RECENCY_WINDOW_WEEKS) rather than a long-stale
+    bench demotion. This is the real, week-of signal that `own_gsis_id`'s
+    intermittent season-long snap pattern might genuinely be this week's
+    confirmed starter rather than a random spot appearance."""
+    for other_gsis_id in season_team_qbs.get(team, set()) - {own_gsis_id}:
+        timeline = status_by_team_gsis.get((team, other_gsis_id), {})
+        prior_active_weeks = [w for w, status in timeline.items() if w < week and status == "ACT"]
+        if len(prior_active_weeks) < MIN_PRIOR_ACTIVE_WEEKS_FOR_ESTABLISHED_STARTER:
+            continue  # never really an established starter for this team either way
+
+        status_this_week = timeline.get(week)
+        if status_this_week is None or status_this_week in PERSISTENT_QB_UNAVAILABLE_STATUSES:
+            return True
+        if status_this_week == "INA" and (week - max(prior_active_weeks)) <= INA_RECENCY_WINDOW_WEEKS:
+            return True
+    return False
 
 
 def run_weekly_calibration(source_slate_id, seasons=None, num_lineups=1, random_field_size=100, engine=None):
@@ -651,6 +770,42 @@ def run_hard_exclude_backtest(source_slate_id, seasons=None, engine=None):
     nonetheless scored above MEANINGFUL_SCORE_THRESHOLD real PPR points -
     the real cost of this gate being wrong, which the average alone can
     hide.
+
+    Includes the real teammate-starter-unavailable check (see
+    data/pre_lock_check.py's hard_role_exclusions/_would_be_hard_excluded):
+    for each real historical week, a QB matching the intermittent-backup
+    pattern is checked against whether his own real team's OTHER
+    ESTABLISHED real QB(s) that season (see
+    MIN_PRIOR_ACTIVE_WEEKS_FOR_ESTABLISHED_STARTER) were genuinely
+    unavailable THAT SAME week - a persistent roster-level exit (IR/cut/
+    practice-squad/no longer even listed under this team - see
+    PERSISTENT_QB_UNAVAILABLE_STATUSES) or a recent real "inactive" week
+    (see INA_RECENCY_WINDOW_WEEKS) - not "before", since real roster/
+    inactive status is legitimately known before kickoff, the same real
+    nflverse source data/player_availability.py's live gate uses (see
+    _team_qb_availability_by_season/_teammate_qb_starter_unavailable for
+    the full real logic and why each piece exists). Sourced directly from
+    nflverse's real weekly roster feed, not player_weekly_stats - that
+    table only has a row for a player who ALSO recorded real box-score
+    participation that week, so it's structurally blind to exactly the
+    cases this check exists for (a starter who didn't play AT ALL: traded,
+    released, on IR, or a healthy scratch) - confirmed for real and fixed;
+    see _team_qb_availability_by_season's docstring for the Daniel
+    Jones/Drew Lock example that exposed this. Real, remaining limitation:
+    this can only ever catch an injury/roster-driven change - a real,
+    healthy benching for poor play (confirmed real cases in this exact
+    dataset: Michael Penix Jr. over an ACT, healthy Kirk Cousins;
+    Jaxson Dart over an ACT, healthy Russell Wilson; Andy Dalton over an
+    ACT, healthy Bryce Young) is structurally invisible to any real
+    injury/roster-status data source and will remain a real miss no matter
+    how this check is refined.
+
+    Uses player["position"] directly (not a Showdown-safe resolved real
+    position) for the QB-pattern check - a real, separate, pre-existing gap
+    in this specific backtest function (it's only ever been run against
+    Classic slates in practice, where that distinction doesn't arise)
+    noticed while making this change, not introduced by it - flagged here
+    rather than silently left undocumented, fixing it is a separate task.
     """
     engine = engine or get_engine()
 
@@ -665,6 +820,8 @@ def run_hard_exclude_backtest(source_slate_id, seasons=None, engine=None):
     if seasons is not None:
         weeks = [(s, w) for s, w in weeks if s in seasons]
 
+    roster_by_season = {season: _team_qb_availability_by_season(season) for season in {s for s, _ in weeks}}
+
     excluded_records = []  # (name, position, season, week, actual_score, reason)
     not_excluded_scores = []
     weeks_evaluated = 0
@@ -673,6 +830,7 @@ def run_hard_exclude_backtest(source_slate_id, seasons=None, engine=None):
         games_by_gsis = _load_recent_usage_batch(gsis_by_dk_id.values(), engine, before=(season, week))
         actual_points, _ = load_actual_scores(non_dst_players, season, week, engine)
         played_gsis_ids = _played_gsis_ids(gsis_by_dk_id.values(), season, week, engine)
+        team_by_gsis_week, season_team_qbs, status_by_team_gsis = roster_by_season[season]
 
         week_had_data = False
         for dk_id, gsis_id in gsis_by_dk_id.items():
@@ -683,7 +841,21 @@ def run_hard_exclude_backtest(source_slate_id, seasons=None, engine=None):
             if len(games) < MIN_RECENT_GAMES_FOR_ROLE_CONFIDENCE:
                 continue  # not enough as-of history to make this call either way - same as the live gate
 
-            is_excluded, reason = _would_be_hard_excluded(player["position"], games)
+            teammate_starter_unavailable = False
+            if player["position"] == "QB":
+                # The player's REAL team for THIS historical week, not
+                # whatever team he's on in today's slate - a well-traveled
+                # backup (exactly this check's target population) can easily
+                # have changed teams since. Falls back to the slate's team
+                # only if he's altogether missing from that week's real
+                # roster feed, which shouldn't happen for a game he actually
+                # played.
+                real_team = team_by_gsis_week.get((gsis_id, week), player["team"])
+                teammate_starter_unavailable = _teammate_qb_starter_unavailable(
+                    real_team, gsis_id, week, season_team_qbs, status_by_team_gsis
+                )
+
+            is_excluded, reason = _would_be_hard_excluded(player["position"], games, teammate_starter_unavailable)
             actual = actual_points[dk_id]
             if is_excluded:
                 excluded_records.append((player["name"], player["position"], season, week, actual, reason))

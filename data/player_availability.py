@@ -40,12 +40,19 @@ HARD_EXCLUDE_INJURY_STATUSES = {"Out"}
 FLAG_INJURY_STATUSES = {"Questionable", "Doubtful"}
 
 
-def fetch_current_roster_status(season, week):
+def fetch_roster_status_for_season(season):
     # Confirmed filename via nflreadr's own source (R/load_rosters_weekly.R):
     # weekly_rosters/roster_weekly_{season}.csv.gz - not guessed from the
     # release page's asset listing, which has previously been an unreliable,
-    # truncating summary rather than a direct read.
-    df = download_csv("weekly_rosters", f"roster_weekly_{season}.csv.gz")
+    # truncating summary rather than a direct read. Split out from
+    # fetch_current_roster_status (which still just filters this to one week)
+    # so a caller checking many weeks of the same season - a backtest - fetches
+    # the whole real season file once instead of once per week.
+    return download_csv("weekly_rosters", f"roster_weekly_{season}.csv.gz")
+
+
+def fetch_current_roster_status(season, week):
+    df = fetch_roster_status_for_season(season)
     return df[df["week"] == week]
 
 

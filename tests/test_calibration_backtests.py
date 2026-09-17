@@ -7,6 +7,8 @@ from models.calibration import (
     MIN_PAIRS_FOR_FITTED_CORRELATION,
     _classify_situational_games,
     _real_divisional_rematch_torch_margins,
+    _team_qb_availability_by_season,
+    _teammate_qb_starter_unavailable,
     fit_real_correlation_matrix,
     run_divisional_rematch_torch_backtest,
     run_game_environment_backtest_comparison,
@@ -216,3 +218,89 @@ def test_run_divisional_rematch_torch_backtest_reports_too_small_a_sample_honest
     # empty or near-empty sample.
     with pytest.raises(ValueError, match="No real divisional rematch observations"):
         run_divisional_rematch_torch_backtest("dk_thu_mon_2026_09_17", seasons={2026}, engine=engine)
+
+
+# --- _team_qb_availability_by_season / _teammate_qb_starter_unavailable ----
+# The teammate-starter-unavailable check that feeds run_hard_exclude_backtest
+# above (via data/pre_lock_check.py's _would_be_hard_excluded) - sourced from
+# nflverse's real weekly roster feed, not player_weekly_stats (which is
+# blind to a QB who recorded zero real box-score participation that week -
+# see _team_qb_availability_by_season's own docstring). These pin down real,
+# specific, already-investigated cases so a future change to the recency/
+# established-starter thresholds can't silently regress any of them.
+
+# Real gsis_ids (from player_weekly_stats), not re-looked-up per test run -
+# stable real nflverse identifiers, not names that could collide/typo.
+_DREW_LOCK = "00-0035704"
+_DESHAUN_WATSON = "00-0033537"
+_JAMEIS_WINSTON = "00-0031503"
+_RUSSELL_WILSON = "00-0029263"
+_JAXSON_DART = "00-0040691"
+_MARCUS_MARIOTA = "00-0032268"
+
+
+def test_teammate_qb_starter_unavailable_true_when_real_starter_released():
+    # Real 2024 case: Daniel Jones was NYG's real QB1 for most of the season,
+    # then released and signed to Minnesota's practice squad before week 17 -
+    # by week 17 he no longer has ANY roster row under team "NYG" at all,
+    # which is real, unambiguous evidence Drew Lock's week-17 start wasn't a
+    # random appearance. This is the exact real case that exposed
+    # player_weekly_stats' blind spot (Jones has zero row there for week 17
+    # either way, injured or not, since he recorded no real stats for NYG).
+    _, season_team_qbs, status_by_team_gsis = _team_qb_availability_by_season(2024)
+    assert _teammate_qb_starter_unavailable(
+        "NYG", _DREW_LOCK, 17, season_team_qbs, status_by_team_gsis
+    ) is True
+
+
+def test_teammate_qb_starter_unavailable_true_when_real_starter_on_ir():
+    # Real 2024 case: Deshaun Watson tore his Achilles and was placed on
+    # real injured reserve ("RES") well before Jameis Winston's week-11 spot
+    # start - a persistent roster-level exit, not a single stale INA week.
+    _, season_team_qbs, status_by_team_gsis = _team_qb_availability_by_season(2024)
+    assert _teammate_qb_starter_unavailable(
+        "CLE", _JAMEIS_WINSTON, 11, season_team_qbs, status_by_team_gsis
+    ) is True
+
+
+def test_teammate_qb_starter_unavailable_false_for_real_healthy_benching():
+    # Real 2025 case: Russell Wilson was real-ACT (healthy, active gameday
+    # roster) the same week Jaxson Dart took over as NYG's starter - a real
+    # performance-based benching, confirmed directly against nflverse's raw
+    # injuries data (Wilson never appears with any real injury designation
+    # around this change). No real injury/roster signal can or should catch
+    # this - the check must correctly report False here, not just find SOME
+    # excuse to flip the exclusion off.
+    _, season_team_qbs, status_by_team_gsis = _team_qb_availability_by_season(2025)
+    assert _teammate_qb_starter_unavailable(
+        "NYG", _JAXSON_DART, 7, season_team_qbs, status_by_team_gsis
+    ) is False
+
+
+def test_teammate_qb_starter_unavailable_ignores_routinely_inactive_third_string_qb():
+    # Real 2025 case, same week as above: NYG's real roster also carried
+    # Jameis Winston as a third QB who was real-INA in every week here
+    # except one (the normal, meaningless-by-itself inactivity of a real
+    # emergency third arm). Without the established-starter threshold, his
+    # routine inactivity alone would wrongly "explain" Dart's start even
+    # though the actual competitor (Wilson) was healthy - this is the exact
+    # false positive this test guards against regressing.
+    _, season_team_qbs, status_by_team_gsis = _team_qb_availability_by_season(2025)
+    assert _JAMEIS_WINSTON in season_team_qbs["NYG"]  # sanity: he's a real roster QB this season
+    assert _teammate_qb_starter_unavailable(
+        "NYG", _JAXSON_DART, 7, season_team_qbs, status_by_team_gsis
+    ) is False
+
+
+def test_teammate_qb_starter_unavailable_ignores_stale_bench_demotion():
+    # Real 2024 case: Washington's Jeff Driskel was real-ACT (an established
+    # real backup) for weeks 1-4, then real-INA for the rest of the season
+    # including week 18 - but that's a permanent, months-old bench
+    # demotion, not fresh week-18 news. The real Jayden Daniels was himself
+    # real-ACT that same week 18 (just given a lighter snap share in an
+    # already-clinched game) - Driskel's stale inactivity must not be
+    # mistaken for Daniels being unavailable.
+    _, season_team_qbs, status_by_team_gsis = _team_qb_availability_by_season(2024)
+    assert _teammate_qb_starter_unavailable(
+        "WAS", _MARCUS_MARIOTA, 18, season_team_qbs, status_by_team_gsis
+    ) is False

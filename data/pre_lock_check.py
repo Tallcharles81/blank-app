@@ -506,7 +506,7 @@ MIN_SNAP_PCT_FOR_BENCHED = 0.15
 MAX_SNAP_PCT_FOR_FULL_GAME = 0.85
 
 
-def hard_role_exclusions(players, engine=None):
+def hard_role_exclusions(players, engine=None, unavailable_gsis_ids=None):
     """Players with NO evidence of a real role in any recent game on record -
     hard-excluded from the eligible pool before the optimizer ever runs, the
     same way data/player_availability.py's roster-absence and IR checks are
@@ -550,15 +550,54 @@ def hard_role_exclusions(players, engine=None):
     QB branch either. Real position is resolved the same way identity
     already is for these rows - from the player's own history - rather
     than trusted from the DK row.
+
+    `unavailable_gsis_ids` (optional): real players confirmed unavailable
+    THIS week (Out/IR/etc - the same real gate data/player_availability.py's
+    get_availability_gate already computed, passed through by
+    models/optimizer.py's caller rather than re-fetched here). Used ONLY
+    for the QB intermittent-starter pattern below: a QB matching that
+    pattern whose team has ANOTHER real QB in this set is presumably this
+    week's actual confirmed starter (the real starter is out), not a
+    random backup appearance while the real starter still plays - see
+    _would_be_hard_excluded's teammate_starter_unavailable param for the
+    real cases this fixes (Drew Lock 2024 wk17, Jaxson Dart 2025 wk7,
+    Michael Penix Jr. 2024 wk18, Jameis Winston himself in a different,
+    real spot-start week - all real hard-exclude MISSES caught by
+    models/calibration.py::run_hard_exclude_backtest's real historical
+    check, every one a real QB change forced by the actual starter being
+    out). Omitted (None/empty), this behaves exactly as before - the fix is
+    additive, not a change to any existing caller that doesn't pass it.
     """
     engine = engine or get_engine()
     if not players:
         return {}
+    unavailable_gsis_ids = unavailable_gsis_ids or set()
 
     gsis_by_dk_id, _, _ = resolve_dk_players_to_gsis(players, engine)
     games_by_gsis = _load_recent_usage_batch(
         [gid for gid in gsis_by_dk_id.values() if gid is not None and not gid.startswith("DST_")], engine
     )
+
+    real_position_by_dk_id = {}
+    for p in players:
+        gsis_id = gsis_by_dk_id.get(p["player_id"])
+        if gsis_id is None or gsis_id.startswith("DST_"):
+            continue
+        games = games_by_gsis.get(gsis_id, [])
+        real_position_by_dk_id[p["player_id"]] = p["position"] if p["position"] not in ("CPT", "FLEX") else (
+            games[0]["position"] if games else None
+        )
+
+    # Real teammate QBs in THIS pool, by team - so a candidate QB's "is my
+    # real teammate starter confirmed out this week" check never depends on
+    # trusting a Showdown row's raw "CPT"/"FLEX" label (this reuses the
+    # SAME real_position resolution above, not a second, less careful one).
+    qb_gsis_by_team = defaultdict(set)
+    for p in players:
+        if real_position_by_dk_id.get(p["player_id"]) == "QB":
+            gsis_id = gsis_by_dk_id.get(p["player_id"])
+            if gsis_id is not None:
+                qb_gsis_by_team[p["team"]].add(gsis_id)
 
     excluded = {}
     for p in players:
@@ -566,20 +605,23 @@ def hard_role_exclusions(players, engine=None):
         if gsis_id is None or gsis_id.startswith("DST_"):
             continue  # no crosswalk match (thin-data/LOW case), or a real defense - neither is a hard exclude here
 
-        games = games_by_gsis.get(gsis_id, [])
-        real_position = p["position"] if p["position"] not in ("CPT", "FLEX") else (
-            games[0]["position"] if games else None
-        )
+        real_position = real_position_by_dk_id.get(p["player_id"])
         if real_position is None:
             continue  # a Showdown pseudo-position row with no history to recover a real position from
 
-        is_excluded, reason = _would_be_hard_excluded(real_position, games)
+        games = games_by_gsis.get(gsis_id, [])
+        teammate_starter_unavailable = False
+        if real_position == "QB":
+            teammate_gsis_ids = qb_gsis_by_team.get(p["team"], set()) - {gsis_id}
+            teammate_starter_unavailable = bool(teammate_gsis_ids & unavailable_gsis_ids)
+
+        is_excluded, reason = _would_be_hard_excluded(real_position, games, teammate_starter_unavailable)
         if is_excluded:
             excluded[p["player_id"]] = reason
     return excluded
 
 
-def _would_be_hard_excluded(real_position, games):
+def _would_be_hard_excluded(real_position, games, teammate_starter_unavailable=False):
     """The exact per-player decision hard_role_exclusions makes, given a
     real (not Showdown CPT/FLEX) position and that player's own recent
     usage history - factored out so models/calibration.py's backtest can
@@ -588,6 +630,16 @@ def _would_be_hard_excluded(real_position, games):
     second, hand-copied implementation drifting out of sync with the one
     actually wired into the optimizer. Returns (excluded: bool, reason:
     str | None).
+
+    teammate_starter_unavailable: real, confirmed evidence (this week's
+    real injury/roster status, not season-long pattern) that this QB's own
+    team has another real QB who is out - see hard_role_exclusions'
+    docstring for the real cases this fixes. Checked ONLY once the
+    intermittent-backup PATTERN itself is already found below - it doesn't
+    change anything for a QB who doesn't match that pattern in the first
+    place, and it deliberately doesn't touch the RB/WR/TE volume floor at
+    all (that check claims "no real role", not "can't confirm who starts" -
+    a different claim a teammate injury doesn't speak to).
     """
     snap_pcts = [float(g["snap_pct"]) for g in games if g["snap_pct"] is not None]
     if len(snap_pcts) < MIN_RECENT_GAMES_FOR_ROLE_CONFIDENCE:
@@ -595,6 +647,8 @@ def _would_be_hard_excluded(real_position, games):
 
     if real_position == "QB":
         if min(snap_pcts) < MIN_SNAP_PCT_FOR_BENCHED and max(snap_pcts) >= MAX_SNAP_PCT_FOR_FULL_GAME:
+            if teammate_starter_unavailable:
+                return False, None  # a real teammate QB is confirmed out this week - this is the real starter now, not a random appearance
             return True, (
                 f"intermittent starter pattern in the last {len(snap_pcts)} recorded games "
                 f"(snap share swings between {min(snap_pcts):.0%} and {max(snap_pcts):.0%}) - "
