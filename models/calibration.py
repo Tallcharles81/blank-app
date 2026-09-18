@@ -10,6 +10,7 @@ from data.player_availability import HARD_EXCLUDE_ROSTER_STATUSES, fetch_roster_
 from data.player_crosswalk import resolve_dk_players_to_gsis
 from data.pre_lock_check import MIN_RECENT_GAMES_FOR_ROLE_CONFIDENCE, _load_recent_usage_batch, _would_be_hard_excluded
 from db.migrate import get_engine
+from models import playing_time_engine
 from models.backtest import DEFAULT_RANDOM_FIELD_SIZE, _asof_projected_points, load_actual_scores, load_slate_pool
 from models.optimizer import SALARY_CAP, build_lineups_from_pool
 from models.projections import (
@@ -913,6 +914,120 @@ def run_hard_exclude_backtest(source_slate_id, seasons=None, engine=None):
         # week and got cut anyway." Sorted by real actual score descending,
         # capped at 15 so this stays a spot-check list, not a dump of every
         # miss (miss_rate/misses above already give the real, complete count).
+        "top_misses": [
+            {"name": name, "position": position, "season": season, "week": week, "actual_score": actual, "reason": reason}
+            for name, position, season, week, actual, reason in sorted(misses, key=lambda r: -r[4])[:15]
+        ],
+    }
+
+
+def run_playing_time_floor_backtest(source_slate_id, seasons=None, engine=None):
+    """Does models/playing_time_engine.py's real hard floor
+    (meets_playing_time_floor - WR/TE real blended snap_pct <50%/<40%, RB
+    real blended snap_pct <30% AND real blended touches <8, QB not the real
+    depth-chart-expected starter) correspond to real subsequent futility,
+    the same no-lookahead standard as run_hard_exclude_backtest above
+    (estimate_role is evaluated via _load_role_history's before_current_week
+    cutoff - only real data strictly before the week under test).
+
+    Real, necessary scope limitation: the QB "not expected starter" branch
+    needs nflverse's real depth-chart feed, which only exists for the
+    CURRENT season (see data/depth_charts.py) - it is never available for a
+    real historical backtest week, so every historical QB player-week here
+    has depth_chart_rank=None and is never excluded by that branch. This
+    backtest is therefore a real test of the RB/WR/TE snap/touch floor
+    only - the QB depth-chart branch is real but, by nflverse's own real
+    data limits, untestable against history.
+    """
+    engine = engine or get_engine()
+
+    slate_players = load_slate_pool(source_slate_id, engine)
+    if not slate_players:
+        raise ValueError(f"No players found in slate_player_pool for slate {source_slate_id}")
+    non_dst_players = [p for p in slate_players if p["position"] != "DST"]
+    gsis_by_dk_id, _, _ = resolve_dk_players_to_gsis(non_dst_players, engine)
+    players_by_id = {p["player_id"]: p for p in non_dst_players}
+
+    games_by_gsis = _load_recent_usage_batch(gsis_by_dk_id.values(), engine)
+    real_position_by_gsis = {
+        gsis_id: games[0]["position"] for gsis_id, games in games_by_gsis.items() if games
+    }
+
+    weeks = _available_weeks(engine)
+    if seasons is not None:
+        weeks = [(s, w) for s, w in weeks if s in seasons]
+
+    excluded_records = []  # (name, position, season, week, actual_score, reason)
+    not_excluded_scores = []
+    weeks_evaluated = 0
+
+    for season, week in weeks:
+        actual_points, _ = load_actual_scores(non_dst_players, season, week, engine)
+        played_gsis_ids = _played_gsis_ids(gsis_by_dk_id.values(), season, week, engine)
+        history_by_gsis = playing_time_engine._load_role_history(
+            gsis_by_dk_id.values(), season, week, engine, before_current_week=True
+        )
+
+        week_had_data = False
+        for dk_id, gsis_id in gsis_by_dk_id.items():
+            if dk_id not in actual_points or gsis_id not in played_gsis_ids:
+                continue
+            real_position = real_position_by_gsis.get(gsis_id)
+            if real_position not in ("QB", "RB", "WR", "TE"):
+                continue  # this floor doesn't apply to DST/K, and an unresolved position isn't this test's call
+
+            history = history_by_gsis.get(gsis_id, {"current": [], "prior": []})
+            if not history["current"] and not history["prior"]:
+                continue  # no real history on either side - same as the live gate's "not this gate's call" case
+
+            player = players_by_id[dk_id]
+            role_estimate = playing_time_engine.estimate_role(real_position, history, None)  # no real depth chart for a historical week - see docstring
+            meets_floor, reason = playing_time_engine.meets_playing_time_floor(real_position, role_estimate)
+            actual = actual_points[dk_id]
+            if not meets_floor:
+                excluded_records.append((player["name"], real_position, season, week, actual, reason))
+            else:
+                not_excluded_scores.append(actual)
+            week_had_data = True
+
+        if week_had_data:
+            weeks_evaluated += 1
+
+    if not excluded_records:
+        raise ValueError(
+            f"No real player-weeks would have been excluded by the playing-time floor for slate {source_slate_id} - "
+            "nothing to evaluate (this itself is worth knowing, not just an error)"
+        )
+
+    excluded_scores = [r[4] for r in excluded_records]
+    excluded_scores_by_position = defaultdict(list)
+    for r in excluded_records:
+        excluded_scores_by_position[r[1]].append(r[4])
+
+    mean_excluded, mean_not_excluded, t_stat, p_value = _two_sample_significance(excluded_scores, not_excluded_scores)
+    misses = [r for r in excluded_records if r[4] > MEANINGFUL_SCORE_THRESHOLD]
+
+    return {
+        "weeks_evaluated": weeks_evaluated,
+        "would_be_excluded_player_weeks": len(excluded_scores),
+        "not_excluded_player_weeks": len(not_excluded_scores),
+        "avg_actual_score_if_excluded": round(mean_excluded, 2) if mean_excluded is not None else None,
+        "avg_actual_score_if_not_excluded": round(mean_not_excluded, 2) if mean_not_excluded is not None else None,
+        "t_stat": round(t_stat, 4) if t_stat is not None else None,
+        "p_value": round(p_value, 4) if p_value is not None else None,
+        "meaningful_score_threshold": MEANINGFUL_SCORE_THRESHOLD,
+        "miss_rate": round(len(misses) / len(excluded_scores), 4),
+        "misses": len(misses),
+        "would_be_excluded_count_by_position": {
+            pos: len(scores) for pos, scores in excluded_scores_by_position.items()
+        },
+        "avg_actual_score_if_excluded_by_position": {
+            pos: round(sum(scores) / len(scores), 2) for pos, scores in excluded_scores_by_position.items()
+        },
+        "miss_rate_by_position": {
+            pos: round(sum(1 for s in scores if s > MEANINGFUL_SCORE_THRESHOLD) / len(scores), 4)
+            for pos, scores in excluded_scores_by_position.items()
+        },
         "top_misses": [
             {"name": name, "position": position, "season": season, "week": week, "actual_score": actual, "reason": reason}
             for name, position, season, week, actual, reason in sorted(misses, key=lambda r: -r[4])[:15]

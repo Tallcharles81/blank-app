@@ -225,7 +225,7 @@ def run_field_simulation(
     sampling, not a separately asserted ownership number) so the sampling
     itself can be sanity-checked.
     """
-    players, _, _ = _load_player_pool(slate_id, projection_field, engine=engine)
+    players, _, _, _ = _load_player_pool(slate_id, projection_field, engine=engine)
     opponents, failed_draws = generate_opponent_lineups(players, contest_size, concentration, seed, proxy_fn=proxy_fn)
     if not opponents:
         raise RuntimeError(f"Could not generate any feasible opponent lineups (all {contest_size} draws failed)")
@@ -418,7 +418,7 @@ def run_validation_comparison(
     report a single run's win_pct ordering as proof either way without
     checking avg_shared_players and the concentration it was run at.
     """
-    players, _, _ = _load_player_pool(slate_id, projection_field, engine=engine)
+    players, _, _, _ = _load_player_pool(slate_id, projection_field, engine=engine)
     raw_points_by_id = {p["player_id"]: p["points"] for p in players}
 
     chalk = build_chalk_lineup(players)

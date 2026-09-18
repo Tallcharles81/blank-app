@@ -14,6 +14,7 @@ from models.calibration import (
     run_game_environment_backtest_comparison,
     run_game_environment_p80_hit_rate_backtest,
     run_hard_exclude_backtest,
+    run_playing_time_floor_backtest,
     run_situational_backtest,
 )
 
@@ -304,3 +305,26 @@ def test_teammate_qb_starter_unavailable_ignores_stale_bench_demotion():
     assert _teammate_qb_starter_unavailable(
         "WAS", _MARCUS_MARIOTA, 18, season_team_qbs, status_by_team_gsis
     ) is False
+
+
+# --- run_playing_time_floor_backtest ----------------------------------------
+
+
+def test_run_playing_time_floor_backtest_runs_and_shows_a_real_effect(engine):
+    result = run_playing_time_floor_backtest("dk_thu_mon_2026_09_17", seasons={2023, 2024, 2025}, engine=engine)
+
+    assert result["weeks_evaluated"] >= 1
+    assert result["would_be_excluded_player_weeks"] > 0
+    assert result["not_excluded_player_weeks"] > 0
+    # The whole premise of this real hard floor: players it catches must
+    # score meaningfully lower on average than players it doesn't - the
+    # same real standard run_hard_exclude_backtest already holds itself to.
+    assert result["avg_actual_score_if_excluded"] < result["avg_actual_score_if_not_excluded"]
+    assert 0.0 <= result["miss_rate"] <= 1.0
+
+    assert len(result["top_misses"]) <= 15
+    for miss in result["top_misses"]:
+        assert miss["actual_score"] > result["meaningful_score_threshold"]
+        assert miss["position"] in ("QB", "RB", "WR", "TE")
+    scores = [m["actual_score"] for m in result["top_misses"]]
+    assert scores == sorted(scores, reverse=True)

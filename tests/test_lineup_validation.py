@@ -22,12 +22,19 @@ def _make_lineup(roster):
 
 def test_a_real_legal_lineup_including_a_flex_as_te_case_passes(engine):
     # Uses live data so this is the same shape as the real incident, not a
-    # hand-built stand-in.
+    # hand-built stand-in. Locks two real, legitimately-eligible starting
+    # TEs (Trey McBride, Kyle Pitts Sr.) in explicitly - since models/
+    # playing_time_engine.py's real floor now correctly excludes most
+    # real backup/committee TEs, the ceiling-maximizer no longer reaches
+    # for a second TE on its own the way it used to on this slate, which
+    # made this test flaky against live data rather than testing what it's
+    # actually meant to (a real FLEX-as-TE roster validates as legal).
     lineups, _, _ = generate_lineups(
         "dk_thu_mon_2026_09_17",
         num_lineups=1,
         projection_field="proj_ceiling",
         excluded_player_ids=["44137054"],
+        locked_player_ids=["44138032", "44138050"],  # Trey McBride, Kyle Pitts Sr.
         engine=engine,
     )
     lineup = lineups[0]

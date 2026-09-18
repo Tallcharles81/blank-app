@@ -17,17 +17,22 @@ from models.projections import SHOWDOWN_CAPTAIN_MULTIPLIER, generate_projections
 
 TEST_SHOWDOWN_PROJECTIONS_SLATE_ID = "TEST_SHOWDOWN_PROJECTIONS"
 
-# Jameis Winston - real, extensive player_weekly_stats history already
-# relied on elsewhere in this test suite (tests/test_showdown_gates.py).
-WINSTON_CPT_ID = "SDPROJ_CPT_WINSTON"
-WINSTON_FLEX_ID = "SDPROJ_FLEX_WINSTON"
+# Jahmyr Gibbs - real, current player_weekly_stats history (through real
+# 2026 week 2) already relied on elsewhere in this test suite (see tests/
+# test_ownership_calibration.py). Not Jameis Winston (this test's original
+# choice) - his own last real recorded game fell far enough behind as real
+# weeks kept accumulating this session that models/projections.py's own
+# real staleness gate (MAX_STALENESS_WEEKS) now correctly treats him as
+# having no usable history at all, which isn't what this test is about.
+GIBBS_CPT_ID = "SDPROJ_CPT_GIBBS"
+GIBBS_FLEX_ID = "SDPROJ_FLEX_GIBBS"
 
 
 @pytest.fixture
 def showdown_projection_slate(engine):
     rows = [
-        {"player_id": WINSTON_CPT_ID, "name": "Jameis Winston", "position": "CPT", "team": "NYG", "salary": 13500},
-        {"player_id": WINSTON_FLEX_ID, "name": "Jameis Winston", "position": "FLEX", "team": "NYG", "salary": 9000},
+        {"player_id": GIBBS_CPT_ID, "name": "Jahmyr Gibbs", "position": "CPT", "team": "DET", "salary": 13500},
+        {"player_id": GIBBS_FLEX_ID, "name": "Jahmyr Gibbs", "position": "FLEX", "team": "DET", "salary": 9000},
     ]
     with engine.begin() as conn:
         for row in rows:
@@ -68,7 +73,7 @@ def test_generate_projections_scales_captain_row_by_1_5x(engine, showdown_projec
         ).mappings().fetchall()
     by_id = {r["player_id"]: r for r in rows}
 
-    cpt = by_id[WINSTON_CPT_ID]
-    flex = by_id[WINSTON_FLEX_ID]
+    cpt = by_id[GIBBS_CPT_ID]
+    flex = by_id[GIBBS_FLEX_ID]
     for field in ("proj_floor", "proj_median", "proj_ceiling"):
         assert float(cpt[field]) == pytest.approx(float(flex[field]) * SHOWDOWN_CAPTAIN_MULTIPLIER, abs=0.02)

@@ -9,6 +9,7 @@ from data.player_availability import game_lock_status, get_availability_gate, re
 from data.player_crosswalk import resolve_dk_players_to_gsis
 from data.pre_lock_check import hard_role_exclusions
 from db.migrate import get_engine
+from models.playing_time_engine import apply_playing_time_gate
 from models.simulation import DEFAULT_NUM_SIMULATIONS, select_best_by_simulation
 
 SALARY_CAP = 50000
@@ -40,7 +41,7 @@ class LineupValidationError(ValueError):
     """
 
 
-def _load_player_pool(slate_id, projection_field, engine):
+def _load_player_pool(slate_id, projection_field, engine, punt_mode=False):
     if projection_field not in ALLOWED_PROJECTION_FIELDS:
         raise ValueError(f"projection_field must be one of {sorted(ALLOWED_PROJECTION_FIELDS)}")
     # projection_field is checked against the fixed whitelist above before use, so
@@ -111,7 +112,45 @@ def _load_player_pool(slate_id, projection_field, engine):
     excluded = {**excluded, **role_excluded}
     available_players = [p for p in available_players if p["player_id"] not in role_excluded]
 
-    # Third hard gate: a player whose real game has already started can
+    # Fourth hard gate, a distinct real claim from the two above: ACTIVE
+    # (roster/injury-clear, already true of every player still in
+    # available_players here) is not the same real fact as "has enough real
+    # expected offensive opportunity to be a DFS play" - see models/
+    # playing_time_engine.py's own module docstring for the real
+    # distinction and the real backtest behind it
+    # (models/calibration.py::run_playing_time_floor_backtest). Every
+    # player reaching this point already cleared the roster/injury gate
+    # above, so no roster_status/injury_status dicts are passed through -
+    # classify_player_status correctly reads that as ACTIVE for all of
+    # them, which is already the real, established fact at this point in
+    # the pipeline; this gate's only new real work is the playing-time
+    # floor itself.
+    playing_time_result = apply_playing_time_gate(
+        available_players, season, week, engine, punt_mode=punt_mode
+    )
+    playing_time_excluded_ids = {e["player_id"]: e["reason"] for e in playing_time_result["excluded"]}
+    excluded = {**excluded, **playing_time_excluded_ids}
+    available_players = playing_time_result["eligible"]
+    playing_time_debug_log = playing_time_result["debug_log"]
+    playing_time_punt_flagged = playing_time_result["punt_flagged"]
+
+    # PUNT MODE only (punt_mode=False leaves punt_flagged empty and this is
+    # a no-op): a player who failed the real playing-time floor stays
+    # eligible but gets his own points/floor/ceiling scaled down by the
+    # same severe, fixed real penalty_multiplier the debug entry already
+    # discloses - applied to every projection field the solver could
+    # optimize on, not just whichever one this call happens to use, so
+    # switching projection_field later can't silently undo the penalty.
+    if playing_time_punt_flagged:
+        penalty_by_id = {e["player_id"]: e["penalty_multiplier"] for e in playing_time_punt_flagged}
+        for p in available_players:
+            multiplier = penalty_by_id.get(p["player_id"])
+            if multiplier is not None:
+                p["points"] *= multiplier
+                p["proj_floor"] *= multiplier
+                p["proj_ceiling"] *= multiplier
+
+    # Fifth hard gate: a player whose real game has already started can
     # never legally be newly rostered - DraftKings itself enforces this
     # (late swap only lets you touch a still-open slot), and unlike the two
     # gates above this is a plain, deterministic fact (a kickoff time has
@@ -126,7 +165,7 @@ def _load_player_pool(slate_id, projection_field, engine):
     for p in available_players:
         p["availability_flag"] = flagged.get(p["player_id"])
 
-    return available_players, excluded, injury_report_available
+    return available_players, excluded, injury_report_available, playing_time_debug_log
 
 
 def _apply_common_constraints(prob, x, players, locked_ids, excluded_ids, max_players_per_team, min_salary=None):
@@ -651,6 +690,7 @@ def generate_lineups(
     min_exposure=None,
     require_qb_stack=True,
     require_bring_back=False,
+    punt_mode=False,
     engine=None,
 ):
     """The live GPP-style lineup path (models/backtest.py, calibration.py,
@@ -668,9 +708,17 @@ def generate_lineups(
     build_lineups_from_pool's docstring) - pass True for a deliberate,
     opt-in full-game-stack build (QB + own pass-catcher + opponent
     pass-catcher).
+
+    punt_mode: see models/playing_time_engine.py's own docstring. False
+    (default, NORMAL MODE) hard-excludes anyone who fails the real
+    playing-time floor before the solver ever sees them. True lets them
+    back in with a severe, real penalty applied to their own points/floor/
+    ceiling instead - an explicit opt-in, never the default.
     """
     engine = engine or get_engine()
-    players, availability_excluded, injury_report_available = _load_player_pool(slate_id, projection_field, engine)
+    players, availability_excluded, injury_report_available, playing_time_debug_log = _load_player_pool(
+        slate_id, projection_field, engine, punt_mode=punt_mode
+    )
     if not players:
         raise ValueError(f"No players with a '{projection_field}' projection found for slate {slate_id}")
 
@@ -689,6 +737,10 @@ def generate_lineups(
     )
 
     availability_report = _build_availability_report(players, availability_excluded, injury_report_available)
+    # Item 13's own requirement: this debug information must be visible to
+    # the user, not just logged - every real playing-time verdict (excluded
+    # AND eligible alike), not only the ones that ended up excluded.
+    availability_report["playing_time_debug_log"] = playing_time_debug_log
     return lineups, exposure_report, availability_report
 
 
@@ -801,7 +853,9 @@ def generate_cash_lineups(
     internally to pick the roster.
     """
     engine = engine or get_engine()
-    players, availability_excluded, injury_report_available = _load_player_pool(slate_id, "proj_floor", engine)
+    players, availability_excluded, injury_report_available, playing_time_debug_log = _load_player_pool(
+        slate_id, "proj_floor", engine
+    )
     if not players:
         raise ValueError(f"No players with a 'proj_floor' projection found for slate {slate_id}")
 
@@ -823,6 +877,7 @@ def generate_cash_lineups(
         lu["total_points"] = sum(p["proj_floor"] for _, p in lu["roster"])
 
     availability_report = _build_availability_report(players, availability_excluded, injury_report_available)
+    availability_report["playing_time_debug_log"] = playing_time_debug_log
     return lineups, exposure_report, availability_report
 
 

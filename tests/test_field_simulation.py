@@ -45,7 +45,7 @@ def test_calibrated_ownership_proxy_falls_back_to_uncalibrated_for_unknown_posit
 
 
 def test_generate_opponent_lineups_defaults_to_calibrated_proxy(engine):
-    players, _, _ = _load_player_pool("dk_thu_mon_2026_09_17", "proj_median", engine)
+    players, _, _, _ = _load_player_pool("dk_thu_mon_2026_09_17", "proj_median", engine)
 
     # A uniform per-position scalar (POSITION_OWNERSHIP_CALIBRATION) doesn't
     # change the relative ORDER within a position, and DST is a mandatory
@@ -74,7 +74,7 @@ def test_generate_opponent_lineups_defaults_to_calibrated_proxy(engine):
 
 
 def test_build_contrarian_lineup_defaults_to_calibrated_proxy(engine):
-    players, _, _ = _load_player_pool("dk_thu_mon_2026_09_17", "proj_ceiling", engine)
+    players, _, _, _ = _load_player_pool("dk_thu_mon_2026_09_17", "proj_ceiling", engine)
 
     calls = []
 
