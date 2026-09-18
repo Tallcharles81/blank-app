@@ -391,13 +391,13 @@ def _clear_and_insert_season(conn, season, rows):
                 targets, target_share, air_yards_share, red_zone_targets,
                 carries, red_zone_carries, rushing_yards, receiving_yards,
                 fantasy_points_ppr, opponent, snap_pct, injury_status,
-                vegas_implied_total
+                vegas_implied_total, receptions
             ) VALUES (
                 :player_id, :player_name, :position, :team, :season, :week,
                 :targets, :target_share, :air_yards_share, :red_zone_targets,
                 :carries, :red_zone_carries, :rushing_yards, :receiving_yards,
                 :fantasy_points_ppr, :opponent, :snap_pct, :injury_status,
-                :vegas_implied_total
+                :vegas_implied_total, :receptions
             )
             """
         ),
@@ -554,6 +554,7 @@ def refresh_player_weekly_stats(seasons, engine=None):
                 "red_zone_carries": rz_carries_by_key.get(key, 0) if rz_carries_by_key is not None else None,
                 "rushing_yards": _nan_to_none(row.rushing_yards),
                 "receiving_yards": _nan_to_none(row.receiving_yards),
+                "receptions": _nan_to_none(row.receptions),
                 "fantasy_points_ppr": _skill_player_fantasy_points(row),
                 "opponent": row.opponent_team,
                 "snap_pct": _nan_to_none(snap_pct_by_key.get(key)),

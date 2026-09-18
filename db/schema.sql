@@ -28,6 +28,13 @@ CREATE TABLE IF NOT EXISTS player_weekly_stats (
 -- weekly report status (e.g. "Out", "Questionable"), not the full injury detail.
 ALTER TABLE player_weekly_stats ADD COLUMN IF NOT EXISTS injury_status TEXT;
 
+-- Added for models/playing_time_engine.py's real "touches" metric (carries +
+-- receptions) - nflverse's real stats_player_week feed always had this
+-- (fetch_player_stats' own "receptions" column), it just was never persisted
+-- here before, since nothing needed it until the playing-time engine's real
+-- RB/WR/TE touch-share floor.
+ALTER TABLE player_weekly_stats ADD COLUMN IF NOT EXISTS receptions INTEGER;
+
 CREATE INDEX IF NOT EXISTS idx_player_weekly_stats_season_week
     ON player_weekly_stats (season, week);
 
