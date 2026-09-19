@@ -543,6 +543,24 @@ def run_gpp_ceiling_backtest(source_slate_id, seasons=None, random_field_size=DE
 # ---------------------------------------------------------------------------
 
 
+def _pearson_r(xs, ys):
+    """Shared real Pearson correlation - the same formula fit_real_
+    correlation_matrix already computes inline for its five stacking
+    relationships; factored out here since run_salary_left_backtest below
+    needs the identical computation a third time.
+    """
+    n = len(xs)
+    if n < 2:
+        return None
+    mean_x, mean_y = sum(xs) / n, sum(ys) / n
+    cov = sum((x - mean_x) * (y - mean_y) for x, y in zip(xs, ys)) / (n - 1)
+    std_x = math.sqrt(sum((x - mean_x) ** 2 for x in xs) / (n - 1))
+    std_y = math.sqrt(sum((y - mean_y) ** 2 for y in ys) / (n - 1))
+    if std_x == 0 or std_y == 0:
+        return None
+    return cov / (std_x * std_y)
+
+
 def _paired_significance(differences):
     """Two-tailed significance test for whether paired `differences` (e.g.
     baseline_error - adjusted_error for the SAME player-week under both
@@ -1032,6 +1050,380 @@ def run_playing_time_floor_backtest(source_slate_id, seasons=None, engine=None):
             {"name": name, "position": position, "season": season, "week": week, "actual_score": actual, "reason": reason}
             for name, position, season, week, actual, reason in sorted(misses, key=lambda r: -r[4])[:15]
         ],
+    }
+
+
+def run_salary_left_backtest(source_slate_id, risk_aversion=1.0, seasons=None, engine=None):
+    """Does leaving real DK salary cap unspent predict a worse real
+    subsequent outcome? Motivated by a real, single-anecdote finding
+    already baked into generate_cash_lineups (min_salary_fraction=0.95 -
+    see that function's own docstring: "caught for real on the first run:
+    risk_aversion=1.0 with no salary floor left $17,200 of a $50,000 cap
+    unused") that was never backtested against real historical data before
+    now - exactly the kind of one-slate threshold this codebase's own
+    standing rule says never to trust without a real backtest.
+
+    For every real historical week (no-lookahead - _asof_projected_points
+    only ever uses data available strictly before that week, same as every
+    other backtest in this module), builds this source slate's real salary
+    structure into two lineups with NO min_salary constraint applied (so
+    real natural leftover-salary behavior can actually show up to be
+    measured, rather than being forced away before it's observed):
+      - ceiling_objective: the same real objective generate_lineups (GPP
+        mode) uses - maximize sum(proj_ceiling).
+      - cash_objective: the same real objective generate_cash_lineups uses
+        - maximize sum(proj_floor - risk_aversion*(proj_ceiling-proj_floor))
+        - MINUS its own min_salary_fraction floor, deliberately, so this
+        backtest measures the same real unconstrained behavior the
+        anecdote described.
+
+    For each, Pearson-correlates the real lineup's own leftover salary
+    (SALARY_CAP - real total salary spent) against its own real subsequent
+    actual score across every real historical week. A negative real
+    correlation (more real salary left behind -> lower real actual score)
+    would validate the existing anecdote-based fix; no real correlation
+    would mean that fix isn't earning its complexity for that objective -
+    reported honestly either way, not assumed from the one anecdote it
+    started from.
+
+    Also runs a direct real paired A/B: the same cash_objective pool, same
+    real week, WITH generate_cash_lineups' own current min_salary_fraction=
+    0.95 constraint applied vs. without it - a real significance test of
+    whether that specific, currently-shipped default actually improves real
+    subsequent actual score, not just whether salary-left correlates with
+    anything in the abstract.
+    """
+    engine = engine or get_engine()
+
+    slate_players = load_slate_pool(source_slate_id, engine)
+    if not slate_players:
+        raise ValueError(f"No players found in slate_player_pool for slate {source_slate_id}")
+    gsis_by_dk_id, _, _ = resolve_dk_players_to_gsis(slate_players, engine)
+
+    weeks = _available_weeks(engine)
+    if seasons is not None:
+        weeks = [(s, w) for s, w in weeks if s in seasons]
+
+    ceiling_records = []  # (salary_left, actual_score)
+    cash_records = []
+    constrained_score_diffs = []  # constrained_actual_score - unconstrained_actual_score, same real week both sides
+    skipped = []
+
+    for season, week in weeks:
+        actual_points, _ = load_actual_scores(slate_players, season, week, engine)
+        ceiling_points = _asof_projected_points(slate_players, gsis_by_dk_id, season, week, engine, field="proj_ceiling")
+        floor_points = _asof_projected_points(slate_players, gsis_by_dk_id, season, week, engine, field="proj_floor")
+
+        eligible_ids = set(actual_points) & set(ceiling_points) & set(floor_points)
+        if not eligible_ids:
+            skipped.append((season, week))
+            continue
+        eligible_players = [p for p in slate_players if p["player_id"] in eligible_ids]
+
+        def score_actual(roster):
+            return sum(actual_points[p["player_id"]] for _, p in roster)
+
+        ceiling_pool = [{**p, "points": ceiling_points[p["player_id"]]} for p in eligible_players]
+        try:
+            lu = build_lineups_from_pool(ceiling_pool, num_lineups=1, salary_cap=SALARY_CAP)[0][0]
+            ceiling_records.append((SALARY_CAP - lu["total_salary"], score_actual(lu["roster"])))
+        except ValueError:
+            pass
+
+        cash_pool = [
+            {
+                **p,
+                "points": floor_points[p["player_id"]]
+                - risk_aversion * (ceiling_points[p["player_id"]] - floor_points[p["player_id"]]),
+            }
+            for p in eligible_players
+        ]
+        unconstrained_score = None
+        try:
+            lu = build_lineups_from_pool(
+                cash_pool, num_lineups=1, salary_cap=SALARY_CAP, max_players_per_team=3
+            )[0][0]
+            unconstrained_score = score_actual(lu["roster"])
+            cash_records.append((SALARY_CAP - lu["total_salary"], unconstrained_score))
+        except ValueError:
+            pass
+
+        # Direct real A/B test of generate_cash_lineups' OWN current default
+        # (min_salary_fraction=0.95) against the unconstrained build above,
+        # paired on the identical real week/pool/objective - only the
+        # constraint differs. Only recorded when both sides actually built,
+        # so the pairing stays real (same week on both sides of the diff).
+        try:
+            constrained_lu = build_lineups_from_pool(
+                cash_pool,
+                num_lineups=1,
+                salary_cap=SALARY_CAP,
+                max_players_per_team=3,
+                min_salary=0.95 * SALARY_CAP,
+            )[0][0]
+            if unconstrained_score is not None:
+                constrained_score_diffs.append(score_actual(constrained_lu["roster"]) - unconstrained_score)
+        except ValueError:
+            pass
+
+    if not ceiling_records and not cash_records:
+        raise ValueError(f"No real historical weeks produced a buildable lineup for slate {source_slate_id}")
+
+    def _summarize(records):
+        n = len(records)
+        if n < 2:
+            return {"sample_size": n, "correlation": None, "avg_salary_left": None, "avg_actual_score": None}
+        salary_lefts = [r[0] for r in records]
+        scores = [r[1] for r in records]
+        correlation = _pearson_r(salary_lefts, scores)
+        return {
+            "sample_size": n,
+            "correlation": round(correlation, 4) if correlation is not None else None,
+            "avg_salary_left": round(sum(salary_lefts) / n, 2),
+            "avg_actual_score": round(sum(scores) / n, 2),
+        }
+
+    mean_diff, t_stat, p_value = _paired_significance(constrained_score_diffs)
+
+    return {
+        "weeks_considered": len(weeks),
+        "skipped_weeks": skipped,
+        "ceiling_objective": _summarize(ceiling_records),
+        "cash_objective": _summarize(cash_records),
+        "cash_min_salary_fraction_0_95_vs_unconstrained": {
+            "sample_size": len(constrained_score_diffs),
+            "avg_actual_score_improvement": round(mean_diff, 2) if constrained_score_diffs else None,
+            "t_stat": round(t_stat, 4) if t_stat is not None else None,
+            "p_value": round(p_value, 4) if p_value is not None else None,
+        },
+    }
+
+
+def run_opportunity_score_backtest(source_slate_id, seasons=None, engine=None):
+    """Does models/playing_time_engine.py's compute_opportunity_score carry
+    real predictive signal of its own, among players who ALREADY clear the
+    hard playing-time floor? So far opportunity_score only ever reaches a
+    debug-log field and PUNT MODE's own binary gate (apply_playing_time_gate
+    only checks meets_playing_time_floor, not the score, to decide who gets
+    punt-flagged) - never anything that changes NORMAL MODE's real
+    eligible-but-thin players. Before wiring it into anything that would
+    change what the optimizer picks, this checks whether the score itself
+    means anything real: item 7's own language calls a floor-passing-but-
+    low-opportunity player HIGH-VARIANCE-PUNT territory - this either shows
+    that's true of real historical outcomes or it doesn't. Same no-lookahead
+    standard as every other backtest in this module (estimate_role only
+    ever sees _load_role_history's before_current_week=True data).
+
+    Scoped to QB/RB/WR/TE only (compute_opportunity_score's own real scope -
+    see meets_playing_time_floor for why DST/K never reach this floor at
+    all), and to player-weeks that already pass meets_playing_time_floor -
+    the floor's OWN real effect is run_playing_time_floor_backtest's job,
+    not this one's; this backtest is specifically about the players that
+    gate already lets through.
+    """
+    engine = engine or get_engine()
+
+    slate_players = load_slate_pool(source_slate_id, engine)
+    if not slate_players:
+        raise ValueError(f"No players found in slate_player_pool for slate {source_slate_id}")
+    non_dst_players = [p for p in slate_players if p["position"] != "DST"]
+    gsis_by_dk_id, _, _ = resolve_dk_players_to_gsis(non_dst_players, engine)
+
+    games_by_gsis = _load_recent_usage_batch(gsis_by_dk_id.values(), engine)
+    real_position_by_gsis = {
+        gsis_id: games[0]["position"] for gsis_id, games in games_by_gsis.items() if games
+    }
+
+    weeks = _available_weeks(engine)
+    if seasons is not None:
+        weeks = [(s, w) for s, w in weeks if s in seasons]
+
+    records = []  # (opportunity_score, actual_score, position)
+    weeks_evaluated = 0
+
+    for season, week in weeks:
+        actual_points, _ = load_actual_scores(non_dst_players, season, week, engine)
+        played_gsis_ids = _played_gsis_ids(gsis_by_dk_id.values(), season, week, engine)
+        history_by_gsis = playing_time_engine._load_role_history(
+            gsis_by_dk_id.values(), season, week, engine, before_current_week=True
+        )
+
+        week_had_data = False
+        for dk_id, gsis_id in gsis_by_dk_id.items():
+            if dk_id not in actual_points or gsis_id not in played_gsis_ids:
+                continue
+            real_position = real_position_by_gsis.get(gsis_id)
+            if real_position not in ("QB", "RB", "WR", "TE"):
+                continue
+
+            history = history_by_gsis.get(gsis_id, {"current": [], "prior": []})
+            if not history["current"] and not history["prior"]:
+                continue  # no real history either side - not this backtest's call, same as the floor's own exemption
+
+            role_estimate = playing_time_engine.estimate_role(real_position, history, None)
+            meets_floor, _ = playing_time_engine.meets_playing_time_floor(real_position, role_estimate)
+            if not meets_floor:
+                continue
+
+            opportunity_score = playing_time_engine.compute_opportunity_score(real_position, role_estimate)
+            records.append((opportunity_score, actual_points[dk_id], real_position))
+            week_had_data = True
+
+        if week_had_data:
+            weeks_evaluated += 1
+
+    if len(records) < 2:
+        raise ValueError(
+            f"Not enough real eligible player-weeks to evaluate opportunity_score for slate {source_slate_id}"
+        )
+
+    scores = [r[0] for r in records]
+    actuals = [r[1] for r in records]
+    correlation = _pearson_r(scores, actuals)
+
+    by_position = defaultdict(list)
+    for opp, actual, pos in records:
+        by_position[pos].append((opp, actual))
+    correlation_by_position = {}
+    for pos, pairs in by_position.items():
+        r = _pearson_r([p[0] for p in pairs], [p[1] for p in pairs])
+        correlation_by_position[pos] = {
+            "correlation": round(r, 4) if r is not None else None,
+            "sample_size": len(pairs),
+        }
+
+    # Real, evidence-derived tercile split of the real observed opportunity_
+    # score distribution among eligible players - not an invented fixed
+    # cutoff, so the low/high comparison below reflects this slate's own
+    # real data rather than a guessed threshold.
+    sorted_scores = sorted(scores)
+    n = len(sorted_scores)
+    low_cut = sorted_scores[n // 3]
+    high_cut = sorted_scores[2 * n // 3]
+    low_actuals = [a for o, a, _ in records if o <= low_cut]
+    high_actuals = [a for o, a, _ in records if o >= high_cut]
+    mean_low, mean_high, t_stat, p_value = _two_sample_significance(low_actuals, high_actuals)
+
+    return {
+        "weeks_evaluated": weeks_evaluated,
+        "eligible_player_weeks": len(records),
+        "correlation": round(correlation, 4) if correlation is not None else None,
+        "correlation_by_position": correlation_by_position,
+        "low_opportunity_tercile_cutoff": round(low_cut, 2),
+        "high_opportunity_tercile_cutoff": round(high_cut, 2),
+        "avg_actual_score_low_tercile": round(mean_low, 2) if mean_low is not None else None,
+        "avg_actual_score_high_tercile": round(mean_high, 2) if mean_high is not None else None,
+        "t_stat": round(t_stat, 4) if t_stat is not None else None,
+        "p_value": round(p_value, 4) if p_value is not None else None,
+    }
+
+
+def _actual_snap_pct_for_week(gsis_ids, season, week, engine):
+    query = text(
+        "SELECT player_id, snap_pct FROM player_weekly_stats "
+        "WHERE player_id = ANY(:ids) AND season = :season AND week = :week AND snap_pct IS NOT NULL"
+    )
+    with engine.connect() as conn:
+        rows = conn.execute(query, {"ids": list(gsis_ids), "season": season, "week": week}).fetchall()
+    return {row.player_id: float(row.snap_pct) for row in rows}
+
+
+def run_shrinkage_backtest(source_slate_id, seasons=None, engine=None):
+    """The real backtest models/playing_time_engine.py's own SHRINKAGE_K
+    comment has promised since it shipped ("see run_shrinkage_backtest in
+    models/calibration.py for the real test of whether this actually beats
+    the old hard cutoff") but that function never actually existed - a real
+    gap between what the code claimed and what was there, found by mapping
+    this codebase against a later request rather than by design. This is
+    that backtest, finally written.
+
+    Compares _shrinkage_blend's real empirical-Bayes blend of current- and
+    prior-season snap_pct against the naive approach it was built to
+    replace: trust current-season data the moment ANY of it exists, ignore
+    prior season entirely - a real, simple hard-cutoff baseline, not an
+    invented strawman (this module's own SHRINKAGE_K comment calls it "an
+    arbitrary game-count cutoff"). Both predict a player's real snap_pct in
+    `week` using only real games strictly before it (before_current_week=
+    True, the same no-lookahead standard as every other backtest here),
+    scored by absolute error against that player's own real actual snap_pct
+    in `week`.
+
+    Restricted to n_current in [1, SHRINKAGE_K) - the real early-season
+    regime where the two methods actually disagree. At n_current=0 both
+    fall back identically to prior-season data (no real disagreement to
+    measure); at n_current >= SHRINKAGE_K, shrinkage's own weight on
+    current-season data approaches 1.0 and converges with the naive
+    baseline by construction - this only tests the window where blending
+    could plausibly help or hurt.
+    """
+    engine = engine or get_engine()
+
+    slate_players = load_slate_pool(source_slate_id, engine)
+    if not slate_players:
+        raise ValueError(f"No players found in slate_player_pool for slate {source_slate_id}")
+    non_dst_players = [p for p in slate_players if p["position"] != "DST"]
+    gsis_by_dk_id, _, _ = resolve_dk_players_to_gsis(non_dst_players, engine)
+
+    weeks = _available_weeks(engine)
+    if seasons is not None:
+        weeks = [(s, w) for s, w in weeks if s in seasons]
+
+    shrinkage_errors = []
+    naive_errors = []
+    weeks_evaluated = 0
+
+    for season, week in weeks:
+        history_by_gsis = playing_time_engine._load_role_history(
+            gsis_by_dk_id.values(), season, week, engine, before_current_week=True
+        )
+        actual_snaps = _actual_snap_pct_for_week(gsis_by_dk_id.values(), season, week, engine)
+
+        week_had_data = False
+        for gsis_id in set(gsis_by_dk_id.values()):
+            if gsis_id is None:
+                continue
+            actual = actual_snaps.get(gsis_id)
+            if actual is None:
+                continue
+            history = history_by_gsis.get(gsis_id, {"current": [], "prior": []})
+            # player_weekly_stats.snap_pct is NUMERIC - psycopg2 returns
+            # Decimal, which _shrinkage_blend's float arithmetic can't mix
+            # with (same real cast estimate_role already applies to this
+            # exact data before calling the same function).
+            current_snaps = [float(g["snap_pct"]) for g in history["current"] if g["snap_pct"] is not None]
+            prior_snaps = [float(g["snap_pct"]) for g in history["prior"] if g["snap_pct"] is not None]
+            n_current = len(current_snaps)
+            if not (1 <= n_current < playing_time_engine.SHRINKAGE_K):
+                continue
+            if not prior_snaps:
+                continue  # both methods degenerate to the same current-only average here - no real disagreement to measure
+
+            shrinkage_pred, _, _, _ = playing_time_engine._shrinkage_blend(current_snaps, prior_snaps)
+            naive_pred = sum(current_snaps) / len(current_snaps)
+
+            shrinkage_errors.append(abs(shrinkage_pred - actual))
+            naive_errors.append(abs(naive_pred - actual))
+            week_had_data = True
+
+        if week_had_data:
+            weeks_evaluated += 1
+
+    if len(shrinkage_errors) < 2:
+        raise ValueError(
+            f"Not enough real early-season player-weeks to evaluate shrinkage for slate {source_slate_id}"
+        )
+
+    differences = [naive_e - shrink_e for naive_e, shrink_e in zip(naive_errors, shrinkage_errors)]
+    mean_diff, t_stat, p_value = _paired_significance(differences)
+
+    return {
+        "weeks_evaluated": weeks_evaluated,
+        "player_weeks_evaluated": len(shrinkage_errors),
+        "avg_absolute_error_shrinkage": round(sum(shrinkage_errors) / len(shrinkage_errors), 4),
+        "avg_absolute_error_naive_hard_cutoff": round(sum(naive_errors) / len(naive_errors), 4),
+        "avg_error_reduction": round(mean_diff, 4),
+        "t_stat": round(t_stat, 4) if t_stat is not None else None,
+        "p_value": round(p_value, 4) if p_value is not None else None,
     }
 
 

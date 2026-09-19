@@ -842,11 +842,19 @@ def generate_cash_lineups(
     without it, this objective can rationally leave real cap unspent rather
     than pay for an expensive-but-volatile player, and a guaranteed-zero
     player has zero spread too, so nothing stops the solver from filling
-    slots with worthless $2,500 scrubs instead. Caught for real on the first
-    run: risk_aversion=1.0 with no salary floor left $17,200 of a $50,000 cap
-    unused, rostering four zero-projection players. min_salary_fraction=0.95
-    forces the solver to still spend real budget while it searches for the
-    lowest-variance combination.
+    slots with worthless $2,500 scrubs instead. First caught anecdotally on a
+    single live run (risk_aversion=1.0 with no salary floor left $17,200 of a
+    $50,000 cap unused), then properly backtested against 55 real historical
+    weeks (models/calibration.py::run_salary_left_backtest) rather than left
+    on that one anecdote: unconstrained, this same objective averages
+    $12,356 of real cap left unspent with a real -0.70 Pearson correlation
+    between salary left and real actual score; applying this exact
+    min_salary_fraction=0.95 default improves real actual score by a real,
+    paired +33.99 points on average across those same 55 weeks (t=9.27,
+    p<0.0001). The GPP ceiling objective (generate_lineups) was checked the
+    same way and shows no such effect (correlation 0.03, avg $907 left
+    unspent on its own) - it naturally spends the cap without needing this
+    constraint, which is why generate_lineups has no min_salary of its own.
 
     lineup['total_points'] on the results is the real sum of proj_floor (what
     you'd actually expect), not the risk-adjusted objective value used

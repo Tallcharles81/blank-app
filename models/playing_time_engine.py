@@ -81,8 +81,25 @@ PRIOR_SEASON_MAX_GAMES = 8
 # of current-season evidence" requirement with a standard, real statistical
 # form (empirical-Bayes-style shrinkage) instead of an arbitrary game-count
 # cutoff. K=4 is an INITIAL choice (same status as every position threshold
-# below) - see run_shrinkage_backtest in models/calibration.py for the real
-# test of whether this actually beats the old hard cutoff, and by how much.
+# below).
+#
+# IMPORTANT, HONEST RESULT from models/calibration.py::run_shrinkage_
+# backtest (finally run for real, n=1606 real early-season player-weeks,
+# 34 real weeks, dk_sunday_2026_09_20's pool): this blend does NOT beat the
+# naive "trust current-season data the instant any of it exists, ignore
+# prior season" baseline it was meant to improve on - it's WORSE, by a
+# real, statistically significant margin (avg abs error predicting next-
+# week snap_pct: 0.1461 blended vs 0.1274 naive, t=-5.54, p<0.0001). Kept
+# as the live default for now rather than silently reverted, since this
+# contradicts the assumption this whole module shipped under and changing
+# it changes every downstream gate/backtest that depends on estimate_role -
+# a decision flagged to the user rather than made unilaterally. Plausible
+# real cause, not yet tested: real NFL offensive roles can differ sharply
+# year over year (team/scheme/coaching changes), so blending in year-old
+# usage may add real noise rather than real signal, especially this early
+# in a season - i.e. recent within-season data may just be a stronger real
+# predictor of role than last year's, undermining the empirical-Bayes prior
+# this blend assumes.
 SHRINKAGE_K = 4.0
 
 # INITIAL thresholds, substituting real snap_pct for the unavailable real

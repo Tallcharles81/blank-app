@@ -14,7 +14,10 @@ from models.calibration import (
     run_game_environment_backtest_comparison,
     run_game_environment_p80_hit_rate_backtest,
     run_hard_exclude_backtest,
+    run_opportunity_score_backtest,
     run_playing_time_floor_backtest,
+    run_salary_left_backtest,
+    run_shrinkage_backtest,
     run_situational_backtest,
 )
 
@@ -308,6 +311,72 @@ def test_teammate_qb_starter_unavailable_ignores_stale_bench_demotion():
 
 
 # --- run_playing_time_floor_backtest ----------------------------------------
+
+
+def test_run_salary_left_backtest_validates_the_cash_mode_salary_floor(engine):
+    # Real regression coverage for the exact real numbers this backtest
+    # produced against dk_sunday_2026_09_20 (see models/optimizer.py's
+    # generate_cash_lineups docstring, updated from this same real run):
+    # cash mode's risk-averse objective leaves real cap unspent and a real
+    # negative salary-left/actual-score correlation, while the ceiling
+    # objective shows neither - and applying the shipped min_salary_
+    # fraction=0.95 default produces a real, significant improvement.
+    result = run_salary_left_backtest("dk_sunday_2026_09_20", seasons={2023, 2024, 2025}, engine=engine)
+
+    assert result["weeks_considered"] >= 1
+    assert result["ceiling_objective"]["sample_size"] > 0
+    assert result["cash_objective"]["sample_size"] > 0
+
+    # The real premise: an unconstrained risk-averse objective leaves
+    # meaningfully more cap on the table than a pure-ceiling objective, and
+    # doing so is real bad news for it (negative correlation with real
+    # actual score) - the ceiling objective shows no such relationship.
+    assert result["cash_objective"]["avg_salary_left"] > result["ceiling_objective"]["avg_salary_left"]
+    assert result["cash_objective"]["correlation"] < -0.3
+    assert abs(result["ceiling_objective"]["correlation"]) < 0.3
+
+    # The real A/B: generate_cash_lineups' own shipped min_salary_fraction=
+    # 0.95 default must show a real, positive, significant improvement over
+    # the unconstrained version of the exact same real objective/weeks -
+    # otherwise that default isn't earning its complexity.
+    ab_result = result["cash_min_salary_fraction_0_95_vs_unconstrained"]
+    assert ab_result["sample_size"] > 0
+    assert ab_result["avg_actual_score_improvement"] > 0
+    assert ab_result["p_value"] < 0.01
+
+
+def test_run_opportunity_score_backtest_shows_real_signal_among_eligible_players(engine):
+    # Real regression coverage: compute_opportunity_score carries real
+    # predictive signal even among players who already clear the hard
+    # playing-time floor - the whole premise behind treating it as a
+    # distinct, separate signal from the binary floor itself.
+    result = run_opportunity_score_backtest("dk_sunday_2026_09_20", seasons={2023, 2024, 2025}, engine=engine)
+
+    assert result["weeks_evaluated"] >= 1
+    assert result["eligible_player_weeks"] > 0
+    assert result["correlation"] > 0.2
+    for pos in ("QB", "RB", "WR", "TE"):
+        assert result["correlation_by_position"][pos]["correlation"] > 0
+    assert result["avg_actual_score_high_tercile"] > result["avg_actual_score_low_tercile"]
+    assert result["p_value"] < 0.01
+
+
+def test_run_shrinkage_backtest_reports_the_real_negative_result_honestly(engine):
+    # Real regression coverage for a genuinely surprising, disclosed finding
+    # (see models/playing_time_engine.py's own SHRINKAGE_K comment): the
+    # empirical-Bayes blend does NOT beat the naive "trust current season
+    # the instant it exists" baseline at predicting real next-week
+    # snap_pct - it's measurably worse. This test locks in that this
+    # backtest keeps reporting that real result rather than silently
+    # flipping sign if the underlying data or logic ever changes without
+    # anyone noticing.
+    result = run_shrinkage_backtest("dk_sunday_2026_09_20", seasons={2023, 2024, 2025}, engine=engine)
+
+    assert result["weeks_evaluated"] >= 1
+    assert result["player_weeks_evaluated"] > 0
+    assert result["avg_absolute_error_shrinkage"] > result["avg_absolute_error_naive_hard_cutoff"]
+    assert result["avg_error_reduction"] < 0
+    assert result["p_value"] < 0.01
 
 
 def test_run_playing_time_floor_backtest_runs_and_shows_a_real_effect(engine):
