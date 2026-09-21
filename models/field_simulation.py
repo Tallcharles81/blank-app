@@ -105,17 +105,41 @@ def ownership_proxy(players):
 # the same real direction and rough magnitude (all still badly under-
 # predicted by raw points-per-$1000) but moved enough between weeks that
 # pooling both real slates, not trusting either alone, is the better
-# estimate now that both exist. Below is that real pooled value across
-# both real weeks (n=141-517/position, combined) - this table is expected
-# to keep moving as more real weeks accumulate, per this module's own
-# accumulating-dataset design; re-run data/ownership_calibration.py's
-# summarize_ownership_calibration before assuming these are still current.
+# estimate now that both exist.
+#
+# UPDATED AGAIN with 2 more real Classic contests on the same
+# dk_sunday_2026_09_20 slate (195866131, 195658397) - a third real,
+# independent data point, not just more of the same contest. Pooled ratio
+# across ALL real Classic contests to date (n=200-730/position): QB 1.19
+# RB 2.55 WR 2.00 TE 1.28 DST 2.17 - all within a few hundredths of the
+# prior table, real convergence rather than drift, the sign this estimate
+# is stabilizing as more real weeks accumulate rather than still hunting
+# for its true value.
+#
+# REAL METHODOLOGICAL FINDING while doing this update, worth preserving:
+# a real Showdown contest (195910196, dk_showdown_ind_kc_2026_09_20) was
+# ALSO imported alongside these, and naively pooling its real ratios in
+# with the Classic ones distorted every position badly (e.g. WR's pooled
+# ratio jumping from 2.00 to 2.13, RB from 2.55 to 2.78) despite Showdown
+# contributing only 2-11 real matched players per position. A Showdown
+# pool's real ownership_proxy scale is NOT comparable to a Classic pool's
+# (far fewer real players compete for the same %Drafted share, and
+# CPT/FLEX pricing changes the raw points-per-$1000 math entirely) - this
+# table must only ever be fit from real Classic-slate contests. A future
+# Showdown-specific calibration, if ever built, needs its own separate
+# table and enough real Showdown contests to trust it, not a blend with
+# this one.
+#
+# This table is expected to keep moving as more real Classic weeks
+# accumulate, per this module's own accumulating-dataset design; re-run
+# data/ownership_calibration.py's summarize_ownership_calibration (Classic
+# slates only) before assuming these are still current.
 POSITION_OWNERSHIP_CALIBRATION = {
-    "QB": 1.17,
-    "RB": 2.48,
-    "WR": 1.96,
-    "TE": 1.26,
-    "DST": 2.22,
+    "QB": 1.19,
+    "RB": 2.55,
+    "WR": 2.00,
+    "TE": 1.28,
+    "DST": 2.17,
 }
 
 

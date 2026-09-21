@@ -413,18 +413,31 @@ def test_run_ownership_correlation_test_on_a_second_real_week_shows_real_signal(
 def test_position_ownership_calibration_still_reflects_real_cross_week_data(engine):
     # Real regression guard against POSITION_OWNERSHIP_CALIBRATION silently
     # going stale: recomputes each position's real mean(%Drafted)/mean(raw
-    # ownership_proxy) ratio, pooled across every real contest imported so
-    # far (both dk_thu_mon_2026_09_17 and dk_sunday_2026_09_20 - two real,
-    # independent weeks as of this test), and checks the live constant is
-    # still within a real, reasonable tolerance of that data. A future
-    # contest import that shifts these ratios enough to fail this test is
-    # exactly the signal that the constant needs another real update, the
-    # same way this session's own cross-week check just triggered one.
+    # ownership_proxy) ratio, pooled across every real CLASSIC-slate
+    # contest imported so far, and checks the live constant is still within
+    # a real, reasonable tolerance of that data. A future contest import
+    # that shifts these ratios enough to fail this test is exactly the
+    # signal that the constant needs another real update, the same way
+    # this session's own cross-week check just triggered one.
+    #
+    # Classic slates only, by real, deliberate design - a real Showdown
+    # contest (195910196, dk_showdown_ind_kc_2026_09_20) is also in this
+    # table, and pooling its ratios in with Classic ones distorts every
+    # position (a Showdown pool's real ownership_proxy scale isn't
+    # comparable to a Classic pool's - far fewer real players compete for
+    # the same %Drafted share, and CPT/FLEX pricing changes the raw
+    # points-per-$1000 math entirely) - see POSITION_OWNERSHIP_CALIBRATION's
+    # own real disclosure comment for the numbers this caused.
     from models.field_simulation import POSITION_OWNERSHIP_CALIBRATION
 
     with engine.connect() as conn:
         rows = conn.execute(
-            text("SELECT position, pct_drafted, ownership_proxy FROM contest_ownership WHERE ownership_proxy IS NOT NULL")
+            text(
+                """
+                SELECT position, pct_drafted, ownership_proxy FROM contest_ownership
+                WHERE ownership_proxy IS NOT NULL AND slate_id NOT ILIKE '%showdown%'
+                """
+            )
         ).fetchall()
 
     by_position = {}
