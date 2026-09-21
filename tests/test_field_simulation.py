@@ -2,9 +2,12 @@ import pytest
 
 from models.field_simulation import (
     POSITION_OWNERSHIP_CALIBRATION,
+    build_chalk_lineup,
     build_contrarian_lineup,
     build_leverage_lineup,
+    build_ownership_cap_lineup,
     calibrated_ownership_proxy,
+    find_ownership_cap_matching_projection,
     generate_opponent_lineups,
     leverage_score,
     ownership_proxy,
@@ -138,6 +141,35 @@ def test_build_leverage_lineup_defaults_to_calibrated_proxy(engine):
     default_ids = frozenset(p["player_id"] for _, p in default_lineup["roster"])
     spied_ids = frozenset(p["player_id"] for _, p in spied_lineup["roster"])
     assert default_ids == spied_ids
+
+
+def test_build_ownership_cap_lineup_respects_the_hard_cap(engine):
+    players, _, _, _ = _load_player_pool("dk_thu_mon_2026_09_17", "proj_ceiling", engine)
+    proxy_by_id = calibrated_ownership_proxy(players)
+
+    uncapped = build_chalk_lineup(players)
+    uncapped_total = sum(proxy_by_id[p["player_id"]] for _, p in uncapped["roster"])
+
+    cap = 0.7 * uncapped_total
+    capped = build_ownership_cap_lineup(players, cap)
+    capped_total = sum(proxy_by_id[p["player_id"]] for _, p in capped["roster"])
+    assert capped_total <= cap + 1e-6
+
+
+def test_find_ownership_cap_matching_projection_finds_a_real_alternative(engine):
+    players, _, _, _ = _load_player_pool("dk_thu_mon_2026_09_17", "proj_ceiling", engine)
+    proxy_by_id = calibrated_ownership_proxy(players)
+
+    chalk = build_chalk_lineup(players)
+    chalk_projection = sum(p["points"] for _, p in chalk["roster"])
+    chalk_total_ownership = sum(proxy_by_id[p["player_id"]] for _, p in chalk["roster"])
+
+    lineup, cap_used, projection, matched = find_ownership_cap_matching_projection(
+        players, chalk_projection, chalk_total_ownership
+    )
+    assert matched
+    assert abs(projection - chalk_projection) <= 0.05 * chalk_projection
+    assert cap_used < chalk_total_ownership  # a real, tighter cap than chalk's own unconstrained total
 
 
 def test_build_contrarian_lineup_defaults_to_calibrated_proxy(engine):

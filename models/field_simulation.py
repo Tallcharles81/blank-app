@@ -590,6 +590,163 @@ def run_leverage_validation_comparison(
     }
 
 
+def build_ownership_cap_lineup(players, cap, proxy_fn=calibrated_ownership_proxy):
+    """Maximize points under the same cap/roster rules as build_chalk_lineup,
+    plus one HARD constraint: total proxy_fn(players) across the 9 selected
+    players must not exceed `cap` (models/optimizer.py's
+    _apply_ownership_cap_constraint, threaded through build_lineups_from_pool
+    as ownership_values_by_id/ownership_cap - both default None/no-op, so
+    every existing caller is unaffected).
+
+    Structurally different from build_contrarian_lineup/build_leverage_
+    lineup: those trade points off against ownership CONTINUOUSLY (a penalty
+    or reward term the solver can balance against), so a high-enough-upside
+    chalk play can still get picked even at a real ownership cost. A hard
+    cap is a genuine constraint - the solver can pick ANY combination under
+    the cap, including one that leaves easy points on the table rather than
+    touch a single over-cap chalk play - a structurally different real
+    question from either existing lever: does directly bounding total
+    lineup-level ownership (as opposed to per-player exposure caps across a
+    portfolio, or a continuous penalty) change real GPP win_pct.
+
+    Raises ValueError (from build_lineups_from_pool/_solve) if `cap` is too
+    tight for ANY legal 9-man roster to fit under it - a real, expected
+    outcome at the tight end of a cap sweep, not a bug; callers doing a
+    sweep (find_ownership_cap_matching_projection) must catch this.
+    """
+    ownership_values_by_id = proxy_fn(players)
+    lineups, _ = build_lineups_from_pool(
+        list(players),
+        num_lineups=1,
+        salary_cap=SALARY_CAP,
+        ownership_values_by_id=ownership_values_by_id,
+        ownership_cap=cap,
+    )
+    return lineups[0]
+
+
+# Cap expressed as a FRACTION of the chalk lineup's own total ownership
+# (find_ownership_cap_matching_projection scales this by the caller's actual
+# chalk_total_ownership), not an absolute unit - unlike _LAMBDA_SEARCH_GRID/
+# _LEVERAGE_LAMBDA_SEARCH_GRID (both hand-tuned to one slate's raw
+# ownership_proxy scale by inspection), a fraction-of-chalk grid is scale-
+# invariant across slates of very different size/projection totals without
+# per-slate re-tuning. 10%-100% of chalk's own total ownership, in 2% steps.
+_OWNERSHIP_CAP_FRACTIONS = [round(0.02 * i, 2) for i in range(5, 51)]
+
+
+def find_ownership_cap_matching_projection(
+    players, target_projection, chalk_total_ownership, tolerance=0.05, proxy_fn=calibrated_ownership_proxy
+):
+    """find_contrarian_matching_projection's counterpart for build_ownership_
+    cap_lineup: search _OWNERSHIP_CAP_FRACTIONS (scaled by chalk_total_
+    ownership) for a capped lineup within `tolerance` of target_projection.
+    Among every cap whose projection falls within tolerance, picks the
+    TIGHTEST cap (most constrained composition) - the mirror of find_
+    contrarian_matching_projection's "lowest average proxy" pick.
+
+    A cap tight enough to make the ILP infeasible (ValueError from
+    build_ownership_cap_lineup) is skipped, same as a failed opponent draw in
+    generate_opponent_lineups - expected at the tight end of the sweep, not
+    an error to propagate.
+    """
+    raw_points_by_id = {p["player_id"]: p["points"] for p in players}
+    ownership_values_by_id = proxy_fn(players)
+
+    candidates = []
+    closest = None
+    for frac in _OWNERSHIP_CAP_FRACTIONS:
+        cap = frac * chalk_total_ownership
+        try:
+            lineup = build_ownership_cap_lineup(players, cap, proxy_fn=proxy_fn)
+        except ValueError:
+            continue
+        projection = _raw_projection(lineup, raw_points_by_id)
+        gap = abs(projection - target_projection)
+        if closest is None or gap < closest[3]:
+            closest = (lineup, cap, projection, gap)
+        if gap <= tolerance * target_projection:
+            candidates.append((lineup, cap, projection))
+
+    if not candidates:
+        if closest is None:
+            raise RuntimeError("no feasible lineup found at any cap in _OWNERSHIP_CAP_FRACTIONS")
+        lineup, cap, projection, gap = closest
+        return lineup, cap, projection, False
+
+    lineup, cap, projection = min(candidates, key=lambda c: c[1])
+    return lineup, cap, projection, True
+
+
+def run_ownership_cap_validation_comparison(
+    slate_id,
+    contest_size=DEFAULT_CONTEST_SIZE,
+    concentration=DEFAULT_CONCENTRATION,
+    num_simulations=DEFAULT_NUM_SIMULATIONS,
+    seed=None,
+    engine=None,
+    projection_field="proj_ceiling",
+    proxy_fn=calibrated_ownership_proxy,
+):
+    """run_validation_comparison's counterpart for the hard ownership-cap
+    lineup: build chalk, the EXISTING ownership-penalty contrarian lineup,
+    and the NEW hard-capped lineup, all matched to chalk's own total
+    projection, then run all three through the SAME opponent field (same
+    seed).
+
+    This is a DIAGNOSTIC/backtest function, same as run_validation_
+    comparison and run_leverage_validation_comparison - it does not change
+    what generate_lineups builds. build_ownership_cap_lineup's only caller is
+    this function and its own tests; nothing in the live optimizer path
+    passes ownership_values_by_id/ownership_cap.
+    """
+    players, _, _, _ = _load_player_pool(slate_id, projection_field, engine=engine)
+    raw_points_by_id = {p["player_id"]: p["points"] for p in players}
+    ownership_values_by_id = proxy_fn(players)
+
+    chalk = build_chalk_lineup(players)
+    chalk_projection = _raw_projection(chalk, raw_points_by_id)
+    chalk_total_ownership = sum(ownership_values_by_id[p["player_id"]] for _, p in chalk["roster"])
+
+    contrarian, contrarian_lambda, contrarian_projection, contrarian_matched = find_contrarian_matching_projection(
+        players, chalk_projection, proxy_fn=proxy_fn
+    )
+    capped, cap_used, capped_projection, capped_matched = find_ownership_cap_matching_projection(
+        players, chalk_projection, chalk_total_ownership, proxy_fn=proxy_fn
+    )
+
+    chalk_result = run_field_simulation(
+        chalk, slate_id, contest_size, concentration, num_simulations, seed, engine, projection_field, proxy_fn=proxy_fn
+    )
+    contrarian_result = run_field_simulation(
+        contrarian, slate_id, contest_size, concentration, num_simulations, seed, engine, projection_field, proxy_fn=proxy_fn
+    )
+    capped_result = run_field_simulation(
+        capped, slate_id, contest_size, concentration, num_simulations, seed, engine, projection_field, proxy_fn=proxy_fn
+    )
+
+    chalk_result["total_projection"] = round(chalk_projection, 2)
+    chalk_result["total_ownership"] = round(chalk_total_ownership, 3)
+    chalk_result["roster"] = [(slot, p["name"]) for slot, p in chalk["roster"]]
+
+    contrarian_result["total_projection"] = round(contrarian_projection, 2)
+    contrarian_result["roster"] = [(slot, p["name"]) for slot, p in contrarian["roster"]]
+    contrarian_result["lambda_used"] = contrarian_lambda
+    contrarian_result["projection_matched_within_tolerance"] = contrarian_matched
+
+    capped_result["total_projection"] = round(capped_projection, 2)
+    capped_result["roster"] = [(slot, p["name"]) for slot, p in capped["roster"]]
+    capped_result["ownership_cap_used"] = round(cap_used, 3)
+    capped_result["ownership_cap_fraction_of_chalk"] = round(cap_used / chalk_total_ownership, 3)
+    capped_result["projection_matched_within_tolerance"] = capped_matched
+
+    return {
+        "chalk": chalk_result,
+        "contrarian": contrarian_result,
+        "ownership_cap": capped_result,
+    }
+
+
 def run_validation_comparison(
     slate_id,
     contest_size=DEFAULT_CONTEST_SIZE,

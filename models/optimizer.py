@@ -280,6 +280,21 @@ def _apply_bring_back_constraint(prob, x, players):
             prob += pass_catcher_sum >= x[qb_id]
 
 
+def _apply_ownership_cap_constraint(prob, x, players, ownership_values_by_id, cap):
+    # A genuinely different constraint from max_exposure/min_exposure above:
+    # those cap how often a PLAYER appears across a multi-lineup portfolio,
+    # this caps how much total ownership a SINGLE lineup can carry (sum of
+    # ownership_values_by_id over all selected players), regardless of
+    # portfolio size. A hard constraint, not a continuous trade-off like
+    # build_contrarian_lineup's penalty term - the solver is free to pick any
+    # combination under the cap, not just ones nudged toward lower ownership.
+    # Backtest-only for now (see models/field_simulation.py::
+    # build_ownership_cap_lineup/run_ownership_cap_validation_comparison) -
+    # both new params default to None so this is a no-op for every existing
+    # caller until/unless a real backtest justifies wiring it into a live path.
+    prob += pulp.lpSum(x[p["player_id"]] * ownership_values_by_id[p["player_id"]] for p in players) <= cap
+
+
 def _solve(prob):
     prob.solve(pulp.PULP_CBC_CMD(msg=False))
     if pulp.LpStatus[prob.status] != "Optimal":
@@ -297,6 +312,8 @@ def _solve_classic(
     min_salary=None,
     require_qb_stack=False,
     require_bring_back=False,
+    ownership_values_by_id=None,
+    ownership_cap=None,
 ):
     prob = pulp.LpProblem("dfs_classic", pulp.LpMaximize)
     x = {p["player_id"]: pulp.LpVariable(f"x_{p['player_id']}", cat="Binary") for p in players}
@@ -325,6 +342,8 @@ def _solve_classic(
         _apply_qb_stack_constraint(prob, x, players)
     if require_bring_back:
         _apply_bring_back_constraint(prob, x, players)
+    if ownership_cap is not None:
+        _apply_ownership_cap_constraint(prob, x, players, ownership_values_by_id, ownership_cap)
 
     _solve(prob)
     selected = [p for p in players if x[p["player_id"]].value() == 1]
@@ -358,6 +377,8 @@ def _solve_showdown(
     min_salary=None,
     require_qb_stack=False,
     require_bring_back=False,
+    ownership_values_by_id=None,
+    ownership_cap=None,
 ):
     # require_qb_stack/require_bring_back are accepted (not just missing) so
     # build_lineups_from_pool can call either solver with the same keyword
@@ -367,7 +388,13 @@ def _solve_showdown(
     # subset the way it does in a 9-player classic roster pulled from up to
     # 8 different games - most showdown rosters already include a
     # meaningful share of both teams by construction.
-    del require_qb_stack, require_bring_back
+    #
+    # ownership_values_by_id/ownership_cap are accepted and ignored the same
+    # way, for the same call-signature-parity reason - not backtested for
+    # Showdown yet (see models/field_simulation.py::
+    # run_ownership_cap_validation_comparison, classic-only so far), not a
+    # claim that the constraint wouldn't apply here too.
+    del require_qb_stack, require_bring_back, ownership_values_by_id, ownership_cap
     prob = pulp.LpProblem("dfs_showdown", pulp.LpMaximize)
     x = {p["player_id"]: pulp.LpVariable(f"x_{p['player_id']}", cat="Binary") for p in players}
 
@@ -547,6 +574,8 @@ def build_lineups_from_pool(
     min_salary=None,
     require_qb_stack=False,
     require_bring_back=False,
+    ownership_values_by_id=None,
+    ownership_cap=None,
 ):
     """Core multi-lineup builder, operating on an in-memory player pool (dicts
     with player_id/name/position/salary/team/points) instead of loading from
@@ -572,6 +601,14 @@ def build_lineups_from_pool(
     slot to one game's correlation is a real construction cost that not
     every lineup should pay by default; pass True explicitly for a
     deliberate full-game-stack build.
+
+    ownership_values_by_id/ownership_cap: classic slates only (see
+    _apply_ownership_cap_constraint) - both None by default (no-op). When
+    both are given, hard-caps the SUM of ownership_values_by_id over the
+    selected roster at ownership_cap, on top of whatever objective/other
+    constraints are active. Backtest-only right now (see models/
+    field_simulation.py::build_ownership_cap_lineup) - no live caller passes
+    these yet.
 
     Returns (lineups, exposure_report) where exposure_report is
     {player_id: {"count": n, "fraction": n / lineups_actually_built}} - the
@@ -642,6 +679,8 @@ def build_lineups_from_pool(
                 min_salary,
                 require_qb_stack,
                 require_bring_back,
+                ownership_values_by_id,
+                ownership_cap,
             )
         except ValueError:
             if i == 0:
