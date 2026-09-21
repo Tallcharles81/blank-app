@@ -129,6 +129,34 @@ def fetch_schedules():
     return download_csv("schedules", "games.csv.gz")
 
 
+# Real, known naming divergence between DraftKings' own team abbreviations
+# (as DK exports them - stored in slate_player_pool.team verbatim, needed for
+# CSV re-upload fidelity, so never rewritten there) and nflverse's team
+# abbreviations (used by every table this module fetches - schedules,
+# rosters, weekly stats, implied totals). Found for real on a Rams Showdown
+# slate (NYG@LAR, 2026-09-21): DK exports the Rams as "LAR", nflverse uses
+# "LA" everywhere. This was a SILENT miss, not a loud error, in three
+# separate places before being caught here - resolve_slate_season_week
+# (data/player_availability.py) came back with no schedule match at all,
+# _apply_game_environment_adjustment (models/projections.py) silently
+# skipped the Vegas ceiling adjustment for every Rams player and every
+# Rams-opponent player, and the Rams DST's own synthetic "DST_{team}" id
+# (data/player_crosswalk.py) didn't match refresh_dst_weekly_stats' own
+# "DST_{team}" id below (built from nflverse's row.team) so the Rams DST
+# read back with zero real history. Add another entry here the moment a
+# second real divergence like this is found - never guess at the full list
+# from memory; every other real DK team code matches nflverse's own already.
+DK_TO_NFLVERSE_TEAM = {"LAR": "LA"}
+
+
+def to_nflverse_team(dk_team):
+    """Normalize a DK-sourced team abbreviation to nflverse's own convention
+    before joining or looking up against ANY nflverse-sourced table or
+    synthetic id keyed by team - see DK_TO_NFLVERSE_TEAM.
+    """
+    return DK_TO_NFLVERSE_TEAM.get(dk_team, dk_team)
+
+
 PBP_RED_ZONE_COLUMNS = [
     "season",
     "week",

@@ -4,7 +4,7 @@ from collections import defaultdict
 
 from sqlalchemy import text
 
-from data.nflverse_fetch import fetch_team_implied_totals
+from data.nflverse_fetch import fetch_team_implied_totals, to_nflverse_team
 from data.player_availability import resolve_slate_season_week
 from data.player_crosswalk import resolve_dk_players_to_gsis
 from data.pre_lock_check import _load_recent_usage_batch
@@ -439,13 +439,13 @@ def generate_projections(slate_id, engine=None, use_dst_opponent_matchup_adjustm
                 # DST's ceiling exactly when its real opponent is BELOW the
                 # week's average implied total, reusing that function's
                 # already-validated boost-only mechanism unchanged.
-                opponent_implied_total = implied_totals_by_team.get(player["opponent"])
+                opponent_implied_total = implied_totals_by_team.get(to_nflverse_team(player["opponent"]))
                 if opponent_implied_total is not None and league_average_implied_total is not None:
                     gap = league_average_implied_total - opponent_implied_total
                     synthetic_implied_total = league_average_implied_total + gap
                     proj = _apply_game_environment_adjustment(proj, synthetic_implied_total, league_average_implied_total)
             else:
-                implied_total = implied_totals_by_team.get(player["team"])
+                implied_total = implied_totals_by_team.get(to_nflverse_team(player["team"]))
                 if implied_total is not None and league_average_implied_total is not None:
                     proj = _apply_game_environment_adjustment(proj, implied_total, league_average_implied_total)
             if player["position"] == "CPT":

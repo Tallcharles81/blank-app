@@ -3,6 +3,7 @@ from collections import defaultdict
 
 from sqlalchemy import text
 
+from data.nflverse_fetch import to_nflverse_team
 from db.migrate import get_engine
 
 # DraftKings' player IDs and nflverse's GSIS IDs are different, unrelated ID
@@ -134,8 +135,12 @@ def resolve_dk_players_to_gsis(dk_players, engine=None):
             # DK's DST name is the team nickname only (e.g. "49ers"), which has
             # no reliable, guessable relationship to any naming convention we'd
             # invent for the synthetic rows refresh_dst_weekly_stats() writes -
-            # team code is the one unambiguous, stable key both sides share.
-            dst_id = f"DST_{player['team']}"
+            # team code is the one unambiguous, stable key both sides share -
+            # normalized to nflverse's own team convention first (DK and
+            # nflverse don't always agree - see data/nflverse_fetch.py's
+            # DK_TO_NFLVERSE_TEAM, found for real via the Rams: DK's "LAR"
+            # vs nflverse's "LA", which silently orphaned this exact lookup).
+            dst_id = f"DST_{to_nflverse_team(player['team'])}"
             if dst_id in existing_dst_ids:
                 mapping[player["player_id"]] = dst_id
             else:
@@ -143,7 +148,7 @@ def resolve_dk_players_to_gsis(dk_players, engine=None):
             continue
 
         if player["position"] in SHOWDOWN_PSEUDO_POSITIONS:
-            dst_id = f"DST_{player['team']}"
+            dst_id = f"DST_{to_nflverse_team(player['team'])}"
             real_nickname = dst_nicknames_by_team.get(player["team"])
             if (
                 dst_id in existing_dst_ids

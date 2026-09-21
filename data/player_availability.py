@@ -3,7 +3,7 @@ from zoneinfo import ZoneInfo
 
 from sqlalchemy import text
 
-from data.nflverse_fetch import download_csv, fetch_schedules
+from data.nflverse_fetch import download_csv, fetch_schedules, to_nflverse_team
 from data.player_crosswalk import resolve_dk_players_to_gsis
 from db.migrate import get_engine
 
@@ -88,9 +88,13 @@ def resolve_slate_season_week(slate_id, engine=None):
     # extracting the date fixes this for every kickoff time, not just
     # Thursday's.
     game_date = sample.game_time.astimezone(_SCHEDULE_TZ).date().isoformat()
+    # DK's own team code (sample.team) doesn't always match nflverse's - see
+    # data/nflverse_fetch.py's DK_TO_NFLVERSE_TEAM (found for real via this
+    # exact lookup silently coming back empty for a Rams game).
+    nflverse_team = to_nflverse_team(sample.team)
     match = schedules_df[
         (schedules_df["gameday"] == game_date)
-        & ((schedules_df["home_team"] == sample.team) | (schedules_df["away_team"] == sample.team))
+        & ((schedules_df["home_team"] == nflverse_team) | (schedules_df["away_team"] == nflverse_team))
     ]
     if match.empty:
         return None

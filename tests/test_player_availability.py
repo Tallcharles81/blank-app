@@ -22,6 +22,23 @@ def test_resolve_slate_season_week_handles_a_late_night_kickoff(engine):
     )
 
 
+def test_resolve_slate_season_week_handles_dk_rams_team_code(engine):
+    # Regression test for a real, silent bug: DK exports the Rams as "LAR",
+    # nflverse's own schedule (and every other nflverse table) uses "LA" -
+    # resolve_slate_season_week joined sample.team directly against
+    # schedules_df's home_team/away_team with no normalization, so this came
+    # back None for a real Rams slate (NYG@LAR Showdown, 2026-09-21) rather
+    # than the correct (season, week). Caught for real building that slate's
+    # actual lineups, not by a mock - see data/nflverse_fetch.py's
+    # DK_TO_NFLVERSE_TEAM for the same divergence's other two real fallout
+    # sites (the Vegas implied-total lookup and the Rams DST's synthetic id).
+    season_week = resolve_slate_season_week("dk_showdown_nyg_lar_2026_09_21", engine)
+    assert season_week is not None, (
+        "DK's 'LAR' team code must resolve against nflverse's own 'LA' schedule rows, "
+        "not silently come back with no match"
+    )
+
+
 def test_roster_absence_is_a_hard_exclude():
     # Regression test for the real gate gap: a player completely absent from
     # the current roster feed (not even an explicit status - Brandon Aiyuk,
