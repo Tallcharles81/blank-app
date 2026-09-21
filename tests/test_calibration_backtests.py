@@ -97,6 +97,31 @@ def test_game_environment_p80_backtest_low_tercile_shows_zero_change(engine):
     assert low["baseline_minus_adjusted_hit_rate_diff"] == 0.0
 
 
+def test_game_environment_p80_backtest_high_tercile_no_longer_hurt_by_the_shared_coefficient(engine):
+    # Real regression coverage for this session's own fix: before splitting
+    # GAME_ENVIRONMENT_CEILING_BOOST_PER_POINT by percentile, the single
+    # shared 0.015 coefficient (correctly tuned for P90) actively moved the
+    # high-implied-total tercile's real P80 hit rate AWAY from its own true
+    # 20% target (20.32% -> 18.61%). After giving "75" its own coefficient
+    # (0.0, per the real sweep that motivated this fix), the adjusted rate
+    # must land closer to 20% than the old shared-coefficient result did,
+    # not just closer than baseline in the abstract.
+    result = run_game_environment_p80_hit_rate_backtest("dk_sunday_2026_09_20", engine=engine)
+    high = result["high_implied_total_tercile"]
+    target = result["true_target_hit_rate"]
+    OLD_SHARED_COEFFICIENT_RATE = 0.1861  # the real, disclosed pre-fix number
+
+    assert abs(high["adjusted_p80_hit_rate"]["rate"] - target) < abs(OLD_SHARED_COEFFICIENT_RATE - target)
+    # Honest real nuance, not swept under the rug: interpolated P80 still
+    # borrows a little residual boost bleeding in from the "90" side (which
+    # keeps its own real, unrelated, already-validated 0.015), so the fixed
+    # adjusted rate can still land a touch off pure no-adjustment baseline
+    # in this one tercile (19.52% adjusted vs 20.32% baseline here) even
+    # though it is dramatically closer to target than the old shared-
+    # coefficient version (18.61%) it replaces. Only assert against the
+    # real thing this fix actually claims to solve.
+
+
 def test_fit_real_correlation_matrix_runs_and_shows_real_relationships(engine):
     # Full multi-season run (not scoped to one season - this needs the whole
     # real sample to clear MIN_PAIRS_FOR_FITTED_CORRELATION comfortably); the

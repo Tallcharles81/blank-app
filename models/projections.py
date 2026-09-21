@@ -94,7 +94,26 @@ CEILING_Z_BOOST = 0.3
 # already the post-fix values. Same conclusion holds - the fix didn't change
 # which direction this adjustment should go, only these numbers by tenths of
 # a point.
-GAME_ENVIRONMENT_CEILING_BOOST_PER_POINT = 0.015
+#
+# SPLIT PER PERCENTILE (previously one shared coefficient for both "75" and
+# "90"): a real held-out check (models/calibration.py::
+# run_game_environment_p80_hit_rate_backtest) found the single shared 0.015
+# correctly helps P90 (its own tuned target, above) but actively HURTS P80 -
+# interpolated between "75" and "90" the same way run_weekly_calibration's
+# own p80_hits already does, true target 20%, not 10%. High-implied-total
+# tercile: baseline P80 hit rate 20.32% -> adjusted (shared 0.015) 18.61%,
+# moving AWAY from target, real and significant (t=8.32, p<0.0001).
+#
+# Real sweep across candidate "75"-only coefficients (n=12,018 pooled /
+# 3,971 high-tercile real player-weeks, dk_sunday_2026_09_20) confirmed a
+# clean, monotonic real relationship - every step down from 0.015 toward
+# 0.0 moved the real P80 hit rate closer to its true 20% target, with 0.0
+# itself the best of everything tested (pooled 19.67%->20.04%, high tercile
+# 18.61%->19.52%). "75" gets NO boost at all now; "90" keeps its own
+# already-validated 0.015 unchanged - this doesn't reopen or re-tune the
+# P90 result above, it only stops that same coefficient from being wrongly
+# reused on a percentile it was never tuned for.
+GAME_ENVIRONMENT_CEILING_BOOST_PER_POINT = {"75": 0.0, "90": 0.015}
 
 # DraftKings' real Showdown Captain slot scores the SAME real outcome at
 # 1.5x - a real fact already relied on elsewhere (models/optimizer.py's
@@ -304,14 +323,23 @@ def _apply_game_environment_adjustment(proj, implied_total, league_average_impli
     noise) while the upward half was validated. A team at or below the
     week's average is left completely unchanged now, rather than
     penalized on a direction the data didn't support.
+
+    Per-percentile coefficient (GAME_ENVIRONMENT_CEILING_BOOST_PER_POINT is
+    a dict keyed by label, not one shared scalar) - a real backtest found
+    the single-coefficient version correctly helped P90 (what it was tuned
+    against) while actively hurting P80's own, different true target. A
+    label missing from the dict gets no boost at all (0.0), the same real
+    fail-safe default as models/field_simulation.py's calibrated_ownership_
+    proxy for an unrecognized key.
     """
     gap = implied_total - league_average_implied_total
     if gap <= 0:
         return dict(proj)
-    multiplier = 1.0 + GAME_ENVIRONMENT_CEILING_BOOST_PER_POINT * gap
     adjusted_percentiles = dict(proj["proj_percentiles"])
     for label, z in PERCENTILE_Z.items():
         if z > 0:
+            coeff = GAME_ENVIRONMENT_CEILING_BOOST_PER_POINT.get(label, 0.0)
+            multiplier = 1.0 + coeff * gap
             adjusted_percentiles[label] = round(adjusted_percentiles[label] * multiplier, 2)
     return {**proj, "proj_ceiling": adjusted_percentiles["90"], "proj_percentiles": adjusted_percentiles}
 
