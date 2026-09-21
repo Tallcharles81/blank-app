@@ -3,8 +3,10 @@ import pytest
 from models.field_simulation import (
     POSITION_OWNERSHIP_CALIBRATION,
     build_contrarian_lineup,
+    build_leverage_lineup,
     calibrated_ownership_proxy,
     generate_opponent_lineups,
+    leverage_score,
     ownership_proxy,
 )
 from models.optimizer import _load_player_pool
@@ -71,6 +73,71 @@ def test_generate_opponent_lineups_defaults_to_calibrated_proxy(engine):
     default_rosters = [frozenset(p["player_id"] for _, p in opp["roster"]) for opp in default_opponents]
     spied_rosters = [frozenset(p["player_id"] for _, p in opp["roster"]) for opp in spied_opponents]
     assert default_rosters == spied_rosters
+
+
+def test_leverage_score_is_zero_when_ceiling_rank_matches_ownership_rank():
+    # Two RBs where the higher-ceiling one is ALSO the higher-owned one, in
+    # the same order - ceiling percentile rank and ownership percentile rank
+    # coincide exactly, so leverage should be flat 0.0 for both, not favor
+    # either.
+    players = [
+        _player("rb_low", "RB", 8.0, 4000),
+        _player("rb_high", "RB", 20.0, 9000),
+    ]
+    scores = leverage_score(players)
+    assert scores["rb_low"] == pytest.approx(0.0)
+    assert scores["rb_high"] == pytest.approx(0.0)
+
+
+def test_leverage_score_is_positive_for_high_ceiling_low_ownership_player():
+    # rb_sleeper: HIGHEST ceiling but priced high enough that its raw
+    # points-per-$1000 (ownership_proxy) is only middling - the real
+    # "leverage" case this signal exists to find. rb_chalk is the mirror
+    # image: cheap with the best raw value/ownership_proxy of the three, but
+    # the lowest ceiling.
+    players = [
+        _player("rb_sleeper", "RB", 22.0, 9000),  # ceiling rank 1st, value 2.44
+        _player("rb_mid", "RB", 14.0, 6000),  # ceiling rank 2nd, value 2.33
+        _player("rb_chalk", "RB", 8.0, 2500),  # ceiling rank last, value 3.2 (highest)
+    ]
+    scores = leverage_score(players)
+    assert scores["rb_sleeper"] > 0
+    assert scores["rb_chalk"] < scores["rb_sleeper"]
+
+
+def test_leverage_score_ranks_within_position_not_across_positions():
+    # A TE's raw ceiling/ownership units are nowhere near a WR's - leverage_
+    # score must compare each position against its OWN peers, so a
+    # last-place TE and a last-place WR should get the same (most negative)
+    # score within their own group, regardless of the huge raw-unit gap
+    # between the two positions.
+    players = [
+        _player("te_last", "TE", 3.0, 2500),
+        _player("te_first", "TE", 12.0, 5000),
+        _player("wr_last", "WR", 9.0, 3000),
+        _player("wr_first", "WR", 28.0, 9000),
+    ]
+    scores = leverage_score(players)
+    assert scores["te_last"] == pytest.approx(scores["wr_last"])
+    assert scores["te_first"] == pytest.approx(scores["wr_first"])
+
+
+def test_build_leverage_lineup_defaults_to_calibrated_proxy(engine):
+    players, _, _, _ = _load_player_pool("dk_thu_mon_2026_09_17", "proj_ceiling", engine)
+
+    calls = []
+
+    def spy_proxy_fn(players):
+        calls.append(True)
+        return calibrated_ownership_proxy(players)
+
+    default_lineup = build_leverage_lineup(players, lambda_boost=5.0)
+    spied_lineup = build_leverage_lineup(players, lambda_boost=5.0, proxy_fn=spy_proxy_fn)
+    assert calls, "proxy_fn was never called"
+
+    default_ids = frozenset(p["player_id"] for _, p in default_lineup["roster"])
+    spied_ids = frozenset(p["player_id"] for _, p in spied_lineup["roster"])
+    assert default_ids == spied_ids
 
 
 def test_build_contrarian_lineup_defaults_to_calibrated_proxy(engine):

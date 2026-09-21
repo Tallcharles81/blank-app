@@ -398,6 +398,198 @@ def find_contrarian_matching_projection(players, target_projection, tolerance=0.
     return lineup, lam, projection, True
 
 
+def _percentile_rank_within_position(players, value_by_id):
+    """0-1 percentile rank of value_by_id, computed SEPARATELY within each
+    position group (average rank for ties, midpoint 0.5 for a singleton
+    group). Positions can't be compared on raw ceiling or raw ownership_proxy
+    units - a top-5 TE's proj_ceiling is nowhere near a top-5 WR's in
+    absolute points, and DST's calibrated ownership_proxy sits on its own
+    scale entirely - so leverage_score below needs "highest ceiling for a
+    RB" and "highest ceiling for a TE" to mean the same 1.0, not compare raw
+    magnitudes across positions.
+    """
+    by_position = {}
+    for p in players:
+        by_position.setdefault(p["position"], []).append(p["player_id"])
+
+    pct_by_id = {}
+    for pids in by_position.values():
+        n = len(pids)
+        if n == 1:
+            pct_by_id[pids[0]] = 0.5
+            continue
+        order = sorted(pids, key=lambda pid: value_by_id[pid])
+        ranks = {}
+        i = 0
+        while i < n:
+            j = i
+            while j + 1 < n and value_by_id[order[j + 1]] == value_by_id[order[i]]:
+                j += 1
+            avg_rank = (i + j) / 2.0
+            for k in range(i, j + 1):
+                ranks[order[k]] = avg_rank
+            i = j + 1
+        for pid in pids:
+            pct_by_id[pid] = ranks[pid] / (n - 1)
+    return pct_by_id
+
+
+def leverage_score(players, proxy_fn=calibrated_ownership_proxy):
+    """Per-player leverage rating: (within-position percentile rank of
+    ceiling upside) minus (within-position percentile rank of ownership_
+    proxy). Range [-1, 1]. Positive = this player's ceiling ranks higher at
+    their position than their ownership_proxy does (real, testable
+    "leverage": upside the field is under-rostering relative to); negative =
+    the reverse (a chalky, ceiling-thin play).
+
+    "Ceiling upside" is whatever projection field the caller loaded players
+    with (players[i]["points"], per _load_player_pool's field-aliasing
+    convention) - pass players loaded with projection_field="proj_ceiling"
+    to make this a real ceiling-vs-ownership leverage score; loading with
+    proj_median instead would make it a median-vs-ownership score, a
+    different (weaker) claim. run_leverage_validation_comparison always
+    loads with proj_ceiling for this reason.
+
+    This is a SCORING signal only - it does not by itself change lineup
+    construction. See build_leverage_lineup for the one place it gets turned
+    into a selection bias, and run_leverage_validation_comparison for the
+    backtest gating whether that bias is ever used as a default.
+    """
+    ceiling_by_id = {p["player_id"]: p["points"] for p in players}
+    proxy_by_id = proxy_fn(players)
+    ceiling_pct = _percentile_rank_within_position(players, ceiling_by_id)
+    proxy_pct = _percentile_rank_within_position(players, proxy_by_id)
+    return {p["player_id"]: ceiling_pct[p["player_id"]] - proxy_pct[p["player_id"]] for p in players}
+
+
+def build_leverage_lineup(players, lambda_boost, proxy_fn=calibrated_ownership_proxy):
+    """Maximize (points + lambda_boost * leverage_score(players)) under the
+    same cap/roster rules as build_chalk_lineup/build_contrarian_lineup -
+    directly REWARDS real leverage (high ceiling rank relative to low
+    ownership rank, within position) rather than build_contrarian_lineup's
+    approach of penalizing raw ownership_proxy regardless of ceiling. The two
+    are not the same lineup in general: a player can have below-average
+    ownership_proxy but also below-average ceiling (contrarian likes them,
+    leverage doesn't), or above-average ownership with an even
+    higher-ranking ceiling (leverage tolerates them more than contrarian
+    would, if their upside outranks their ownership by enough).
+    """
+    scores = leverage_score(players, proxy_fn=proxy_fn)
+    pool = [{**p, "points": p["points"] + lambda_boost * scores[p["player_id"]]} for p in players]
+    lineups, _ = build_lineups_from_pool(pool, num_lineups=1, salary_cap=SALARY_CAP)
+    return lineups[0]
+
+
+# Same fine-grained grid as _LAMBDA_SEARCH_GRID, for the same reason -
+# build_leverage_lineup's objective is piecewise-constant in lambda_boost, so
+# a coarse grid can jump clean over the useful plateau between "identical to
+# chalk" and "wildly under-projected."
+_LEVERAGE_LAMBDA_SEARCH_GRID = [round(0.5 * i, 2) for i in range(1, 100)]
+
+
+def find_leverage_matching_projection(players, target_projection, tolerance=0.05, proxy_fn=calibrated_ownership_proxy):
+    """find_contrarian_matching_projection's counterpart for build_leverage_
+    lineup: search _LEVERAGE_LAMBDA_SEARCH_GRID for a leverage-biased lineup
+    within `tolerance` of target_projection that is ALSO meaningfully
+    different in composition. Among every lambda_boost whose real projection
+    (raw points, ignoring the leverage boost) falls within tolerance, picks
+    the one with the HIGHEST average leverage_score (the most leverage-
+    tilted option that still respects the projection constraint) - the
+    mirror image of find_contrarian_matching_projection's "lowest average
+    proxy" selection.
+    """
+    raw_points_by_id = {p["player_id"]: p["points"] for p in players}
+    scores = leverage_score(players, proxy_fn=proxy_fn)
+
+    candidates = []
+    closest = None
+    for lam in _LEVERAGE_LAMBDA_SEARCH_GRID:
+        lineup = build_leverage_lineup(players, lam, proxy_fn=proxy_fn)
+        projection = _raw_projection(lineup, raw_points_by_id)
+        gap = abs(projection - target_projection)
+        avg_score = sum(scores[p["player_id"]] for _, p in lineup["roster"]) / len(lineup["roster"])
+        if closest is None or gap < closest[3]:
+            closest = (lineup, lam, projection, gap)
+        if gap <= tolerance * target_projection:
+            candidates.append((lineup, lam, projection, avg_score))
+
+    if not candidates:
+        lineup, lam, projection, gap = closest
+        return lineup, lam, projection, False
+
+    lineup, lam, projection, _ = max(candidates, key=lambda c: c[3])
+    return lineup, lam, projection, True
+
+
+def run_leverage_validation_comparison(
+    slate_id,
+    contest_size=DEFAULT_CONTEST_SIZE,
+    concentration=DEFAULT_CONCENTRATION,
+    num_simulations=DEFAULT_NUM_SIMULATIONS,
+    seed=None,
+    engine=None,
+    projection_field="proj_ceiling",
+    proxy_fn=calibrated_ownership_proxy,
+):
+    """run_validation_comparison's counterpart for the leverage-score-biased
+    lineup: build chalk, the EXISTING ownership-penalty contrarian lineup,
+    and the NEW leverage-biased lineup, all matched to chalk's own total
+    projection, then run all three through the SAME opponent field (same
+    seed) so the comparison isn't confounded by different simulated fields.
+
+    projection_field defaults to proj_ceiling (not proj_median, unlike
+    run_validation_comparison's own default) - a leverage score defined
+    against a ceiling field only means what it claims to mean ("real ceiling
+    upside relative to ownership") when the lineups being compared were
+    actually built to chase ceiling in the first place, which is also the
+    real GPP path's own objective (see run_validation_comparison's
+    docstring).
+
+    This is a DIAGNOSTIC/backtest function, same as run_validation_
+    comparison - it does not change what generate_lineups builds. See
+    build_leverage_lineup's own callers (none yet in the live optimizer path)
+    for confirmation nothing wires this into construction.
+    """
+    players, _, _, _ = _load_player_pool(slate_id, projection_field, engine=engine)
+    raw_points_by_id = {p["player_id"]: p["points"] for p in players}
+
+    chalk = build_chalk_lineup(players)
+    chalk_projection = _raw_projection(chalk, raw_points_by_id)
+    contrarian, contrarian_lambda, contrarian_projection, contrarian_matched = find_contrarian_matching_projection(
+        players, chalk_projection, proxy_fn=proxy_fn
+    )
+    leverage, leverage_lambda, leverage_projection, leverage_matched = find_leverage_matching_projection(
+        players, chalk_projection, proxy_fn=proxy_fn
+    )
+
+    chalk_result = run_field_simulation(
+        chalk, slate_id, contest_size, concentration, num_simulations, seed, engine, projection_field, proxy_fn=proxy_fn
+    )
+    contrarian_result = run_field_simulation(
+        contrarian, slate_id, contest_size, concentration, num_simulations, seed, engine, projection_field, proxy_fn=proxy_fn
+    )
+    leverage_result = run_field_simulation(
+        leverage, slate_id, contest_size, concentration, num_simulations, seed, engine, projection_field, proxy_fn=proxy_fn
+    )
+
+    chalk_result["total_projection"] = round(chalk_projection, 2)
+    chalk_result["roster"] = [(slot, p["name"]) for slot, p in chalk["roster"]]
+    contrarian_result["total_projection"] = round(contrarian_projection, 2)
+    contrarian_result["roster"] = [(slot, p["name"]) for slot, p in contrarian["roster"]]
+    contrarian_result["lambda_used"] = contrarian_lambda
+    contrarian_result["projection_matched_within_tolerance"] = contrarian_matched
+    leverage_result["total_projection"] = round(leverage_projection, 2)
+    leverage_result["roster"] = [(slot, p["name"]) for slot, p in leverage["roster"]]
+    leverage_result["lambda_used"] = leverage_lambda
+    leverage_result["projection_matched_within_tolerance"] = leverage_matched
+
+    return {
+        "chalk": chalk_result,
+        "contrarian": contrarian_result,
+        "leverage": leverage_result,
+    }
+
+
 def run_validation_comparison(
     slate_id,
     contest_size=DEFAULT_CONTEST_SIZE,
