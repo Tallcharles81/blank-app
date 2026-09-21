@@ -3,6 +3,7 @@ import math
 import random
 from collections import defaultdict
 
+import numpy as np
 from sqlalchemy import text
 
 from data.nflverse_fetch import _team_implied_totals, _team_points_scored, fetch_schedules
@@ -19,7 +20,7 @@ from models.projections import (
     _load_recent_stats,
     _project_from_history,
 )
-from models.simulation import _standard_normal_cdf
+from models.simulation import _correlated_percentile_ranks, _quantile_to_scores, _standard_normal_cdf
 
 # The stored percentile ladder (models/projections.py's PERCENTILE_Z) has
 # 10/25/50/75/90 but not 20 or 80 directly - both interpolated between their
@@ -520,6 +521,216 @@ def run_gpp_ceiling_backtest(source_slate_id, seasons=None, random_field_size=DE
         "avg_ceiling_lineup_field_percentile": avg_ceiling_percentile,
         "avg_median_lineup_field_percentile": avg_median_percentile,
     }
+    return weekly_results, summary
+
+
+def _asof_full_projection(slate_players, gsis_by_dk_id, season, week, engine):
+    """Same real, as-of (strictly-before-this-week) history restriction as
+    models/backtest.py's _asof_projected_points, but keeps _project_from_
+    history's FULL return (proj_floor/median/ceiling AND the complete
+    proj_percentiles ladder) instead of collapsing to one field. The ladder
+    is exactly what models/simulation.py's correlated Monte Carlo engine
+    needs (see _quantile_to_scores) - there's no way to read it from the
+    live projections table the way models/simulation.py::_load_players
+    does, since a backtest's as-of projection for a past week was never
+    written there (and must not be - it needs to be blind to data after
+    that week, which the live table isn't).
+    """
+    history = _load_recent_stats(gsis_by_dk_id.values(), engine, before=(season, week))
+    result = {}
+    for player in slate_players:
+        gsis_id = gsis_by_dk_id.get(player["player_id"])
+        games = history.get(gsis_id) if gsis_id else None
+        if not games:
+            continue
+        result[player["player_id"]] = _project_from_history(games, player["position"])
+    return result
+
+
+def _simulate_candidates_asof(candidates, players_meta_by_id, full_projections, num_simulations, seed):
+    """models/simulation.py's simulate_lineups + win_rates, replayed against
+    AS-OF (blind, backtest-only) percentile projections instead of a live
+    slate's stored projections table - simulate_lineups's own _load_players
+    hard-requires a real DB projections row for slate_id, which a backtest
+    week's synthetic as-of projection never has. Same correlation model
+    (_correlated_percentile_ranks/_quantile_to_scores) applied to an
+    in-memory dict instead of a query; every candidate here comes from the
+    same real Classic slate_player_pool, so real_position is just each
+    player's own stored position (no Showdown CPT/FLEX resolution needed).
+    """
+    player_ids = sorted({p["player_id"] for lu in candidates for _, p in lu["roster"]})
+    ordered = [
+        {
+            "player_id": pid,
+            "real_position": players_meta_by_id[pid]["position"],
+            "team": players_meta_by_id[pid]["team"],
+            "opponent": players_meta_by_id[pid].get("opponent"),
+            "percentiles": full_projections[pid]["proj_percentiles"],
+        }
+        for pid in player_ids
+    ]
+    percentile_ranks = _correlated_percentile_ranks(ordered, num_simulations, seed)
+    scores_by_id = {
+        p["player_id"]: _quantile_to_scores(percentile_ranks[:, j], p["percentiles"]) for j, p in enumerate(ordered)
+    }
+    stacked = np.vstack([sum(scores_by_id[p["player_id"]] for _, p in lu["roster"]) for lu in candidates])
+    winner_idx = np.argmax(stacked, axis=0)
+    counts = np.bincount(winner_idx, minlength=len(candidates))
+    return [count / stacked.shape[1] for count in counts]
+
+
+def run_simulation_selection_backtest(
+    source_slate_id,
+    seasons=None,
+    num_candidates=10,
+    num_simulations=2000,
+    seed=None,
+    random_field_size=DEFAULT_RANDOM_FIELD_SIZE,
+    engine=None,
+):
+    """Does models/optimizer.py::generate_simulation_selected_lineup's real
+    selection mechanism (build num_candidates diverse legal lineups, then
+    pick by simulated win rate) produce better REAL historical outcomes
+    than the CURRENT default - just taking the single highest-as-of-
+    ceiling-sum lineup - across many real historical weeks? Same real
+    backtest methodology as run_gpp_ceiling_backtest (one slate's real
+    salary structure, replayed against every real historical week's actual
+    results, ranked against the same real random-legal field each week),
+    extended to compare TWO selection rules on IDENTICAL candidates/field/
+    actual-outcomes per week, so any difference found is attributable to
+    the selection rule itself, not a confound from different lineups or a
+    different random field.
+
+    "current" = candidates[0]. build_lineups_from_pool's diversity
+    constraints are only applied to lineups AFTER the first, so candidates[0]
+    is unconstrained - the single highest-raw-ceiling-sum roster, identical
+    to what generate_lineups(num_lineups=1) would return. No separate build
+    needed to get the "current" comparison point.
+
+    num_simulations defaults far lower here (2000, not simulate_lineups's
+    own live-path default of 10000) - this runs once per real historical
+    week (dozens of weeks in one call), and the selection question only
+    needs the winning CANDIDATE identified correctly, not a precise win-rate
+    percentage to two decimal places.
+
+    Returns (weekly_results, summary). Never writes to any table - a
+    diagnostic, not a stored calibration, same as run_gpp_ceiling_backtest.
+    """
+    engine = engine or get_engine()
+
+    slate_players = load_slate_pool(source_slate_id, engine)
+    if not slate_players:
+        raise ValueError(f"No players found in slate_player_pool for slate {source_slate_id}")
+    gsis_by_dk_id, _, _ = resolve_dk_players_to_gsis(slate_players, engine)
+
+    weeks = _available_weeks(engine)
+    if seasons is not None:
+        weeks = [(s, w) for s, w in weeks if s in seasons]
+
+    rng = random.Random()
+    weekly_results = []
+    skipped = []
+
+    for season, week in weeks:
+        actual_points, _ = load_actual_scores(slate_players, season, week, engine)
+        full_projections = _asof_full_projection(slate_players, gsis_by_dk_id, season, week, engine)
+
+        eligible_ids = set(actual_points) & set(full_projections)
+        if not eligible_ids:
+            skipped.append((season, week))
+            continue
+        eligible_players = [p for p in slate_players if p["player_id"] in eligible_ids]
+        players_meta_by_id = {p["player_id"]: p for p in eligible_players}
+
+        def score_actual(roster):
+            return sum(actual_points[p["player_id"]] for _, p in roster)
+
+        field_scores = []
+        for _ in range(random_field_size):
+            randomized_pool = [{**p, "points": rng.random()} for p in eligible_players]
+            try:
+                field_lineup, _ = build_lineups_from_pool(randomized_pool, num_lineups=1, salary_cap=SALARY_CAP)
+            except ValueError:
+                continue
+            field_scores.append(score_actual(field_lineup[0]["roster"]))
+        if not field_scores:
+            skipped.append((season, week))
+            continue
+
+        ceiling_pool = [{**p, "points": full_projections[p["player_id"]]["proj_ceiling"]} for p in eligible_players]
+        try:
+            candidates, _ = build_lineups_from_pool(
+                ceiling_pool, num_lineups=num_candidates, min_uniques=3, salary_cap=SALARY_CAP
+            )
+        except ValueError:
+            skipped.append((season, week))
+            continue
+        if len(candidates) < 2:
+            skipped.append((season, week))
+            continue
+
+        current_lineup = candidates[0]
+        candidate_win_rates = _simulate_candidates_asof(
+            candidates, players_meta_by_id, full_projections, num_simulations, seed
+        )
+        sim_best_idx = max(range(len(candidates)), key=lambda i: candidate_win_rates[i])
+        sim_selected_lineup = candidates[sim_best_idx]
+
+        def field_percentile(roster):
+            actual = score_actual(roster)
+            better_than = sum(1 for s in field_scores if actual > s)
+            return round(better_than / len(field_scores), 4), actual
+
+        current_percentile, current_actual = field_percentile(current_lineup["roster"])
+        sim_percentile, sim_actual = field_percentile(sim_selected_lineup["roster"])
+
+        weekly_results.append(
+            {
+                "season": season,
+                "week": week,
+                "current_field_percentile": current_percentile,
+                "sim_selected_field_percentile": sim_percentile,
+                "current_actual_points": round(current_actual, 2),
+                "sim_selected_actual_points": round(sim_actual, 2),
+                "same_lineup_picked": sim_best_idx == 0,
+                "sim_selected_win_rate": round(candidate_win_rates[sim_best_idx], 4),
+                "current_win_rate_among_candidates": round(candidate_win_rates[0], 4),
+                "field_size": len(field_scores),
+                "num_candidates_built": len(candidates),
+            }
+        )
+
+    n = len(weekly_results)
+
+    def avg(key):
+        return round(sum(r[key] for r in weekly_results) / n, 4) if n else None
+
+    sim_beats_current = sum(1 for r in weekly_results if r["sim_selected_field_percentile"] > r["current_field_percentile"])
+    current_beats_sim = sum(1 for r in weekly_results if r["current_field_percentile"] > r["sim_selected_field_percentile"])
+    tied_weeks = n - sim_beats_current - current_beats_sim
+
+    diffs = [r["sim_selected_field_percentile"] - r["current_field_percentile"] for r in weekly_results]
+    mean_diff = sum(diffs) / n if n else None
+    t_stat = None
+    if n and n >= 2:
+        variance = sum((d - mean_diff) ** 2 for d in diffs) / (n - 1)
+        std = math.sqrt(variance)
+        if std > 0:
+            t_stat = mean_diff / (std / math.sqrt(n))
+
+    summary = {
+        "weeks_evaluated": n,
+        "skipped_weeks": skipped,
+        "same_lineup_picked_rate": round(sum(1 for r in weekly_results if r["same_lineup_picked"]) / n, 4) if n else None,
+        "avg_current_field_percentile": avg("current_field_percentile"),
+        "avg_sim_selected_field_percentile": avg("sim_selected_field_percentile"),
+        "sim_beats_current_weeks": sim_beats_current,
+        "current_beats_sim_weeks": current_beats_sim,
+        "tied_weeks": tied_weeks,
+        "mean_percentile_diff_sim_minus_current": round(mean_diff, 4) if mean_diff is not None else None,
+        "t_stat": round(t_stat, 4) if t_stat is not None else None,
+    }
+
     return weekly_results, summary
 
 
