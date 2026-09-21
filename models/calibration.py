@@ -615,6 +615,20 @@ def run_simulation_selection_backtest(
 
     Returns (weekly_results, summary). Never writes to any table - a
     diagnostic, not a stored calibration, same as run_gpp_ceiling_backtest.
+
+    SCOPE OF THE REAL NULL RESULT THIS FUNCTION PRODUCES (55 real weeks on
+    dk_sunday_2026_09_20, t=0.20, mean field-percentile diff +0.0016 -
+    essentially zero despite the two rules picking a DIFFERENT lineup 85%
+    of the time): this says the CORRELATION-COPULA simulation engine in
+    models/simulation.py (see that module's own disclosed limitation, right
+    above QB_PASS_CATCHER_CORR) doesn't beat the deterministic ceiling pick
+    on real historical outcomes. It is not evidence about simulation-based
+    selection in general - a genuinely deeper engine (real play-by-play, or
+    an explicit shared-game-environment factor) is architecturally capable
+    of capturing correlation structure this one cannot, and could show a
+    real effect this backtest was never able to detect. Don't cite this
+    result as "simulation doesn't help GPPs" - only as "this specific,
+    simpler simulation implementation doesn't, as tested."
     """
     engine = engine or get_engine()
 

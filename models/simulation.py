@@ -44,6 +44,34 @@ DEFAULT_NUM_SIMULATIONS = 10000
 # All five real sample sizes clear MIN_PAIRS_FOR_FITTED_CORRELATION (200) by
 # a wide margin. Re-run fit_real_correlation_matrix() periodically as more
 # real seasons accumulate rather than treating these as permanently fixed.
+#
+# REAL, DISCLOSED ARCHITECTURAL LIMITATION (compared against SaberSim's own
+# published description of their simulation engine): this is a pairwise
+# Gaussian-copula correlation model over independently-fit marginal
+# percentile distributions (_correlated_percentile_ranks/_quantile_to_scores
+# below), not a play-by-play/game-state simulation. Concretely: each
+# player's own outcome distribution is fit alone (5-point percentile ladder
+# from real recent history), the five correlation constants above are the
+# ENTIRE joint-outcome model, and one multivariate-normal draw per
+# simulated world turns those fixed pairwise numbers into correlated
+# percentile ranks. There's no simulated play/drive/scoreboard state, and -
+# less obviously - no shared LATENT game-environment factor either (no
+# single "this game ran hot/cold/fast/slow" draw that multiple players'
+# outcomes derive from beyond what the five fixed pairwise terms encode).
+# That's simpler than both "true" play-by-play AND a shared-game-script
+# model would be - just a small, fixed set of real, empirically-fit pairwise
+# relationships applied directly to real, independently-modeled marginals.
+#
+# This directly qualifies models/calibration.py::run_simulation_selection_
+# backtest's real null result (55 weeks, t=0.20 - see that function's own
+# docstring): that result says THIS SPECIFIC correlation-copula
+# implementation of simulation-based selection doesn't beat the
+# deterministic ceiling pick on real historical outcomes. It does not, by
+# itself, say anything about whether a genuinely deeper simulation (real
+# play-by-play, or an explicit shared-game-environment factor) would show a
+# real effect this simpler model is structurally unable to capture - that
+# would need building and backtesting that different, more expensive
+# engine, not assumed from this result.
 QB_PASS_CATCHER_CORR = 0.3284
 QB_RB_CORR = 0.0499
 SAME_TEAM_CORR = 0.0136
