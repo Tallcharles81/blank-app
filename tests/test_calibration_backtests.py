@@ -12,6 +12,7 @@ from models.calibration import (
     fit_real_correlation_matrix,
     run_divisional_rematch_torch_backtest,
     run_game_environment_backtest_comparison,
+    run_dst_matchup_backtest,
     run_game_environment_p80_hit_rate_backtest,
     run_hard_exclude_backtest,
     run_opportunity_score_backtest,
@@ -377,6 +378,28 @@ def test_run_shrinkage_backtest_reports_the_real_negative_result_honestly(engine
     assert result["avg_absolute_error_shrinkage"] > result["avg_absolute_error_naive_hard_cutoff"]
     assert result["avg_error_reduction"] < 0
     assert result["p_value"] < 0.01
+
+
+def test_run_dst_matchup_backtest_shows_the_real_ordering_found_this_session(engine):
+    # Real regression coverage for this session's own finding: proposed
+    # (opponent-based) beats both baseline (no adjustment) and the current
+    # shipped (own-team-based) DST treatment on real P90 hit rate, closest
+    # to the true 10% target of the three. Locks in the ORDERING, not exact
+    # rates (those can shift slightly as more real weeks/games get added).
+    result = run_dst_matchup_backtest("dk_sunday_2026_09_20", engine=engine)
+
+    assert result["dst_player_weeks_with_real_opponent_implied_total"] >= 1000
+    baseline_rate = result["baseline_p90_hit_rate"]["rate"]
+    current_rate = result["current_shipped_p90_hit_rate"]["rate"]
+    proposed_rate = result["proposed_opponent_based_p90_hit_rate"]["rate"]
+    target = result["true_target_p90_hit_rate"]
+
+    # Real ordering found this session: proposed is closest to the true
+    # target, current is in the middle, baseline is furthest off.
+    assert abs(proposed_rate - target) < abs(current_rate - target) < abs(baseline_rate - target)
+    # The baseline-vs-proposed real effect is decisive - this is the
+    # headline real finding, not noise.
+    assert result["baseline_vs_proposed_p_value"] < 0.001
 
 
 def test_run_playing_time_floor_backtest_runs_and_shows_a_real_effect(engine):

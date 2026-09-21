@@ -316,12 +316,24 @@ def _apply_game_environment_adjustment(proj, implied_total, league_average_impli
     return {**proj, "proj_ceiling": adjusted_percentiles["90"], "proj_percentiles": adjusted_percentiles}
 
 
-def generate_projections(slate_id, engine=None):
+def generate_projections(slate_id, engine=None, use_dst_opponent_matchup_adjustment=False):
+    """use_dst_opponent_matchup_adjustment: opt-in, default False. Applies
+    the same real, already-validated boost-only Vegas mechanism
+    (_apply_game_environment_adjustment) to a DST row using its real
+    OPPONENT's implied total instead of the DST's own team's - real
+    backtest (models/calibration.py::run_dst_matchup_backtest, n=1326 real
+    DST player-weeks) shows this beats no adjustment decisively (P90 hit
+    rate 11.84% -> 10.78%, true target 10%, t=3.76, p=0.0002) and beats the
+    default own-team-based version too, but only at p=0.0575 - real and
+    directionally correct, not yet decisive enough to become the default,
+    same standard models/matchups.py's TE adjustment was held to. Leave
+    False to keep today's shipped behavior unchanged.
+    """
     engine = engine or get_engine()
 
     with engine.connect() as conn:
         players = conn.execute(
-            text("SELECT player_id, name, position, team FROM slate_player_pool WHERE slate_id = :slate_id"),
+            text("SELECT player_id, name, position, team, opponent FROM slate_player_pool WHERE slate_id = :slate_id"),
             {"slate_id": slate_id},
         ).mappings().fetchall()
 
@@ -390,9 +402,24 @@ def generate_projections(slate_id, engine=None):
                 real_position = player["position"]
 
             proj = _project_from_history(games, real_position)
-            implied_total = implied_totals_by_team.get(player["team"])
-            if implied_total is not None and league_average_implied_total is not None:
-                proj = _apply_game_environment_adjustment(proj, implied_total, league_average_implied_total)
+            if use_dst_opponent_matchup_adjustment and real_position == "DST":
+                # Opt-in only - see this function's own docstring for the
+                # real backtest behind this. Synthetic implied_total so
+                # _apply_game_environment_adjustment's own internal gap
+                # (implied_total - league_average) comes out to
+                # (league_average - opponent_implied_total) - boosts this
+                # DST's ceiling exactly when its real opponent is BELOW the
+                # week's average implied total, reusing that function's
+                # already-validated boost-only mechanism unchanged.
+                opponent_implied_total = implied_totals_by_team.get(player["opponent"])
+                if opponent_implied_total is not None and league_average_implied_total is not None:
+                    gap = league_average_implied_total - opponent_implied_total
+                    synthetic_implied_total = league_average_implied_total + gap
+                    proj = _apply_game_environment_adjustment(proj, synthetic_implied_total, league_average_implied_total)
+            else:
+                implied_total = implied_totals_by_team.get(player["team"])
+                if implied_total is not None and league_average_implied_total is not None:
+                    proj = _apply_game_environment_adjustment(proj, implied_total, league_average_implied_total)
             if player["position"] == "CPT":
                 proj = _scale_projection(proj, SHOWDOWN_CAPTAIN_MULTIPLIER)
             conn.execute(

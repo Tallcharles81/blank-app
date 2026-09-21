@@ -2084,3 +2084,158 @@ def run_game_environment_p80_hit_rate_backtest(source_slate_id, seasons=None, en
             }
 
     return result
+
+
+def run_dst_matchup_backtest(source_slate_id, seasons=None, engine=None):
+    """Does a DST-specific ceiling adjustment - reusing the exact same
+    validated boost-only mechanism as _apply_game_environment_adjustment,
+    just fed the real OPPONENT's implied total instead of the DST's own
+    team's - actually improve real P90 calibration for DST specifically?
+
+    Motivated by two real findings this session: (1) two real weeks of
+    contest-standings data show real GPP winners concentrate heavily on
+    just 1-2 real "best matchup" DSTs a week, not spread evenly across all
+    32 - matching data/ownership_calibration.py's own already-documented
+    finding that real DST ownership tracks matchup quality, not raw
+    points-per-salary; (2) the CURRENTLY SHIPPED Vegas ceiling adjustment
+    (models/projections.py's generate_projections) applies to DST using
+    the DST's own team's implied total - the wrong side of the ball for a
+    defense, whose real upside comes from the OPPONENT's offense being
+    bad, not its own offense scoring a lot. That current behavior WAS part
+    of run_game_environment_backtest_comparison's real pooled sample (DST
+    is included there), so it is not simply "untested" - but no position-
+    specific breakout of that pooled result has ever been run, so whether
+    the current own-team-based DST treatment actually helps, hurts, or
+    just rides along with the skill-position effect was a real unknown
+    before this function existed.
+
+    Compares three real, no-lookahead variants for every real historical
+    DST player-week:
+      - baseline: raw historical-percentile proj_ceiling, no Vegas
+        adjustment at all.
+      - current (shipped today): _apply_game_environment_adjustment fed
+        the DST's own team's real implied total - reproduces exactly what
+        generate_projections already does for a real DST row.
+      - proposed: the SAME real, already-validated boost-only mechanism
+        and coefficient (GAME_ENVIRONMENT_CEILING_BOOST_PER_POINT is not
+        re-tuned or duplicated here - no new signal, per the explicit
+        instruction this was built under), fed a synthetic implied_total
+        constructed so the function's own internal gap
+        (implied_total - league_average) equals (league_average - real
+        opponent implied total) - i.e. boosts a DST's ceiling exactly when
+        its real opponent's own implied total is BELOW the week's average,
+        using only the opponent's own already-fetched real Vegas number.
+
+    True target for a well-calibrated proj_ceiling (90th percentile) is a
+    real 10% P90 hit rate, matching run_game_environment_backtest_
+    comparison's own established standard for this exact mechanism.
+    """
+    engine = engine or get_engine()
+    from models.matchups import _opponents_for_week  # local import - avoids a module-load cycle (models/matchups.py imports FROM this module)
+
+    slate_players = load_slate_pool(source_slate_id, engine)
+    dst_players = [p for p in slate_players if p["position"] == "DST"]
+    if not dst_players:
+        raise ValueError(f"No real DST rows found in slate_player_pool for slate {source_slate_id}")
+    gsis_by_dk_id, _, _ = resolve_dk_players_to_gsis(dst_players, engine)
+    players_by_id = {p["player_id"]: p for p in dst_players}
+
+    weeks = _available_weeks(engine)
+    if seasons is not None:
+        weeks = [(s, w) for s, w in weeks if s in seasons]
+
+    try:
+        implied_totals_by_team_season_week = _team_implied_totals(fetch_schedules())
+    except Exception:
+        implied_totals_by_team_season_week = {}
+
+    records = []  # (gap_or_None, baseline_hit, current_hit, proposed_hit)
+    weeks_evaluated = 0
+
+    for season, week in weeks:
+        history = _load_recent_stats(gsis_by_dk_id.values(), engine, before=(season, week))
+        actual_points, _ = load_actual_scores(dst_players, season, week, engine)
+        teams_by_gsis = _teams_for_week(gsis_by_dk_id.values(), season, week, engine)
+        opponents_by_gsis = _opponents_for_week(gsis_by_dk_id.values(), season, week, engine)
+
+        implied_totals_by_team = {
+            team: total
+            for (team, s, w), total in implied_totals_by_team_season_week.items()
+            if s == season and w == week
+        }
+        league_average = (
+            sum(implied_totals_by_team.values()) / len(implied_totals_by_team) if implied_totals_by_team else None
+        )
+
+        week_had_data = False
+        for dk_id, gsis_id in gsis_by_dk_id.items():
+            player = players_by_id.get(dk_id)
+            if player is None or dk_id not in actual_points:
+                continue
+            games = history.get(gsis_id)
+            if not games:
+                continue
+
+            proj = _project_from_history(games, "DST")
+            actual = actual_points[dk_id]
+            baseline_hit = 1 if actual >= proj["proj_ceiling"] else 0
+
+            real_team = teams_by_gsis.get(gsis_id)
+            own_implied_total = implied_totals_by_team.get(real_team) if real_team else None
+            if own_implied_total is not None and league_average is not None:
+                current_adjusted = _apply_game_environment_adjustment(proj, own_implied_total, league_average)
+            else:
+                current_adjusted = proj
+            current_hit = 1 if actual >= current_adjusted["proj_ceiling"] else 0
+
+            opponent = opponents_by_gsis.get(gsis_id)
+            opponent_implied_total = implied_totals_by_team.get(opponent) if opponent else None
+            gap = None
+            if opponent_implied_total is not None and league_average is not None:
+                gap = league_average - opponent_implied_total
+                synthetic_implied_total = league_average + gap
+                proposed_adjusted = _apply_game_environment_adjustment(proj, synthetic_implied_total, league_average)
+            else:
+                proposed_adjusted = proj
+            proposed_hit = 1 if actual >= proposed_adjusted["proj_ceiling"] else 0
+
+            records.append((gap, baseline_hit, current_hit, proposed_hit))
+            week_had_data = True
+
+        if week_had_data:
+            weeks_evaluated += 1
+
+    if not records:
+        raise ValueError(f"No real DST player-weeks could be evaluated for slate {source_slate_id}")
+
+    def _hit_rate_summary(rows, hit_index):
+        hits = sum(r[hit_index] for r in rows)
+        return {"hits": hits, "opportunities": len(rows), "rate": round(hits / len(rows), 4) if rows else None}
+
+    with_gap = [r for r in records if r[0] is not None]
+    if len(with_gap) < 20:
+        raise ValueError(
+            f"Only {len(with_gap)} real DST player-weeks had both a real opponent and league-average "
+            "implied total - too few to trust a real hit-rate comparison"
+        )
+
+    baseline_vs_proposed_diffs = [r[1] - r[3] for r in with_gap]
+    current_vs_proposed_diffs = [r[2] - r[3] for r in with_gap]
+    mean_diff_bp, t_bp, p_bp = _paired_significance(baseline_vs_proposed_diffs)
+    mean_diff_cp, t_cp, p_cp = _paired_significance(current_vs_proposed_diffs)
+
+    return {
+        "weeks_evaluated": weeks_evaluated,
+        "dst_player_weeks_evaluated": len(records),
+        "dst_player_weeks_with_real_opponent_implied_total": len(with_gap),
+        "true_target_p90_hit_rate": 0.10,
+        "baseline_p90_hit_rate": _hit_rate_summary(with_gap, 1),
+        "current_shipped_p90_hit_rate": _hit_rate_summary(with_gap, 2),
+        "proposed_opponent_based_p90_hit_rate": _hit_rate_summary(with_gap, 3),
+        "baseline_minus_proposed_diff": round(mean_diff_bp, 4),
+        "baseline_vs_proposed_t_stat": round(t_bp, 4) if t_bp is not None else None,
+        "baseline_vs_proposed_p_value": round(p_bp, 4) if p_bp is not None else None,
+        "current_minus_proposed_diff": round(mean_diff_cp, 4),
+        "current_vs_proposed_t_stat": round(t_cp, 4) if t_cp is not None else None,
+        "current_vs_proposed_p_value": round(p_cp, 4) if p_cp is not None else None,
+    }
