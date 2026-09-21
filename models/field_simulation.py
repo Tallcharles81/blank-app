@@ -88,40 +88,34 @@ def ownership_proxy(players):
 
 # Real, measured correction to the raw stand-in above - see
 # data/ownership_calibration.py for the full real-data pipeline this comes
-# from. Derived from real DK contest-standings exports the user actually
-# entered (contests 193028208 and 193028210, pooled - both real contests on
-# the SAME real slate, dk_thu_mon_2026_09_17, so this is genuine field-to-
-# field replication of one real slate's ownership behavior, not yet
-# cross-week validated - a third contest on that same slate, 195526257, is a
-# real Showdown and contributes no usable data here, see
-# data/ownership_calibration.py's is_showdown guard). For each real matched
-# player (n=76-262 per position across the two contests), computed as
-# mean(real %Drafted) / mean(raw ownership_proxy) - i.e. how much MORE or
-# LESS a position's real ownership runs, on average, than the raw points-
-# per-$1000 formula alone predicts:
-#   QB  1.18   TE  1.26   (proxy tracks these reasonably well)
-#   DST 2.37   RB  2.45   WR  2.05   (proxy badly UNDER-predicts real
-#     ownership for these - the field piles onto real chalk/matchup plays
-#     harder than raw value alone would suggest)
-# Matches this session's own earlier finding from the same real data: QB
-# ownership is real-world FLATTER than proxy implies (a field spreads QB
-# ownership across many "acceptable" options rather than concentrating on
-# the single best-value play the way it does for RB/WR/DST), and DST
-# ownership is real-world MORE concentrated on the best matchup than raw
-# points-per-dollar captures.
-#
-# Per the user's explicit instruction: used now, ahead of a cross-week
-# validation this single slate can't yet provide, with the plan to revisit
-# and update these multipliers once the contests this calibrates are
-# actually played and produce new real contest-standings exports to fold
-# in - see data/ownership_calibration.py's accumulating-dataset design,
-# built for exactly this update cycle.
+# from. UPDATED with genuine cross-week validation: the previous version of
+# this table was fit from real contests on dk_thu_mon_2026_09_17 alone,
+# explicitly flagged as "not yet cross-week validated." Two more real
+# contests (195661326, 195661349) on a DIFFERENT real slate/week
+# (dk_sunday_2026_09_20) have since been played and imported - this is that
+# update. For each real matched player, mean(real %Drafted) / mean(raw
+# ownership_proxy) per position, by real slate:
+#   dk_thu_mon_2026_09_17 (n=76-262/position): QB 1.18 RB 2.45 WR 2.05 TE
+#     1.26 DST 2.37 (the prior table, reproduced exactly from this slate's
+#     own real data)
+#   dk_sunday_2026_09_20 (n=52-255/position, genuinely different week):
+#     QB 1.15 RB 2.52 WR 1.88 TE 1.25 DST 2.08
+# QB/TE landed almost identically across two independent real weeks - real
+# cross-week confirmation, not just within-week replication. RB/WR/DST held
+# the same real direction and rough magnitude (all still badly under-
+# predicted by raw points-per-$1000) but moved enough between weeks that
+# pooling both real slates, not trusting either alone, is the better
+# estimate now that both exist. Below is that real pooled value across
+# both real weeks (n=141-517/position, combined) - this table is expected
+# to keep moving as more real weeks accumulate, per this module's own
+# accumulating-dataset design; re-run data/ownership_calibration.py's
+# summarize_ownership_calibration before assuming these are still current.
 POSITION_OWNERSHIP_CALIBRATION = {
-    "QB": 1.18,
-    "RB": 2.45,
-    "WR": 2.05,
+    "QB": 1.17,
+    "RB": 2.48,
+    "WR": 1.96,
     "TE": 1.26,
-    "DST": 2.37,
+    "DST": 2.22,
 }
 
 

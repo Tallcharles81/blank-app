@@ -396,3 +396,49 @@ def test_summarize_ownership_calibration_flags_shared_slate_ids(engine):
     slate_ids = {c["slate_id"] for c in real_contests}
     assert len(slate_ids) == 1
     assert proj_basis["distinct_slate_ids_with_data"] < proj_basis["n_contests_with_data"]
+
+
+def test_run_ownership_correlation_test_on_a_second_real_week_shows_real_signal(engine):
+    # Uses the real, permanently-imported contest 195661349 (a real DK
+    # $100K-scale contest-standings export on dk_sunday_2026_09_20 - a
+    # genuinely different real week from every other real-fixture contest
+    # in this file, all of which are dk_thu_mon_2026_09_17). Same real-
+    # fixture-dependency pattern as the tests above.
+    result = run_ownership_correlation_test("195661349", slate_id="dk_sunday_2026_09_20", engine=engine, store=False)
+    assert result["proj_median"]["n"] >= MIN_MATCHED_PLAYERS_FOR_CORRELATION
+    assert result["proj_median"]["spearman_rho"] > 0.4
+    assert result["proj_median"]["p_value"] < 0.001
+
+
+def test_position_ownership_calibration_still_reflects_real_cross_week_data(engine):
+    # Real regression guard against POSITION_OWNERSHIP_CALIBRATION silently
+    # going stale: recomputes each position's real mean(%Drafted)/mean(raw
+    # ownership_proxy) ratio, pooled across every real contest imported so
+    # far (both dk_thu_mon_2026_09_17 and dk_sunday_2026_09_20 - two real,
+    # independent weeks as of this test), and checks the live constant is
+    # still within a real, reasonable tolerance of that data. A future
+    # contest import that shifts these ratios enough to fail this test is
+    # exactly the signal that the constant needs another real update, the
+    # same way this session's own cross-week check just triggered one.
+    from models.field_simulation import POSITION_OWNERSHIP_CALIBRATION
+
+    with engine.connect() as conn:
+        rows = conn.execute(
+            text("SELECT position, pct_drafted, ownership_proxy FROM contest_ownership WHERE ownership_proxy IS NOT NULL")
+        ).fetchall()
+
+    by_position = {}
+    for r in rows:
+        by_position.setdefault(r.position, {"pct": [], "proxy": []})
+        by_position[r.position]["pct"].append(float(r.pct_drafted))
+        by_position[r.position]["proxy"].append(float(r.ownership_proxy))
+
+    for position, calibrated_value in POSITION_OWNERSHIP_CALIBRATION.items():
+        d = by_position[position]
+        n = len(d["pct"])
+        real_ratio = (sum(d["pct"]) / n) / (sum(d["proxy"]) / n)
+        assert abs(real_ratio - calibrated_value) < 0.15, (
+            f"{position}: real pooled ratio {real_ratio:.3f} has drifted from the "
+            f"live constant {calibrated_value} by more than the real tolerance - re-run "
+            "data/ownership_calibration.py's calibration and update models/field_simulation.py"
+        )
