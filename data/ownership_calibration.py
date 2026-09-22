@@ -1,6 +1,10 @@
 import csv
 import json
 import math
+import os
+import re
+import tempfile
+import zipfile
 from collections import defaultdict
 
 from sqlalchemy import text
@@ -339,6 +343,152 @@ def import_contest_standings(csv_path, slate_id, contest_id, engine=None):
         "csv_rows_skipped": skipped,
         "is_showdown": is_showdown,
     }
+
+
+# ---------------------------------------------------------------------------
+# Bulk import: the same real import_contest_standings workflow above, run
+# once per real contest-standings file dropped in a folder, instead of one
+# file at a time by hand. Built as the ToS-safe alternative to an automated
+# DK scraper - DraftKings' own Terms of Use explicitly prohibit "using
+# automated means (including...harvesting bots, robots, parser, spiders or
+# screen scrapers) to obtain, collect or access any information on the
+# Website," with a real history of cease-and-desist letters over exactly
+# that class of tool, and this sandboxed environment's own egress proxy
+# hard-blocks draftkings.com outright regardless (confirmed: a direct
+# request gets a 403 at the CONNECT-tunnel level, before DK is ever
+# reached). Nothing here talks to DK - it only processes files the user
+# already downloaded themselves, through their own browser, same as every
+# real contest imported into this codebase so far - just batched.
+# ---------------------------------------------------------------------------
+
+# DK's own real filename convention for both the raw exported CSV and the
+# zip its GameCenter "Download CSV" button produces - every real contest-
+# standings file collected this session (see data/ownership_calibration.py's
+# module docstring / the uploads this was built from) is named exactly
+# "contest-standings-<contest_id>[_<n>][.zip suffix from a re-download]",
+# so the real contest_id is parsed straight from the filename rather than
+# asked for separately per file.
+_CONTEST_ID_FROM_FILENAME_RE = re.compile(r"contest-standings-(\d+)")
+
+
+def _collect_standings_files(folder_path):
+    """Every real contest-standings file in `folder_path`, resolved to
+    (contest_id, csv_path, cleanup) - csv_path is a real, already-parseable
+    CSV path (a plain .csv used as-is, or a .zip's one real .csv member
+    extracted to a temp file), cleanup removes that temp file (a no-op for
+    a plain .csv) and MUST be called once the caller is done reading it.
+
+    Returns (entries, skipped) - skipped is a list of {"file", "reason"}
+    for anything this couldn't confidently resolve (wrong extension, a zip
+    that isn't exactly one real .csv, a filename that doesn't match DK's
+    own real naming convention) - reported honestly rather than silently
+    dropped, so a large real batch never quietly loses a file.
+    """
+    entries = []
+    skipped = []
+
+    for name in sorted(os.listdir(folder_path)):
+        path = os.path.join(folder_path, name)
+        if not os.path.isfile(path):
+            continue
+
+        lower = name.lower()
+        if lower.endswith(".csv"):
+            contest_id = _CONTEST_ID_FROM_FILENAME_RE.search(name)
+            if contest_id is None:
+                skipped.append({"file": name, "reason": "filename doesn't match DK's real contest-standings-<contest_id> pattern"})
+                continue
+            entries.append((contest_id.group(1), path, lambda: None))
+
+        elif lower.endswith(".zip"):
+            try:
+                with zipfile.ZipFile(path) as zf:
+                    csv_members = [m for m in zf.namelist() if m.lower().endswith(".csv")]
+                    if len(csv_members) != 1:
+                        skipped.append(
+                            {"file": name, "reason": f"zip contains {len(csv_members)} .csv member(s), expected exactly 1"}
+                        )
+                        continue
+                    member = csv_members[0]
+                    contest_id = _CONTEST_ID_FROM_FILENAME_RE.search(name) or _CONTEST_ID_FROM_FILENAME_RE.search(member)
+                    if contest_id is None:
+                        skipped.append(
+                            {"file": name, "reason": "neither the zip filename nor its .csv member matches contest-standings-<contest_id>"}
+                        )
+                        continue
+                    tmp = tempfile.NamedTemporaryFile(suffix=".csv", delete=False)
+                    tmp.write(zf.read(member))
+                    tmp.close()
+                    entries.append((contest_id.group(1), tmp.name, (lambda p=tmp.name: os.remove(p))))
+            except zipfile.BadZipFile:
+                skipped.append({"file": name, "reason": "not a valid zip file"})
+
+        else:
+            skipped.append({"file": name, "reason": "not a .csv or .zip file"})
+
+    return entries, skipped
+
+
+def bulk_import_contest_standings(folder_path, slate_id=None, slate_id_by_contest=None, engine=None):
+    """import_contest_standings, run once per real contest-standings file
+    found in `folder_path` (both a plain .csv and DK's own zipped-CSV
+    download are handled - see _collect_standings_files) - the same manual,
+    already-validated per-file workflow, just batched so a whole week's
+    worth of real, manually-downloaded contests import in one call instead
+    of one at a time.
+
+    Each file's real slate_id is resolved from `slate_id_by_contest` (keyed
+    by the real contest_id parsed from its filename) first, falling back to
+    the flat `slate_id` - the common real case is a folder of several real
+    contests from the SAME slate/week (e.g. this session's own 3 real Monday
+    contest zips for one Broncos@Chiefs slate), where passing just
+    `slate_id` covers every file; `slate_id_by_contest` is for a folder that
+    mixes different real weeks. A contest with neither is skipped and
+    reported - never guessed at by matching player names against every
+    stored slate, which risks silently attributing a real contest to the
+    wrong week's projections.
+
+    A contest_id appearing more than once in the folder (a real, observed
+    case - the same real contest re-downloaded/re-uploaded under a second
+    filename) is imported once, from whichever file sorts first, and every
+    later duplicate is skipped and reported - not because a re-import would
+    be unsafe (import_contest_standings upserts, so it wouldn't be), but so
+    the returned report doesn't double-count one real contest as two.
+
+    Returns {"imported": [{"contest_id", "slate_id", **import_contest_
+    standings's own return dict}, ...], "skipped": [{"file"|"contest_id",
+    "reason"}, ...]} - every file in the folder ends up in exactly one of
+    these two lists, so a large batch never silently drops one.
+    """
+    engine = engine or get_engine()
+    slate_id_by_contest = slate_id_by_contest or {}
+
+    entries, skipped = _collect_standings_files(folder_path)
+
+    imported = []
+    seen_contest_ids = set()
+    for contest_id, csv_path, cleanup in entries:
+        try:
+            if contest_id in seen_contest_ids:
+                skipped.append(
+                    {"contest_id": contest_id, "reason": "duplicate contest_id - already imported from an earlier file in this batch"}
+                )
+                continue
+
+            resolved_slate_id = slate_id_by_contest.get(contest_id, slate_id)
+            if resolved_slate_id is None:
+                skipped.append(
+                    {"contest_id": contest_id, "reason": "no slate_id given (neither slate_id_by_contest nor a fallback slate_id)"}
+                )
+                continue
+
+            result = import_contest_standings(csv_path, resolved_slate_id, contest_id, engine=engine)
+            imported.append({"contest_id": contest_id, "slate_id": resolved_slate_id, **result})
+            seen_contest_ids.add(contest_id)
+        finally:
+            cleanup()
+
+    return {"imported": imported, "skipped": skipped}
 
 
 def _rank(values):
