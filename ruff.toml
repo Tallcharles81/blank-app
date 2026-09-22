@@ -1,0 +1,36 @@
+# Explicit rule selection instead of relying on ruff's version-dependent
+# default set - that gap is what caused CI's lint job to fail on push
+# (found 42 errors under the fresh `pip install ruff` CI grabbed, 0.16.8,
+# vs 3 under the older 0.15.8 already on this machine). Pinning the CI
+# workflow's ruff version isn't enough by itself - an explicit select list
+# here means the enabled rules stay the same across ANY ruff version,
+# pinned or not.
+#
+# E4/E7/E9/F: ruff's own long-standing default (pycodestyle errors +
+# pyflakes) - real, low-noise, caught genuine dead code here (unused
+# imports/variables).
+# I: import sorting - cosmetic, but the fixes ruff proposed were safe and
+# already applied; keeping it selected so it stays sorted going forward.
+# RUF: ruff-specific rules - RUF059 (unused tuple-unpack) caught real dead
+# variables in this codebase, same category as F841 just for unpacking.
+#
+# Deliberately NOT selected, each verified by hand rather than assumed:
+# - B (flake8-bugbear), specifically B023 "function uses loop variable":
+#   every real hit in this codebase (models/calibration.py, models/
+#   matchups.py) is a closure defined AND fully called within the same
+#   loop iteration, never stored or deferred - the exact pattern B023
+#   can't statically rule out but is safe here. Real bugbear findings in
+#   other categories may still be worth a one-off look later; the whole
+#   category is excluded here only because B023 dominates the noise.
+# - BLE001 (flake8-blind-except): every real hit is a deliberate broad
+#   `except Exception` around an external fetch (data/news_scanner.py,
+#   models/calibration.py's Vegas schedule fetch, models/projections.py) -
+#   exactly what CLAUDE.md's own convention asks for ("wrap anything that
+#   fetches external data... so one failed request doesn't crash the
+#   app"), not something to flag as an error.
+# - SIM115 (flake8-simplify, "use a context manager for files"): its one
+#   hit is data/ownership_calibration.py's bulk-import temp file, which
+#   uses NamedTemporaryFile(delete=False) deliberately - the file has to
+#   outlive the `with` block for the caller to read before cleanup.
+[lint]
+select = ["E4", "E7", "E9", "F", "I", "RUF"]

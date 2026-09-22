@@ -1,1 +1,10 @@
-streamlit
+pandas
+numpy
+requests
+flask
+psycopg2-binary
+sqlalchemy
+python-dotenv
+pulp
+pytest
+anthropic
