@@ -720,6 +720,89 @@ def build_lineups_from_pool(
     return lineups, exposure_report
 
 
+def _lineup_id_set(lineup):
+    return frozenset(p["player_id"] for _, p in lineup["roster"])
+
+
+def select_portfolio_within_caps(candidates, target_count, max_exposure=None, total_portfolio_size=None, state=None):
+    """The real, missing finishing pass: greedily select up to `target_count`
+    lineups from `candidates` (assumed pre-sorted best-to-worst by whatever
+    the caller's own real quality signal is - simulated win_rate, raw
+    proj_ceiling, etc.) such that the SELECTED SET is genuinely free of both
+    problems build_lineups_from_pool's own max_exposure/min_uniques cannot
+    catch once a portfolio is assembled from MULTIPLE separate generation
+    calls:
+
+    1. Exact duplicates - two lineups with the identical 9 real players
+       (compared by roster CONTENT, i.e. the set of player_ids, not slot
+       labels - a FLEX-eligible player shuffled from FLEX to WR is still
+       the same real entry). This is unconditional: it does not depend on
+       min_uniques at all, so it still catches a duplicate that slipped
+       through because it came from two DIFFERENT generation calls, each
+       of which correctly enforced min_uniques only against ITS OWN
+       previous output and had no visibility into the other's.
+
+    2. Real hard exposure cap, enforced across the FINAL assembled set, not
+       baked into any one generation call - the actual, confirmed root
+       cause of a real bug: two separate `generate_simulation_selected_
+       lineup` scenario calls (and a separate `generate_lineups` call for a
+       third, independently-built set) each capped exposure fine within
+       themselves, but nothing capped it across all three combined, so a
+       core group of players ended up far above any single call's own cap
+       once every set was concatenated into one real 20-lineup export.
+
+    `total_portfolio_size` is the denominator the exposure fraction is
+    computed against - pass the REAL FINAL portfolio size (e.g. 20), not
+    just this one call's own `target_count` (e.g. 10), when building one
+    shared portfolio across several sequential calls to this function, so
+    "40%" always means 40% of the real final export, not 40% of one slice
+    of it. Defaults to target_count when not given (the single-bucket case).
+
+    `state`, if given, is {"seen_id_sets": set, "exposure_counts":
+    defaultdict(int)} carried over from a PRIOR call to this function, so
+    several sequential calls (e.g. one per real construction scenario) can
+    share one real, cumulative uniqueness/exposure picture instead of each
+    starting blind. Returns (selected, rejected, state) - state is the
+    same object, mutated in place, meant to be threaded into the next call;
+    rejected is [{"lineup", "reason"}] so nothing is silently dropped
+    without a real, inspectable reason.
+    """
+    if state is None:
+        state = {"seen_id_sets": set(), "exposure_counts": defaultdict(int)}
+    seen_id_sets = state["seen_id_sets"]
+    exposure_counts = state["exposure_counts"]
+    denom = total_portfolio_size if total_portfolio_size is not None else target_count
+
+    selected = []
+    rejected = []
+    for lu in candidates:
+        if len(selected) >= target_count:
+            break
+
+        id_set = _lineup_id_set(lu)
+        if id_set in seen_id_sets:
+            rejected.append({"lineup": lu, "reason": "exact duplicate of an already-selected lineup (same 9 real players)"})
+            continue
+
+        over_cap = []
+        for pid in id_set:
+            cap = _resolve_exposure(max_exposure, pid)
+            if cap is not None and exposure_counts[pid] + 1 > cap * denom:
+                over_cap.append(pid)
+        if over_cap:
+            rejected.append(
+                {"lineup": lu, "reason": f"would push player(s) {sorted(over_cap)} over the {max_exposure:.0%} exposure cap"}
+            )
+            continue
+
+        selected.append(lu)
+        seen_id_sets.add(id_set)
+        for pid in id_set:
+            exposure_counts[pid] += 1
+
+    return selected, rejected, state
+
+
 def generate_lineups(
     slate_id,
     num_lineups=1,
