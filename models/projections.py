@@ -365,7 +365,7 @@ def generate_projections(slate_id, engine=None, use_dst_opponent_matchup_adjustm
             {"slate_id": slate_id},
         ).mappings().fetchall()
 
-    gsis_by_dk_id, unmatched, ambiguous = resolve_dk_players_to_gsis(players, engine)
+    gsis_by_dk_id, _unmatched, ambiguous = resolve_dk_players_to_gsis(players, engine)
     history_by_gsis = _load_recent_stats(gsis_by_dk_id.values(), engine)
 
     # Real position resolution for the COV fallback below (POSITION_COV_

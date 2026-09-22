@@ -1,8 +1,8 @@
 import pytest
 
 from models.playing_time_engine import (
-    RB_MIN_TOUCHES,
     RB_MIN_SNAP_PCT,
+    RB_MIN_TOUCHES,
     SHRINKAGE_K,
     TE_MIN_SNAP_PCT,
     WR_MIN_SNAP_PCT,
@@ -53,14 +53,14 @@ def test_shrinkage_blend_no_data_either_side():
 
 
 def test_shrinkage_blend_only_prior_season_data():
-    blended, n_current, n_prior, weight = _shrinkage_blend([], [0.8, 0.9])
+    blended, n_current, _n_prior, weight = _shrinkage_blend([], [0.8, 0.9])
     assert blended == pytest_approx(0.85)
     assert n_current == 0
     assert weight == 0.0
 
 
 def test_shrinkage_blend_only_current_season_data():
-    blended, n_current, n_prior, weight = _shrinkage_blend([0.7, 0.9], [])
+    blended, _n_current, _n_prior, weight = _shrinkage_blend([0.7, 0.9], [])
     assert blended == pytest_approx(0.8)
     assert weight == 1.0
 
@@ -68,7 +68,7 @@ def test_shrinkage_blend_only_current_season_data():
 def test_shrinkage_blend_at_k_games_weights_equally():
     current = [0.9] * int(SHRINKAGE_K)
     prior = [0.1]
-    blended, n_current, n_prior, weight = _shrinkage_blend(current, prior)
+    blended, _n_current, _n_prior, weight = _shrinkage_blend(current, prior)
     assert weight == pytest_approx(0.5)
     assert blended == pytest_approx(0.5)  # halfway between 0.9 and 0.1
 
@@ -156,7 +156,7 @@ def test_qb_expected_starter_via_depth_chart_passes():
     depth_chart_entry = {"pos_rank": 1}
     role = estimate_role("QB", _history(current_snaps=[0.95, 0.90]), depth_chart_entry)
     assert role["role"] == "EXPECTED STARTER"
-    meets, reason = meets_playing_time_floor("QB", role)
+    meets, _reason = meets_playing_time_floor("QB", role)
     assert meets is True
 
 

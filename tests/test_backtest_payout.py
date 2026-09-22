@@ -3,7 +3,6 @@ import pytest
 from models.backtest import backtest_slate
 from models.payout import import_contest_payout_structure
 
-
 # Real, already-elapsed real slate/season/week combo used by
 # test_calibration_backtests.py for the same reason: real actuals exist for
 # this (season, week) and the pipeline can build a real as-of lineup for it.

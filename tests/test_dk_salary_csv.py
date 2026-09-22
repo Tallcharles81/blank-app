@@ -3,7 +3,11 @@ import os
 
 from sqlalchemy import text
 
-from data.dk_salary_csv import load_slate_player_pool, parse_dk_salary_csv, write_dk_upload_csv
+from data.dk_salary_csv import (
+    load_slate_player_pool,
+    parse_dk_salary_csv,
+    write_dk_upload_csv,
+)
 
 # Real DK Showdown export (DET@BUF 09/17/2026) - the first real Showdown CSV
 # this codebase has ever parsed through this exact ingestion path (every

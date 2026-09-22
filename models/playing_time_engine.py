@@ -413,7 +413,9 @@ def apply_playing_time_gate(
     gsis_by_dk_id, _, _ = resolve_dk_players_to_gsis(players, engine)
     non_dst = [p for p in players if not (gsis_by_dk_id.get(p["player_id"]) or "").startswith("DST_")]
 
-    from data.pre_lock_check import _load_recent_usage_batch  # local import - avoids a module-load cycle with pre_lock_check
+    from data.pre_lock_check import (
+        _load_recent_usage_batch,  # local import - avoids a module-load cycle with pre_lock_check
+    )
 
     # Real position resolution - a Showdown row's own position is "CPT"/
     # "FLEX" regardless of what the real player plays (see data/player_

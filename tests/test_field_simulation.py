@@ -236,7 +236,7 @@ def test_find_ownership_cap_matching_projection_finds_a_real_alternative(engine,
     chalk_projection = sum(p["points"] for _, p in chalk["roster"])
     chalk_total_ownership = sum(proxy_by_id[p["player_id"]] for _, p in chalk["roster"])
 
-    lineup, cap_used, projection, matched = find_ownership_cap_matching_projection(
+    _lineup, cap_used, projection, matched = find_ownership_cap_matching_projection(
         players, chalk_projection, chalk_total_ownership
     )
     assert matched

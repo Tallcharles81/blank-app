@@ -283,7 +283,7 @@ def run_field_simulation(
     avg_shared_players = sum(overlap_counts) / len(overlap_counts)
     max_shared_players = max(overlap_counts)
 
-    sim_results = simulate_lineups([my_lineup] + opponents, slate_id, num_simulations=num_simulations, seed=seed, engine=engine)
+    sim_results = simulate_lineups([my_lineup, *opponents], slate_id, num_simulations=num_simulations, seed=seed, engine=engine)
     my_scores = sim_results[0]["scores"]
     opponent_scores = np.vstack([r["scores"] for r in sim_results[1:]])
     opponent_best = opponent_scores.max(axis=0)

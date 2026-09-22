@@ -87,7 +87,7 @@ def test_parse_contest_standings_csv_prefers_flex_fpts_on_showdown(tmp_path):
             (GIBBS["name"], "FLEX", 30.0, 30.98),  # ...but FLEX (unmultiplied) must still win
         ],
     )
-    parsed, skipped, is_showdown = parse_contest_standings_csv(str(path))
+    parsed, _skipped, is_showdown = parse_contest_standings_csv(str(path))
     assert is_showdown is True
     assert parsed[GIBBS["name"]]["fpts_contest"] == pytest.approx(30.98)
 
@@ -99,7 +99,7 @@ def test_parse_contest_standings_csv_falls_back_to_cpt_fpts_if_never_flexed(tmp_
     # the player. A real, disclosed limitation of that edge case.
     path = tmp_path / "contest-standings-SHOWDOWN-TEST2.csv"
     _write_contest_csv(path, [(GIBBS["name"], "CPT", 10.0, 46.47)])
-    parsed, skipped, is_showdown = parse_contest_standings_csv(str(path))
+    parsed, _skipped, is_showdown = parse_contest_standings_csv(str(path))
     assert is_showdown is True
     assert parsed[GIBBS["name"]]["fpts_contest"] == pytest.approx(46.47)
 

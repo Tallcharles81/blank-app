@@ -6,20 +6,40 @@ from collections import defaultdict
 import numpy as np
 from sqlalchemy import text
 
-from data.nflverse_fetch import _team_implied_totals, _team_points_scored, fetch_schedules
-from data.player_availability import HARD_EXCLUDE_ROSTER_STATUSES, fetch_roster_status_for_season
+from data.nflverse_fetch import (
+    _team_implied_totals,
+    _team_points_scored,
+    fetch_schedules,
+)
+from data.player_availability import (
+    HARD_EXCLUDE_ROSTER_STATUSES,
+    fetch_roster_status_for_season,
+)
 from data.player_crosswalk import resolve_dk_players_to_gsis
-from data.pre_lock_check import MIN_RECENT_GAMES_FOR_ROLE_CONFIDENCE, _load_recent_usage_batch, _would_be_hard_excluded
+from data.pre_lock_check import (
+    MIN_RECENT_GAMES_FOR_ROLE_CONFIDENCE,
+    _load_recent_usage_batch,
+    _would_be_hard_excluded,
+)
 from db.migrate import get_engine
 from models import playing_time_engine
-from models.backtest import DEFAULT_RANDOM_FIELD_SIZE, _asof_projected_points, load_actual_scores, load_slate_pool
+from models.backtest import (
+    DEFAULT_RANDOM_FIELD_SIZE,
+    _asof_projected_points,
+    load_actual_scores,
+    load_slate_pool,
+)
 from models.optimizer import SALARY_CAP, build_lineups_from_pool
 from models.projections import (
     _apply_game_environment_adjustment,
     _load_recent_stats,
     _project_from_history,
 )
-from models.simulation import _correlated_percentile_ranks, _quantile_to_scores, _standard_normal_cdf
+from models.simulation import (
+    _correlated_percentile_ranks,
+    _quantile_to_scores,
+    _standard_normal_cdf,
+)
 
 # The stored percentile ladder (models/projections.py's PERCENTILE_Z) has
 # 10/25/50/75/90 but not 20 or 80 directly - both interpolated between their
@@ -380,9 +400,9 @@ def summarize_calibration(seasons=None, engine=None):
             pooled_error[pos][0] += info["mae"] * info["n"]
             pooled_error[pos][1] += info["n"]
 
-        for key in totals:
-            totals[key][0] += row[f"{key}_hits"] or 0
-            totals[key][1] += row[f"{key}_opportunities"] or 0
+        for key, total in totals.items():
+            total[0] += row[f"{key}_hits"] or 0
+            total[1] += row[f"{key}_opportunities"] or 0
 
         if row["avg_field_percentile"] is not None:
             field_percentiles_by_week.append((row["season"], row["week"], float(row["avg_field_percentile"])))
@@ -2355,7 +2375,9 @@ def run_dst_matchup_backtest(source_slate_id, seasons=None, engine=None):
     comparison's own established standard for this exact mechanism.
     """
     engine = engine or get_engine()
-    from models.matchups import _opponents_for_week  # local import - avoids a module-load cycle (models/matchups.py imports FROM this module)
+    from models.matchups import (
+        _opponents_for_week,  # local import - avoids a module-load cycle (models/matchups.py imports FROM this module)
+    )
 
     slate_players = load_slate_pool(source_slate_id, engine)
     dst_players = [p for p in slate_players if p["position"] == "DST"]

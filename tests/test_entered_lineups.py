@@ -1,6 +1,10 @@
 from sqlalchemy import text
 
-from data.entered_lineups import backfill_actual_scores, log_entered_lineups, summarize_entered_group_results
+from data.entered_lineups import (
+    backfill_actual_scores,
+    log_entered_lineups,
+    summarize_entered_group_results,
+)
 
 TEST_CONTEST_ID = "TEST_ENTERED_LINEUPS_CONTEST"
 

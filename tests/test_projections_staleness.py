@@ -1,6 +1,11 @@
 from sqlalchemy import text
 
-from models.projections import MAX_STALENESS_WEEKS, _load_recent_stats, _real_week_sequence, _staleness_reference_week
+from models.projections import (
+    MAX_STALENESS_WEEKS,
+    _load_recent_stats,
+    _real_week_sequence,
+    _staleness_reference_week,
+)
 
 # Regression coverage for the real bug this was built to fix: Christian
 # McCaffrey's 2024 week-8 as-of projection was being built entirely from

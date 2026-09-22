@@ -5,7 +5,11 @@ import pulp
 from sqlalchemy import text
 
 from data.dk_salary_csv import CLASSIC_ROSTER, SHOWDOWN_ROSTER
-from data.player_availability import game_lock_status, get_availability_gate, resolve_slate_season_week
+from data.player_availability import (
+    game_lock_status,
+    get_availability_gate,
+    resolve_slate_season_week,
+)
 from data.player_crosswalk import resolve_dk_players_to_gsis
 from data.pre_lock_check import hard_role_exclusions
 from db.migrate import get_engine

@@ -62,7 +62,7 @@ def test_duplicate_player_is_rejected(engine, stable_slate):
         stable_slate, num_lineups=1, projection_field="proj_ceiling", engine=engine
     )
     roster = lineups[0]["roster"]
-    duplicated = roster[:-1] + [roster[0]]
+    duplicated = [*roster[:-1], roster[0]]
 
     with pytest.raises(LineupValidationError, match="duplicate player"):
         validate_lineup(_make_lineup(duplicated))
