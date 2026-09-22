@@ -15,7 +15,6 @@ from models import playing_time_engine
 from models.backtest import DEFAULT_RANDOM_FIELD_SIZE, _asof_projected_points, load_actual_scores, load_slate_pool
 from models.optimizer import SALARY_CAP, build_lineups_from_pool
 from models.projections import (
-    GAME_ENVIRONMENT_CEILING_BOOST_PER_POINT,
     _apply_game_environment_adjustment,
     _load_recent_stats,
     _project_from_history,

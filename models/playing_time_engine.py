@@ -4,7 +4,6 @@ from sqlalchemy import text
 
 from data.depth_charts import latest_depth_chart_by_player
 from data.player_availability import (
-    FLAG_INJURY_STATUSES,
     HARD_EXCLUDE_INJURY_STATUSES,
     HARD_EXCLUDE_ROSTER_STATUSES,
 )

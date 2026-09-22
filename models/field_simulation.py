@@ -698,7 +698,6 @@ def find_ownership_cap_matching_projection(
     an error to propagate.
     """
     raw_points_by_id = {p["player_id"]: p["points"] for p in players}
-    ownership_values_by_id = proxy_fn(players)
 
     candidates = []
     closest = None
