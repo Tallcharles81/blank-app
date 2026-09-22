@@ -73,6 +73,29 @@ def test_select_portfolio_enforces_a_real_hard_exposure_cap_across_all_candidate
     assert all("star" in r["reason"] for r in rejected)
 
 
+def test_select_portfolio_accepts_a_per_player_exposure_dict_and_reports_a_real_reason():
+    # Regression: max_exposure can legitimately be a per-player dict (same
+    # spec _resolve_exposure has always supported everywhere else in this
+    # module) - a real live rebuild hit an unhandled dict here and crashed
+    # with TypeError formatting the rejection reason, which assumed a
+    # single float. One player gets a higher real cap than everyone else.
+    candidates = []
+    for i in range(4):
+        roster = [("QB", _player("star", salary=8000))] + [(f"slot{j}", _player(f"c{i}_{j}")) for j in range(8)]
+        candidates.append(_synthetic_lineup(roster, points=100.0 - i))
+
+    selected, rejected, state = select_portfolio_within_caps(
+        candidates, target_count=4, max_exposure={"default": 0.25, "star": 0.75}
+    )
+
+    # 0.75 * 4 = 3 real slots for "star" specifically, not the 0.25 default.
+    star_count = sum(1 for lu in selected for _, p in lu["roster"] if p["player_id"] == "star")
+    assert star_count == 3
+    assert len(rejected) == 1
+    assert "star" in rejected[0]["reason"]
+    assert "75%" in rejected[0]["reason"]
+
+
 def test_select_portfolio_state_threads_across_sequential_calls_against_a_shared_total():
     # Mirrors the real bug: bucket 1 (e.g. "the optimizer set") and bucket 2
     # (e.g. "the simulation scenarios") are built by separate calls, but

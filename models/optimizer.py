@@ -788,11 +788,14 @@ def select_portfolio_within_caps(candidates, target_count, max_exposure=None, to
         for pid in id_set:
             cap = _resolve_exposure(max_exposure, pid)
             if cap is not None and exposure_counts[pid] + 1 > cap * denom:
-                over_cap.append(pid)
+                over_cap.append((pid, cap))
         if over_cap:
-            rejected.append(
-                {"lineup": lu, "reason": f"would push player(s) {sorted(over_cap)} over the {max_exposure:.0%} exposure cap"}
-            )
+            # max_exposure may be a single float (every player shares one cap)
+            # or a per-player dict (see _resolve_exposure) - the rejection
+            # reason reports each over-cap player's OWN real resolved cap,
+            # correct in both cases, rather than assuming a single float.
+            detail = ", ".join(f"{pid} ({cap:.0%})" for pid, cap in sorted(over_cap))
+            rejected.append({"lineup": lu, "reason": f"would push player(s) over their exposure cap: {detail}"})
             continue
 
         selected.append(lu)
