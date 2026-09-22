@@ -217,3 +217,44 @@ CREATE TABLE IF NOT EXISTS ownership_calibration_runs (
 
 CREATE INDEX IF NOT EXISTS idx_ownership_calibration_runs_contest_id
     ON ownership_calibration_runs (contest_id);
+
+-- Real, per-contest payout metadata, keyed by contest_id so this is never
+-- hardcoded for a single contest - a growing table as real contests are
+-- entered, same accumulating-dataset shape as contest_ownership. entries/
+-- total_entries is a POINT-IN-TIME snapshot for a still-filling contest
+-- (DK's own single-entry GPPs keep accepting entries until lock), not a
+-- guaranteed final count - structure_complete distinguishes a contest whose
+-- FULL rank-1-through-places_paid payout table is on record from one where
+-- only some leading ranks are confirmed (DK's contest CSV export has no
+-- Prize/Winnings column at all - real payout numbers only come from
+-- whatever the user reads off DK's own contest page, which is often
+-- truncated/partial when pasted, and must never be guessed at beyond what
+-- was actually given).
+CREATE TABLE IF NOT EXISTS contests (
+    contest_id          TEXT PRIMARY KEY,
+    slate_id            TEXT,
+    entry_fee           NUMERIC(10, 2),
+    total_entries       INTEGER,
+    places_paid         INTEGER,
+    total_prizes        NUMERIC(12, 2),
+    structure_complete  BOOLEAN NOT NULL DEFAULT FALSE,
+    imported_at         TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- One row per confirmed real payout tier: ranks rank_start-rank_end each
+-- win `prize`. rank_end NULL means this tier's real upper bound was never
+-- confirmed (e.g. a pasted "3rd EQ $50" with no stated range) - such a tier
+-- is deliberately excluded from any payout math that needs a closed rank
+-- range (see models/payout.py's prize_for_rank) rather than silently
+-- guessed at.
+CREATE TABLE IF NOT EXISTS contest_payout_tiers (
+    id          BIGSERIAL PRIMARY KEY,
+    contest_id  TEXT NOT NULL REFERENCES contests(contest_id) ON DELETE CASCADE,
+    rank_start  INTEGER NOT NULL,
+    rank_end    INTEGER,
+    prize       NUMERIC(12, 2) NOT NULL,
+    UNIQUE (contest_id, rank_start)
+);
+
+CREATE INDEX IF NOT EXISTS idx_contest_payout_tiers_contest_id
+    ON contest_payout_tiers (contest_id);

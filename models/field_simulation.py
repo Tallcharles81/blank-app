@@ -4,6 +4,7 @@ from collections import Counter
 import numpy as np
 
 from models.optimizer import SALARY_CAP, _load_player_pool, build_lineups_from_pool
+from models.payout import estimate_payout_from_ranks, load_contest_payout
 from models.simulation import DEFAULT_NUM_SIMULATIONS, simulate_lineups
 
 # ---------------------------------------------------------------------------
@@ -218,6 +219,7 @@ def run_field_simulation(
     engine=None,
     projection_field="proj_median",
     proxy_fn=calibrated_ownership_proxy,
+    contest_id=None,
 ):
     """Simulate a `contest_size`-lineup GPP field around `my_lineup` and score
     everyone against the SAME num_simulations simulated worlds (one call to
@@ -242,6 +244,26 @@ def run_field_simulation(
     selection frequency per player - a direct, measured output of the
     sampling, not a separately asserted ownership number) so the sampling
     itself can be sanity-checked.
+
+    `contest_id`, if given, adds a "payout" key: real per-world finish rank
+    (1 + how many opponents strictly outscored my_lineup that world) run
+    through models.payout's stored curve for that real contest (raises
+    ValueError via load_contest_payout if it was never imported). This is a
+    genuinely different, complementary question from win_pct/tie_pct/loss_pct
+    above: those answer "do I beat the WHOLE field" (a single-winner framing
+    that only strictly matters for a winner-take-all contest), while `payout`
+    answers "how does this lineup do under this contest's REAL multi-place
+    payout structure," including honestly reporting when that structure is
+    only partially known (see models/payout.py's module docstring).
+
+    One real approximation this carries that a caller must weigh, not just
+    take on faith: the simulated field here has `contest_size` opponents,
+    which may be far smaller than the real contest's own total_entries
+    (large single-entry GPPs commonly run into the thousands) - a rank
+    computed against a much smaller simulated field is an easier bar to
+    clear than the real one, so payout.cash_pct will read optimistic unless
+    `contest_size` is set close to the real contest's own total_entries. See
+    payout.field_size_note.
     """
     players, _, _, _ = _load_player_pool(slate_id, projection_field, engine=engine)
     opponents, failed_draws = generate_opponent_lineups(players, contest_size, concentration, seed, proxy_fn=proxy_fn)
@@ -280,6 +302,30 @@ def run_field_simulation(
         for pid, count in realized_selection_counts.most_common(10)
     ]
 
+    payout = None
+    if contest_id is not None:
+        contest = load_contest_payout(contest_id, engine=engine)
+        if contest["slate_id"] is not None and contest["slate_id"] != slate_id:
+            raise ValueError(
+                f"contest_id={contest_id} was imported for slate_id={contest['slate_id']!r}, not {slate_id!r} - "
+                "refusing to score a real contest's payout curve against a different slate's simulated field"
+            )
+        my_rank_per_world = 1 + np.sum(opponent_scores > my_scores, axis=0)
+        payout = estimate_payout_from_ranks(
+            my_rank_per_world.tolist(),
+            contest["tiers"],
+            places_paid=contest["places_paid"],
+            entry_fee=contest["entry_fee"],
+        )
+        payout["structure_complete"] = contest["structure_complete"]
+        payout["simulated_field_size"] = len(opponents)
+        payout["real_total_entries"] = contest["total_entries"]
+        payout["field_size_note"] = (
+            "simulated_field_size vs real_total_entries - cash_pct is only a faithful estimate of "
+            "the real contest once these are close; a much smaller simulated field makes cashing look "
+            "easier than it really is."
+        )
+
     return {
         "contest_size_requested": contest_size,
         "contest_size_actual": len(opponents),
@@ -294,6 +340,7 @@ def run_field_simulation(
         "loss_pct": round(loss_pct, 4),
         "my_median_score": round(float(np.median(my_scores)), 2),
         "ownership_proxy_top": ownership_proxy_top,
+        "payout": payout,
     }
 
 

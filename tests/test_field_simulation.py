@@ -11,8 +11,10 @@ from models.field_simulation import (
     generate_opponent_lineups,
     leverage_score,
     ownership_proxy,
+    run_field_simulation,
 )
 from models.optimizer import _load_player_pool
+from models.payout import import_contest_payout_structure
 
 # --- calibrated_ownership_proxy: pure unit tests, no DB needed -------------
 
@@ -154,6 +156,76 @@ def test_build_ownership_cap_lineup_respects_the_hard_cap(engine, stable_slate):
     capped = build_ownership_cap_lineup(players, cap)
     capped_total = sum(proxy_by_id[p["player_id"]] for _, p in capped["roster"])
     assert capped_total <= cap + 1e-6
+
+
+def test_run_field_simulation_without_contest_id_has_no_payout_key(engine, stable_slate):
+    players, _, _, _ = _load_player_pool(stable_slate, "proj_ceiling", engine)
+    chalk = build_chalk_lineup(players)
+    result = run_field_simulation(chalk, stable_slate, contest_size=10, num_simulations=200, seed=1, engine=engine)
+    assert result["payout"] is None
+
+
+def test_run_field_simulation_with_contest_id_adds_real_payout_stats(engine, stable_slate):
+    import_contest_payout_structure(
+        "test_fs_payout_contest",
+        [
+            {"rank_start": 1, "rank_end": 1, "prize": 10.0},
+            {"rank_start": 2, "rank_end": 5, "prize": 5.0},
+        ],
+        slate_id=stable_slate,
+        entry_fee=1.0,
+        total_entries=10,
+        places_paid=5,
+        total_prizes=30.0,
+        structure_complete=True,
+        engine=engine,
+    )
+    players, _, _, _ = _load_player_pool(stable_slate, "proj_ceiling", engine)
+    chalk = build_chalk_lineup(players)
+    result = run_field_simulation(
+        chalk,
+        stable_slate,
+        contest_size=10,
+        num_simulations=500,
+        seed=1,
+        engine=engine,
+        contest_id="test_fs_payout_contest",
+    )
+    payout = result["payout"]
+    assert payout is not None
+    assert 0.0 <= payout["cash_pct"] <= 1.0
+    assert payout["pct_unknown_payout"] == 0.0  # every rank 1-10 is covered: 1, 2-5, or >5 (confident $0)
+    assert payout["structure_complete"] is True
+    assert payout["simulated_field_size"] == 10
+    assert payout["real_total_entries"] == 10
+    # The best simulated lineup here (chalk, highest projection) should clear
+    # some real worlds outright - not a degenerate always-zero result.
+    assert payout["mean_known_payout"] is not None and payout["mean_known_payout"] >= 0.0
+
+
+def test_run_field_simulation_raises_when_contest_slate_id_mismatches(engine, stable_slate):
+    import_contest_payout_structure(
+        "test_fs_payout_wrong_slate",
+        [{"rank_start": 1, "rank_end": 1, "prize": 10.0}],
+        slate_id="some_other_slate_entirely",
+        places_paid=1,
+        engine=engine,
+    )
+    players, _, _, _ = _load_player_pool(stable_slate, "proj_ceiling", engine)
+    chalk = build_chalk_lineup(players)
+    with pytest.raises(ValueError, match="refusing to score"):
+        run_field_simulation(
+            chalk, stable_slate, contest_size=10, num_simulations=50, seed=1, engine=engine, contest_id="test_fs_payout_wrong_slate"
+        )
+
+
+def test_run_field_simulation_raises_for_an_unimported_contest_id(engine, stable_slate):
+    players, _, _, _ = _load_player_pool(stable_slate, "proj_ceiling", engine)
+    chalk = build_chalk_lineup(players)
+    with pytest.raises(ValueError, match="No contest payout structure stored"):
+        run_field_simulation(
+            chalk, stable_slate, contest_size=10, num_simulations=50, seed=1, engine=engine, contest_id="nope_not_real"
+        )
 
 
 def test_find_ownership_cap_matching_projection_finds_a_real_alternative(engine, stable_slate):

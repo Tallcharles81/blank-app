@@ -5,6 +5,7 @@ from sqlalchemy import text
 from data.player_crosswalk import resolve_dk_players_to_gsis
 from db.migrate import get_engine
 from models.optimizer import SALARY_CAP, build_lineups_from_pool
+from models.payout import load_contest_payout, prize_for_rank
 from models.projections import _load_recent_stats, _project_from_history
 
 # A naive "field": legal-but-random lineups from the same real slate, scored on
@@ -102,6 +103,7 @@ def backtest_slate(
     min_exposure=None,
     random_field_size=DEFAULT_RANDOM_FIELD_SIZE,
     engine=None,
+    contest_id=None,
 ):
     """Build lineup(s) from `source_slate_id`'s real DK salaries using only
     data available before (season, week), then score them against the real
@@ -124,6 +126,20 @@ def backtest_slate(
     - excluded_no_asof_projection / excluded_no_actual_result: DK player_ids
       dropped from the candidate pool because either couldn't be produced -
       see load_actual_scores and _asof_projected_points.
+
+    `contest_id`, if given, adds a "payout_estimate" key to each lineup dict
+    (raises ValueError via models.payout.load_contest_payout if that real
+    contest's curve was never imported). This is a REAL, compounded
+    approximation, disclosed here rather than presented as an exact number:
+    field_percentile itself already comes from `field_scores`, a sample of
+    RANDOM legal lineups on real actual results, not a real skilled opponent
+    field (see this module's own docstring above) - implied_rank further
+    rescales that percentile against the real contest's own total_entries
+    (`implied_rank = round((1 - field_percentile) * total_entries)`,
+    minimum 1), which assumes the random field's percentile shape transfers
+    onto the real field's size, a real but unverified assumption. Useful as
+    a rough, directionally-real cash/payout signal for a backtested week,
+    not a claim about what this lineup would have actually won.
     """
     engine = engine or get_engine()
 
@@ -180,17 +196,39 @@ def backtest_slate(
             continue
         field_scores.append(score_actual(field_lineup[0]["roster"]))
 
+    contest = load_contest_payout(contest_id, engine=engine) if contest_id is not None else None
+    if contest is not None and contest["slate_id"] is not None and contest["slate_id"] != source_slate_id:
+        raise ValueError(
+            f"contest_id={contest_id} was imported for slate_id={contest['slate_id']!r}, not {source_slate_id!r} - "
+            "refusing to score a real contest's payout curve against a different slate's backtest"
+        )
+
     results = []
     for lu in our_lineups:
         actual = score_actual(lu["roster"])
         better_than = sum(1 for s in field_scores if actual > s)
+        field_percentile = round(better_than / len(field_scores), 4) if field_scores else None
+
+        payout_estimate = None
+        if contest is not None and field_percentile is not None and contest["total_entries"]:
+            implied_rank = max(1, round((1 - field_percentile) * contest["total_entries"]))
+            prize, known = prize_for_rank(implied_rank, contest["tiers"], places_paid=contest["places_paid"])
+            payout_estimate = {
+                "implied_rank": implied_rank,
+                "real_total_entries": contest["total_entries"],
+                "prize": prize,
+                "prize_known": known,
+                "cashed": (implied_rank <= contest["places_paid"]) if contest["places_paid"] else None,
+            }
+
         results.append(
             {
                 "roster": lu["roster"],
                 "projected_points": lu["total_points"],
                 "actual_points": actual,
                 "pct_of_ceiling": round(actual / ceiling_points, 4) if ceiling_points else None,
-                "field_percentile": round(better_than / len(field_scores), 4) if field_scores else None,
+                "field_percentile": field_percentile,
+                "payout_estimate": payout_estimate,
             }
         )
 
