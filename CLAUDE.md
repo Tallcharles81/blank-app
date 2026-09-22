@@ -30,3 +30,15 @@ costing real results - not just producing a different lineup - say so
 plainly and let the user decide whether to change the default. Never switch
 back to the deterministic path silently, and never suppress a negative
 finding to avoid revisiting this decision.
+
+## Standing reporting convention: name the file
+
+Whenever reporting exposure/duplicate/verification numbers (or any other
+per-export analysis) for a generated file, state the exact filename in the
+same message as the numbers - e.g. "these numbers are for
+DKUpload_20lineups_v2.csv" - rather than a bare table the reader has to
+guess the source of. A real incident this caused: reporting a table without
+naming which of two successive exports (19-lineup vs. 20-lineup) it
+described, which the user reasonably read as contradicting a later,
+correct report on the newer file. This applies every time a new version of
+a file is generated, not just DK lineup exports.
