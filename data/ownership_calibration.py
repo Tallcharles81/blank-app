@@ -84,7 +84,7 @@ def parse_contest_standings_csv(csv_path):
     see import_contest_standings for how that's handled rather than silently
     computing ownership_proxy off the wrong price.
     """
-    totals = defaultdict(lambda: {"pct_drafted": 0.0, "fpts_contest": None})
+    totals = defaultdict(lambda: {"pct_drafted": 0.0, "fpts_by_position": {}})
     skipped = 0
     is_showdown = False
     with open(csv_path, encoding="utf-8-sig") as f:
@@ -93,7 +93,8 @@ def parse_contest_standings_csv(csv_path):
             name = (row.get("Player") or "").strip()
             if not name:
                 continue
-            if (row.get("Roster Position") or "").strip() == "CPT":
+            roster_position = (row.get("Roster Position") or "").strip()
+            if roster_position == "CPT":
                 is_showdown = True
             pct_raw = (row.get("%Drafted") or "").strip().rstrip("%")
             try:
@@ -109,15 +110,35 @@ def parse_contest_standings_csv(csv_path):
                 except ValueError:
                     fpts = None
             totals[name]["pct_drafted"] += pct
-            # FPTS is the player's real total, identical across every one of
-            # their roster-slot rows (verified against this contest's own
-            # real data - a player's FPTS never differs between their
-            # natural-position row and their FLEX row), so the last row seen
-            # is as good as any other, not an average or a sum.
             if fpts is not None:
-                totals[name]["fpts_contest"] = fpts
+                totals[name]["fpts_by_position"][roster_position] = fpts
 
-    return dict(totals), skipped, is_showdown
+    # REAL BUG FIXED HERE, found reconciling real entered lineups against
+    # real per-entry DK totals: on a Classic slate a player's FPTS really is
+    # identical across every one of their roster-slot rows (no multiplier
+    # exists there), so "last row wins" was safe. On a SHOWDOWN slate it is
+    # NOT - CPT applies a real 1.5x multiplier to the exact same real
+    # per-game performance, so a player's CPT-row FPTS and FLEX-row FPTS are
+    # genuinely different real numbers (confirmed for real: Matthew Stafford
+    # showed 46.47 as CPT vs 30.98 as FLEX in the same real contest, exactly
+    # 1.5x). "Last row wins" silently stored whichever multiplier happened
+    # to appear last in file order - not tied to what role THIS row's own
+    # entry used - which is exactly what caused a real per-entry total
+    # reconciliation to overshoot DK's own reported totals. FLEX is the
+    # real, unmultiplied base value - preferred here; a player never
+    # drafted into FLEX by anyone in the whole real field (rare) falls back
+    # to their CPT value, which IS the multiplied number - a real,
+    # disclosed limitation of that edge case, not a silent wrong answer.
+    result = {}
+    for name, info in totals.items():
+        fpts_by_position = info["fpts_by_position"]
+        if is_showdown:
+            fpts = fpts_by_position.get("FLEX", fpts_by_position.get("CPT"))
+        else:
+            fpts = next(iter(fpts_by_position.values()), None)
+        result[name] = {"pct_drafted": info["pct_drafted"], "fpts_contest": fpts}
+
+    return result, skipped, is_showdown
 
 
 def import_contest_standings(csv_path, slate_id, contest_id, engine=None):

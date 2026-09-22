@@ -69,6 +69,41 @@ def test_parse_contest_standings_csv_dedupes_and_sums_roster_slots(contest_csv):
     assert parsed[FAKE_PLAYER_NAME]["pct_drafted"] == pytest.approx(1.0)
 
 
+def test_parse_contest_standings_csv_prefers_flex_fpts_on_showdown(tmp_path):
+    # Regression test for a real bug: on a Classic slate a player's FPTS is
+    # identical across every roster-slot row (no multiplier), so "last row
+    # wins" was safe there - but on Showdown, CPT applies a real 1.5x
+    # multiplier to the SAME real per-game performance, so a player's CPT
+    # row and FLEX row carry genuinely DIFFERENT real FPTS. Found for real
+    # reconciling entered lineups against DK's own per-entry totals (Matthew
+    # Stafford: 46.47 as CPT vs 30.98 as FLEX in the same real contest,
+    # exactly 1.5x). The real, unmultiplied FLEX value must be preferred
+    # regardless of which row happens to appear last in the file.
+    path = tmp_path / "contest-standings-SHOWDOWN-TEST.csv"
+    _write_contest_csv(
+        path,
+        [
+            (GIBBS["name"], "CPT", 10.0, 46.47),  # CPT row written FIRST in the file...
+            (GIBBS["name"], "FLEX", 30.0, 30.98),  # ...but FLEX (unmultiplied) must still win
+        ],
+    )
+    parsed, skipped, is_showdown = parse_contest_standings_csv(str(path))
+    assert is_showdown is True
+    assert parsed[GIBBS["name"]]["fpts_contest"] == pytest.approx(30.98)
+
+
+def test_parse_contest_standings_csv_falls_back_to_cpt_fpts_if_never_flexed(tmp_path):
+    # A player nobody in the whole real field ever drafted into FLEX (only
+    # ever CPT) has no unmultiplied real value to prefer - falls back to
+    # the CPT (multiplied) number rather than raising or silently dropping
+    # the player. A real, disclosed limitation of that edge case.
+    path = tmp_path / "contest-standings-SHOWDOWN-TEST2.csv"
+    _write_contest_csv(path, [(GIBBS["name"], "CPT", 10.0, 46.47)])
+    parsed, skipped, is_showdown = parse_contest_standings_csv(str(path))
+    assert is_showdown is True
+    assert parsed[GIBBS["name"]]["fpts_contest"] == pytest.approx(46.47)
+
+
 TEST_CONTEST_ID = "TEST_CONTEST_OWNERSHIP"
 
 
