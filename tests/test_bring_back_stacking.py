@@ -6,12 +6,12 @@ def _bring_back_present(lineup):
     return any(p["position"] in ("WR", "TE") and p["team"] == qb["opponent"] for _, p in lineup["roster"])
 
 
-def test_bring_back_is_off_by_default(engine):
+def test_bring_back_is_off_by_default(engine, stable_slate):
     # require_bring_back defaults to False even in generate_lineups (unlike
     # require_qb_stack, which defaults True) - dedicating a third roster
     # slot to one game's correlation is a real cost, opt-in only.
     lineups, _, _ = generate_lineups(
-        "dk_thu_mon_2026_09_17", num_lineups=5, projection_field="proj_ceiling", engine=engine
+        stable_slate, num_lineups=5, projection_field="proj_ceiling", engine=engine
     )
     assert len(lineups) == 5
     # Not asserting zero bring-backs (one could happen to occur naturally) -
@@ -20,9 +20,9 @@ def test_bring_back_is_off_by_default(engine):
         validate_lineup(lu)
 
 
-def test_require_bring_back_produces_a_real_opponent_pass_catcher(engine):
+def test_require_bring_back_produces_a_real_opponent_pass_catcher(engine, stable_slate):
     lineups, _, _ = generate_lineups(
-        "dk_thu_mon_2026_09_17",
+        stable_slate,
         num_lineups=5,
         projection_field="proj_ceiling",
         require_bring_back=True,
@@ -34,9 +34,9 @@ def test_require_bring_back_produces_a_real_opponent_pass_catcher(engine):
         assert _bring_back_present(lu), f"lineup missing a real bring-back: {lu['roster']}"
 
 
-def test_require_bring_back_holds_alongside_exposure_caps_and_uniqueness(engine):
+def test_require_bring_back_holds_alongside_exposure_caps_and_uniqueness(engine, stable_slate):
     lineups, _, _ = generate_lineups(
-        "dk_thu_mon_2026_09_17",
+        stable_slate,
         num_lineups=10,
         projection_field="proj_ceiling",
         require_bring_back=True,

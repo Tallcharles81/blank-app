@@ -20,21 +20,20 @@ def _make_lineup(roster):
     return {"roster": roster, "total_salary": sum(p["salary"] for _, p in roster), "total_points": 0}
 
 
-def test_a_real_legal_lineup_including_a_flex_as_te_case_passes(engine):
+def test_a_real_legal_lineup_including_a_flex_as_te_case_passes(engine, stable_slate):
     # Uses live data so this is the same shape as the real incident, not a
     # hand-built stand-in. Locks two real, legitimately-eligible starting
-    # TEs (Trey McBride, Kyle Pitts Sr.) in explicitly - since models/
+    # TEs (George Kittle, Trey McBride) in explicitly - since models/
     # playing_time_engine.py's real floor now correctly excludes most
     # real backup/committee TEs, the ceiling-maximizer no longer reaches
     # for a second TE on its own the way it used to on this slate, which
     # made this test flaky against live data rather than testing what it's
     # actually meant to (a real FLEX-as-TE roster validates as legal).
     lineups, _, _ = generate_lineups(
-        "dk_thu_mon_2026_09_17",
+        stable_slate,
         num_lineups=1,
         projection_field="proj_ceiling",
-        excluded_player_ids=["44137054"],
-        locked_player_ids=["44138032", "44138050"],  # Trey McBride, Kyle Pitts Sr.
+        locked_player_ids=["44221112", "44221104"],  # George Kittle, Trey McBride
         engine=engine,
     )
     lineup = lineups[0]
@@ -44,12 +43,11 @@ def test_a_real_legal_lineup_including_a_flex_as_te_case_passes(engine):
     validate_lineup(lineup)  # must not raise
 
 
-def test_flex_mislabeled_as_a_second_te_slot_is_rejected(engine):
+def test_flex_mislabeled_as_a_second_te_slot_is_rejected(engine, stable_slate):
     lineups, _, _ = generate_lineups(
-        "dk_thu_mon_2026_09_17",
+        stable_slate,
         num_lineups=1,
         projection_field="proj_ceiling",
-        excluded_player_ids=["44137054"],
         engine=engine,
     )
     roster = lineups[0]["roster"]
@@ -59,9 +57,9 @@ def test_flex_mislabeled_as_a_second_te_slot_is_rejected(engine):
         validate_lineup(_make_lineup(mislabeled))
 
 
-def test_duplicate_player_is_rejected(engine):
+def test_duplicate_player_is_rejected(engine, stable_slate):
     lineups, _, _ = generate_lineups(
-        "dk_thu_mon_2026_09_17", num_lineups=1, projection_field="proj_ceiling", engine=engine
+        stable_slate, num_lineups=1, projection_field="proj_ceiling", engine=engine
     )
     roster = lineups[0]["roster"]
     duplicated = roster[:-1] + [roster[0]]
@@ -70,9 +68,9 @@ def test_duplicate_player_is_rejected(engine):
         validate_lineup(_make_lineup(duplicated))
 
 
-def test_over_salary_cap_is_rejected(engine):
+def test_over_salary_cap_is_rejected(engine, stable_slate):
     lineups, _, _ = generate_lineups(
-        "dk_thu_mon_2026_09_17", num_lineups=1, projection_field="proj_ceiling", engine=engine
+        stable_slate, num_lineups=1, projection_field="proj_ceiling", engine=engine
     )
     roster = lineups[0]["roster"]
     over_cap = [(slot, {**p, "salary": p["salary"] + 100_000} if slot == "QB" else p) for slot, p in roster]
@@ -81,9 +79,9 @@ def test_over_salary_cap_is_rejected(engine):
         validate_lineup(_make_lineup(over_cap))
 
 
-def test_missing_a_required_position_is_rejected(engine):
+def test_missing_a_required_position_is_rejected(engine, stable_slate):
     lineups, _, _ = generate_lineups(
-        "dk_thu_mon_2026_09_17", num_lineups=1, projection_field="proj_ceiling", engine=engine
+        stable_slate, num_lineups=1, projection_field="proj_ceiling", engine=engine
     )
     roster = lineups[0]["roster"]
     # Filter by real position, not slot label: FLEX could legally be filled
@@ -99,13 +97,13 @@ def test_missing_a_required_position_is_rejected(engine):
         validate_lineup(_make_lineup(missing_rb))
 
 
-def test_generate_lineups_only_ever_returns_lineups_that_already_passed_validation(engine):
+def test_generate_lineups_only_ever_returns_lineups_that_already_passed_validation(engine, stable_slate):
     # build_lineups_from_pool calls validate_lineup on every lineup before
     # it's appended to the results - this just confirms that wiring holds
     # for a real multi-lineup GPP run with exposure caps and stacking on,
     # not just a single lineup.
     lineups, _, _ = generate_lineups(
-        "dk_thu_mon_2026_09_17",
+        stable_slate,
         num_lineups=10,
         projection_field="proj_ceiling",
         max_exposure=0.6,

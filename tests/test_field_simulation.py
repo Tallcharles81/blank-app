@@ -49,8 +49,8 @@ def test_calibrated_ownership_proxy_falls_back_to_uncalibrated_for_unknown_posit
 # --- real, DB-backed integration checks - proxy_fn actually gets used ------
 
 
-def test_generate_opponent_lineups_defaults_to_calibrated_proxy(engine):
-    players, _, _, _ = _load_player_pool("dk_thu_mon_2026_09_17", "proj_median", engine)
+def test_generate_opponent_lineups_defaults_to_calibrated_proxy(engine, stable_slate):
+    players, _, _, _ = _load_player_pool(stable_slate, "proj_median", engine)
 
     # A uniform per-position scalar (POSITION_OWNERSHIP_CALIBRATION) doesn't
     # change the relative ORDER within a position, and DST is a mandatory
@@ -125,8 +125,8 @@ def test_leverage_score_ranks_within_position_not_across_positions():
     assert scores["te_first"] == pytest.approx(scores["wr_first"])
 
 
-def test_build_leverage_lineup_defaults_to_calibrated_proxy(engine):
-    players, _, _, _ = _load_player_pool("dk_thu_mon_2026_09_17", "proj_ceiling", engine)
+def test_build_leverage_lineup_defaults_to_calibrated_proxy(engine, stable_slate):
+    players, _, _, _ = _load_player_pool(stable_slate, "proj_ceiling", engine)
 
     calls = []
 
@@ -143,8 +143,8 @@ def test_build_leverage_lineup_defaults_to_calibrated_proxy(engine):
     assert default_ids == spied_ids
 
 
-def test_build_ownership_cap_lineup_respects_the_hard_cap(engine):
-    players, _, _, _ = _load_player_pool("dk_thu_mon_2026_09_17", "proj_ceiling", engine)
+def test_build_ownership_cap_lineup_respects_the_hard_cap(engine, stable_slate):
+    players, _, _, _ = _load_player_pool(stable_slate, "proj_ceiling", engine)
     proxy_by_id = calibrated_ownership_proxy(players)
 
     uncapped = build_chalk_lineup(players)
@@ -156,8 +156,8 @@ def test_build_ownership_cap_lineup_respects_the_hard_cap(engine):
     assert capped_total <= cap + 1e-6
 
 
-def test_find_ownership_cap_matching_projection_finds_a_real_alternative(engine):
-    players, _, _, _ = _load_player_pool("dk_thu_mon_2026_09_17", "proj_ceiling", engine)
+def test_find_ownership_cap_matching_projection_finds_a_real_alternative(engine, stable_slate):
+    players, _, _, _ = _load_player_pool(stable_slate, "proj_ceiling", engine)
     proxy_by_id = calibrated_ownership_proxy(players)
 
     chalk = build_chalk_lineup(players)
@@ -172,8 +172,8 @@ def test_find_ownership_cap_matching_projection_finds_a_real_alternative(engine)
     assert cap_used < chalk_total_ownership  # a real, tighter cap than chalk's own unconstrained total
 
 
-def test_build_contrarian_lineup_defaults_to_calibrated_proxy(engine):
-    players, _, _, _ = _load_player_pool("dk_thu_mon_2026_09_17", "proj_ceiling", engine)
+def test_build_contrarian_lineup_defaults_to_calibrated_proxy(engine, stable_slate):
+    players, _, _, _ = _load_player_pool(stable_slate, "proj_ceiling", engine)
 
     calls = []
 
