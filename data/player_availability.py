@@ -34,10 +34,22 @@ HARD_EXCLUDE_ROSTER_STATUSES = {
     "RFA",  # cut, restricted free agent
 }
 
+# Game-day inactive list for that specific week - not a multi-week status,
+# so kept out of HARD_EXCLUDE_ROSTER_STATUSES (models/calibration.py builds
+# its "persistently unavailable QB" set from that one). Only appears once a
+# team files its inactives ~90 minutes before kickoff, so it mostly catches
+# late swaps and backtests, but when it's there it's definitive.
+GAME_DAY_EXCLUDE_ROSTER_STATUSES = {"INA"}
 # The weekly injury report (separate source, separate cadence - see
 # fetch_current_injury_report) uses these instead.
-HARD_EXCLUDE_INJURY_STATUSES = {"Out"}
-FLAG_INJURY_STATUSES = {"Questionable", "Doubtful"}
+#
+# Doubtful is a hard exclusion, not a flag: across 2023-2026 regular seasons,
+# QB/RB/WR/TE listed Doubtful recorded a snap, target, or carry in 1 of 160
+# player-weeks, the same as Out (0 of 1,051) - Questionable players played
+# ~54% of the time, so they stay eligible. Flagging Doubtful let Zay Flowers
+# (Doubtful, then inactive, week 2 2026) into 10 of 20 generated lineups.
+HARD_EXCLUDE_INJURY_STATUSES = {"Out", "Doubtful"}
+FLAG_INJURY_STATUSES = {"Questionable"}
 
 
 def fetch_roster_status_for_season(season):
@@ -105,12 +117,12 @@ def resolve_slate_season_week(slate_id, engine=None):
 def get_availability_gate(dk_players, season, week, engine=None):
     """Resolve each DK player to their current roster/injury status for
     (season, week) and split them into excluded (hard blocker - must never
-    appear in a generated lineup) vs flagged (Questionable/Doubtful - still
+    appear in a generated lineup) vs flagged (Questionable - still
     eligible, surfaced as risk).
 
     Returns (excluded, flagged, injury_report_available):
     - excluded: {dk_player_id: reason string}
-    - flagged: {dk_player_id: "Questionable" | "Doubtful"}
+    - flagged: {dk_player_id: "Questionable"}
     - injury_report_available: whether nflverse had actually published a
       weekly injury report for this exact (season, week) yet - injury reports
       are filed Wed-Fri of game week, so for an upcoming week early in that
@@ -171,7 +183,7 @@ def get_availability_gate(dk_players, season, week, engine=None):
             continue
 
         roster_status = roster_status_by_gsis.get(gsis_id)
-        if roster_status in HARD_EXCLUDE_ROSTER_STATUSES:
+        if roster_status in HARD_EXCLUDE_ROSTER_STATUSES or roster_status in GAME_DAY_EXCLUDE_ROSTER_STATUSES:
             excluded[dk_id] = f"roster status: {roster_status}"
             continue
 

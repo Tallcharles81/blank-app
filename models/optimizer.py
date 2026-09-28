@@ -878,8 +878,8 @@ def _build_availability_report(players, availability_excluded, injury_report_ava
         # Hard-excluded before the solver ever saw them - see
         # data/player_availability.py. {dk_player_id: reason}.
         "excluded": availability_excluded,
-        # Still eligible, but risky - Questionable/Doubtful on the real
-        # current injury report. {dk_player_id: status}.
+        # Still eligible, but risky - Questionable on the real current
+        # injury report (Doubtful is excluded). {dk_player_id: status}.
         "flagged": {p["player_id"]: p["availability_flag"] for p in players if p.get("availability_flag")},
         # Injury reports are filed Wed-Fri of game week - False here means
         # nflverse hasn't published this week's report yet, not that everyone

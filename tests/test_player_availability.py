@@ -53,6 +53,23 @@ def test_roster_absence_is_a_hard_exclude():
     assert "not found on any team's current roster" in excluded["TEST_DK_AIYUK"]
 
 
+def test_doubtful_is_excluded_but_questionable_is_only_flagged():
+    # Real regression: Zay Flowers was Doubtful (then inactive) for 2026
+    # week 2, only flagged, and landed in 10 of 20 generated lineups for a
+    # 0-point game. Doubtful skill players played 1 of 160 times in
+    # 2023-2026; Questionable ~54%. Jalen McMillan was Questionable that
+    # same week and must stay eligible (flagged), not excluded.
+    dk_players = [
+        {"player_id": "TEST_DK_ZAY", "name": "Zay Flowers", "position": "WR", "team": "BAL"},
+        {"player_id": "TEST_DK_MCMILLAN", "name": "Jalen McMillan", "position": "WR", "team": "TB"},
+    ]
+    excluded, flagged, injury_report_available = get_availability_gate(dk_players, 2026, 2)
+    assert injury_report_available
+    assert "TEST_DK_ZAY" in excluded
+    assert "TEST_DK_MCMILLAN" not in excluded
+    assert flagged.get("TEST_DK_MCMILLAN") == "Questionable"
+
+
 def test_dst_is_exempt_from_the_roster_absence_check():
     # DST rows resolve to a synthetic DST_{team} id, never a real GSIS id -
     # team defenses aren't people, so they'd never legitimately appear in a
