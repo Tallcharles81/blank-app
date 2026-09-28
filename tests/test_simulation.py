@@ -1,5 +1,6 @@
 import json
 
+import numpy as np
 import pytest
 from sqlalchemy import text
 
@@ -9,6 +10,7 @@ from models.simulation import (
     SAME_TEAM_CORR,
     _load_players,
     _player_correlation,
+    _simulate_player_scores,
     simulate_player_distributions,
 )
 
@@ -176,6 +178,16 @@ def test_full_pipeline_showdown_qb_pass_catcher_correlation_is_real(engine, show
     qb = players_by_id[ids_by_name["Trevor Lawrence"]["CPT"]]
     wr = players_by_id[ids_by_name["Parker Washington"]["FLEX"]]
     assert _player_correlation(qb, wr) == QB_PASS_CATCHER_CORR
+
+
+def test_showdown_cpt_and_flex_rows_of_one_player_share_each_simulated_game(engine, showdown_simulation_slate):
+    # Same player, two DK rows: every simulated world must give him ONE game.
+    # This fixture stores identical ladders for both rows, so the draws must
+    # match exactly (a real CPT row's ladder is 1.5x, scaling that one game).
+    ids_by_name = showdown_simulation_slate
+    lawrence = ids_by_name["Trevor Lawrence"]
+    scores, _ = _simulate_player_scores([lawrence["CPT"], lawrence["FLEX"]], TEST_SLATE_ID, 2000, 7, engine)
+    assert np.array_equal(scores[lawrence["CPT"]], scores[lawrence["FLEX"]])
 
 
 # --- simulate_player_distributions -----------------------------------------

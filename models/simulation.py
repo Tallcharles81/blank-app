@@ -254,10 +254,27 @@ def _simulate_player_scores(player_ids, slate_id, num_simulations, seed, engine)
     """
     players_by_id = _load_players(slate_id, player_ids, engine)
     ordered_players = [players_by_id[pid] for pid in player_ids]
-    percentile_ranks = _correlated_percentile_ranks(ordered_players, num_simulations, seed)
+
+    # One draw per real player, not per DK row: on a Showdown slate the same
+    # player has a CPT row and a FLEX row with different ids, and the pairwise
+    # rules above would give them only SAME_TEAM_CORR - so "Swift at CPT" and
+    # "Swift at FLEX" played two unrelated games in each simulated world,
+    # breaking every cross-lineup comparison (win rates, field finish ranks).
+    # Both rows now read the same percentile rank through their own
+    # percentile ladders (the CPT ladder is already scaled 1.5x).
+    column_by_identity = {}
+    representatives = []
+    for player in ordered_players:
+        identity = (player["name"], player["team"])
+        if identity not in column_by_identity:
+            column_by_identity[identity] = len(representatives)
+            representatives.append(player)
+    percentile_ranks = _correlated_percentile_ranks(representatives, num_simulations, seed)
     scores_by_player_id = {
-        player["player_id"]: _quantile_to_scores(percentile_ranks[:, j], player["percentiles"])
-        for j, player in enumerate(ordered_players)
+        player["player_id"]: _quantile_to_scores(
+            percentile_ranks[:, column_by_identity[(player["name"], player["team"])]], player["percentiles"]
+        )
+        for player in ordered_players
     }
     return scores_by_player_id, players_by_id
 
