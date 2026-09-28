@@ -9,6 +9,7 @@ from collections import defaultdict
 
 from sqlalchemy import text
 
+from data.player_availability import resolve_slate_season_week
 from data.player_crosswalk import resolve_dk_players_to_gsis
 from data.pre_lock_check import (
     MAX_SNAP_PCT_FOR_FULL_GAME,
@@ -758,6 +759,23 @@ def _run_one_basis(rows, proxy_key, proxy_value_getter):
 # FOR_FULL_GAME) rather than inventing a second, parallel definition of
 # "uncertain starter" - same real signal, same real thresholds, applied
 # here to explain an ownership gap instead of to hard-exclude a player.
+#
+# This module analyzes contests well after they've closed, sometimes many
+# weeks later - a real, disclosed constraint that matters for HOW the
+# recent-usage window below is loaded: analyze_qb_ownership_gap must call
+# _load_recent_usage_batch with before=(season, week) set to the CONTEST's
+# own slate, not left at its live default. Without that cutoff, "recent
+# games" would be resolved relative to whatever is newest in the DB right
+# now, which can include real games that happened AFTER the contest being
+# analyzed - lookahead bias that would silently mislabel a QB's real
+# starter certainty as of the contest using usage the field could not have
+# known about yet, rather than erroring the way a bad live-gate call on an
+# elapsed slate would (get_availability_gate/hard_role_exclusions answer
+# "as of right now" and were considered and rejected here for exactly that
+# reason - re-querying them against an already-elapsed slate marks every
+# player unavailable, since the real injury/inactive report has long since
+# rolled over). Same as-of pattern models/calibration.py's backtests already
+# use via _load_recent_stats(before=(season, week)).
 CLEAN_STARTER_MIN_SNAP_PCT = 0.75
 
 
@@ -810,6 +828,15 @@ def analyze_qb_ownership_gap(contest_id, slate_id=None, engine=None):
     that correctly hesitated), that's the concrete, fixable finding; if
     clean_starter QBs ALSO show a large gap, the uncertainty explanation
     doesn't hold and the bias is coming from somewhere else.
+
+    `slate_id` (explicit, or resolved from the matched rows when omitted)
+    is required to be resolvable to a real (season, week): recent usage is
+    loaded as-of that slate via _load_recent_usage_batch(before=(season,
+    week)), not left at its live default, since this function is normally
+    run well after the contest has closed and a live-default lookup would
+    silently pull in games that happened after the contest instead of what
+    the field actually knew at the time - see the comment above
+    CLEAN_STARTER_MIN_SNAP_PCT for why.
     """
     engine = engine or get_engine()
     with engine.connect() as conn:
@@ -828,6 +855,15 @@ def analyze_qb_ownership_gap(contest_id, slate_id=None, engine=None):
     if slate_id is None:
         slate_ids = {r["slate_id"] for r in all_rows if r["slate_id"]}
         slate_id = slate_ids.pop() if len(slate_ids) == 1 else None
+
+    season_week = resolve_slate_season_week(slate_id, engine) if slate_id else None
+    if season_week is None:
+        raise RuntimeError(
+            f"Could not determine (season, week) for slate {slate_id!r} - refusing to load "
+            "recent QB usage without an as-of cutoff, which would silently pull in games "
+            "that happened after this contest instead of what the field actually knew"
+        )
+    season, week = season_week
 
     pct_values = [float(r["pct_drafted"]) for r in all_rows]
     proxy_values = [float(r["ownership_proxy"]) for r in all_rows]
@@ -850,7 +886,7 @@ def analyze_qb_ownership_gap(contest_id, slate_id=None, engine=None):
     ]
     gsis_by_dk_id, _, _ = resolve_dk_players_to_gsis(dk_players, engine)
     games_by_gsis = _load_recent_usage_batch(
-        [gid for gid in gsis_by_dk_id.values() if gid is not None], engine
+        [gid for gid in gsis_by_dk_id.values() if gid is not None], engine, before=(season, week)
     )
 
     qb_results = []
