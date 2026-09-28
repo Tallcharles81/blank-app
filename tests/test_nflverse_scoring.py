@@ -92,3 +92,16 @@ def test_two_point_conversion_scores_regardless_of_type():
 def test_interception_thrown_is_penalized_one_point_not_two():
     row = _row(passing_interceptions=1)
     assert _skill_player_fantasy_points(row) == -1.0
+
+
+def test_kicker_scoring_matches_dks_own_averages():
+    # Real 2026 lines checked against DK's AvgPointsPerGame (8.5 and 7.0).
+    santos = [_row(pat_made=8, fg_made_40_49=1), _row(pat_made=5)]
+    elliott = [_row(pat_made=3, fg_made_30_39=1), _row(pat_made=3, fg_made_50_59=1)]
+    assert sum(_skill_player_fantasy_points(r) for r in santos) / 2 == 8.5
+    assert sum(_skill_player_fantasy_points(r) for r in elliott) / 2 == 7.0
+
+
+def test_kicking_columns_missing_or_nan_score_zero():
+    assert _skill_player_fantasy_points(_row(pat_made=float("nan"))) == 0.0
+    assert _skill_player_fantasy_points(_row()) == 0.0

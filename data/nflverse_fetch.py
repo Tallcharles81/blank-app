@@ -342,6 +342,34 @@ _HUNDRED_YARD_BONUS = 3
 _THREE_HUNDRED_YARD_PASSING_BONUS = 3
 
 
+# DK kicker scoring (Showdown is the only format with kickers): +1 per PAT
+# made, +3 for a FG of 0-39 yards, +4 for 40-49, +5 for 50+. Misses cost
+# nothing. Checked against DK's own AvgPointsPerGame on the PHI@CHI
+# 2026-09-28 salary file: Cairo Santos (8 PAT + a 40-49 FG, then 5 PAT) =
+# 8.5 avg, Jake Elliott (3 PAT + 30-39, then 3 PAT + 50-59) = 7.0 avg - both
+# exact. Before this, every kicker scored a flat 0.
+_KICKING_POINTS = {
+    "pat_made": 1,
+    "fg_made_0_19": 3,
+    "fg_made_20_29": 3,
+    "fg_made_30_39": 3,
+    "fg_made_40_49": 4,
+    "fg_made_50_59": 5,
+    "fg_made_60_": 5,
+}
+
+
+def _kicking_points(row):
+    # getattr/NaN guard: non-kickers carry NaN in these columns in some
+    # seasons' files, and older callers pass rows without them at all.
+    total = 0.0
+    for field, points in _KICKING_POINTS.items():
+        value = getattr(row, field, 0)
+        if value is not None and not pd.isna(value):
+            total += points * value
+    return total
+
+
 def _skill_player_fantasy_points(row):
     score = (
         0.04 * row.passing_yards
@@ -356,6 +384,7 @@ def _skill_player_fantasy_points(row):
         - 1 * row.fumbles_lost_total
         + 2 * (row.passing_2pt_conversions + row.rushing_2pt_conversions + row.receiving_2pt_conversions)
     )
+    score += _kicking_points(row)
     if row.passing_yards >= 300:
         score += _THREE_HUNDRED_YARD_PASSING_BONUS
     if row.rushing_yards >= 100:
