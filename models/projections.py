@@ -4,11 +4,13 @@ from collections import defaultdict
 
 from sqlalchemy import text
 
+from data.depth_charts import latest_depth_chart_by_player
 from data.nflverse_fetch import fetch_team_implied_totals, to_nflverse_team
-from data.player_availability import resolve_slate_season_week
+from data.player_availability import get_availability_gate, resolve_slate_season_week
 from data.player_crosswalk import resolve_dk_players_to_gsis
 from data.pre_lock_check import _load_recent_usage_batch
 from db.migrate import get_engine
+from models.playing_time_engine import promote_past_unavailable_qbs
 
 # player_weekly_stats.player_id is nflverse's GSIS ID (e.g. "00-0034857"), which
 # does not match slate_player_pool.player_id's DraftKings numeric ID (e.g.
@@ -269,6 +271,62 @@ def _load_recent_stats(player_ids, engine, max_weeks=MAX_HISTORY_WEEKS, before=N
     return {pid: [pts for _, pts in sorted(games)] for pid, games in fresh_players.items()}
 
 
+# A "start" for the promoted-backup projection below: a game he played at
+# least this share of offensive snaps. Mop-up and injury-relief cameos sit
+# well under it (Tyson Bagent's 2024-2026 relief games were 1-16%), while
+# his real 2023 starts were 96-100%.
+QB_START_MIN_SNAP_PCT = 0.80
+MIN_QB_STARTS_FOR_PROMOTION = 2
+
+
+def _load_qb_starts(gsis_ids, engine, before=None, min_snap_pct=QB_START_MIN_SNAP_PCT, max_games=MAX_HISTORY_WEEKS):
+    """{gsis_id: [DK points of his most recent real starts, most recent first]}."""
+    if not gsis_ids:
+        return {}
+    cutoff_sql = ""
+    params = {"ids": list(gsis_ids), "min_snap": min_snap_pct}
+    if before is not None:
+        cutoff_sql = "AND (season < :bs OR (season = :bs AND week < :bw))"
+        params["bs"], params["bw"] = before
+    query = text(
+        f"""
+        SELECT player_id, fantasy_points_ppr FROM player_weekly_stats
+        WHERE player_id = ANY(:ids) AND snap_pct >= :min_snap AND fantasy_points_ppr IS NOT NULL {cutoff_sql}
+        ORDER BY season DESC, week DESC
+        """
+    )
+    starts = defaultdict(list)
+    with engine.connect() as conn:
+        for row in conn.execute(query, params):
+            if len(starts[row.player_id]) < max_games:
+                starts[row.player_id].append(float(row.fantasy_points_ppr))
+    return dict(starts)
+
+
+def _promoted_starting_qbs(slate_id, players, gsis_by_dk_id, engine):
+    """gsis_ids of backup QBs who start this week because every QB above
+    them on the depth chart is ruled out (same rule the optimizer's
+    playing-time gate uses - see promote_past_unavailable_qbs).
+
+    Their normal recent-games projection is built from relief cameos, not
+    starts: Tyson Bagent (PHI@CHI 2026-09-28, Caleb Williams Out) projected
+    a 0.8 median off 2.16 / 0.80 / 1.78-point relief games, while his four
+    real 2023 starts averaged 13.4. Best-effort: any fetch failure just
+    returns no promotions, leaving the normal projection in place.
+    """
+    try:
+        season_week = resolve_slate_season_week(slate_id, engine)
+        if season_week is None:
+            return set()
+        excluded, _, _ = get_availability_gate(players, *season_week, engine)
+        unavailable = {gsis_by_dk_id[pid] for pid in excluded if gsis_by_dk_id.get(pid)}
+        depth_chart = latest_depth_chart_by_player(season_week[0])
+    except Exception:
+        return set()
+    promoted = promote_past_unavailable_qbs(depth_chart, unavailable)
+    return {gid for gid, e in promoted.items() if e.get("promoted_from_rank") and e["pos_rank"] == 1}
+
+
 def _missed_team_games(team_by_gsis, engine, before=None):
     """{gsis_id: k} - how many of the player's CURRENT team's games since his
     own last recorded game he sat out, counting only weeks strictly before
@@ -441,6 +499,9 @@ def generate_projections(slate_id, engine=None, use_dst_opponent_matchup_adjustm
         engine,
     )
 
+    promoted_qbs = _promoted_starting_qbs(slate_id, players, gsis_by_dk_id, engine)
+    qb_starts_by_gsis = _load_qb_starts(promoted_qbs, engine)
+
     # Real, current-week game-environment signal (see
     # GAME_ENVIRONMENT_CEILING_BOOST_PER_POINT) - best-effort per this
     # project's convention of wrapping external-data fetches in try/except:
@@ -481,6 +542,10 @@ def generate_projections(slate_id, engine=None, use_dst_opponent_matchup_adjustm
         for player in players:
             gsis_id = gsis_by_dk_id.get(player["player_id"])
             games = history_by_gsis.get(gsis_id) if gsis_id else None
+            starts = qb_starts_by_gsis.get(gsis_id, [])
+            if len(starts) >= MIN_QB_STARTS_FOR_PROMOTION:
+                # Starting this week - project from his real starts, not relief snaps.
+                games = starts
             if not games:
                 skipped_no_history.append(player["player_id"])
                 continue

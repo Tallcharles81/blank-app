@@ -4,6 +4,7 @@ from sqlalchemy import text
 from models.projections import (
     MAX_STALENESS_WEEKS,
     MISSED_TEAM_GAMES_MULTIPLIER,
+    _load_qb_starts,
     _load_recent_stats,
     _missed_team_games,
     _real_week_sequence,
@@ -112,38 +113,71 @@ def test_missed_team_games_multiplier_shrinks_with_more_games_missed():
 E2E_SLATE = "TEST_MISSED_GAMES_SLATE"
 
 
+def _a_wr_currently_missing_team_games(engine):
+    # Picked from live data rather than hardcoded: which WR is currently
+    # sitting out changes every time a new week is loaded (McMillan, the
+    # original pick, returned in 2026 week 3).
+    with engine.connect() as conn:
+        rows = conn.execute(text(
+            """
+            WITH last AS (
+                SELECT DISTINCT ON (player_id) player_id, player_name, team, season, week
+                FROM player_weekly_stats WHERE position = 'WR' AND season = 2026
+                ORDER BY player_id, season DESC, week DESC
+            )
+            SELECT l.player_id, l.player_name, l.team FROM last l
+            WHERE l.week < (SELECT MAX(week) FROM player_weekly_stats t WHERE t.team = l.team AND t.season = 2026)
+            ORDER BY l.player_id
+            """
+        )).fetchall()
+    for row in rows:
+        if _missed_team_games({row.player_id: row.team}, engine).get(row.player_id, 0) >= 1:
+            return row
+    pytest.skip("no WR currently missing team games in the loaded data")
+
+
 def test_generate_projections_discounts_a_player_who_missed_team_games(engine):
     # End-to-end on a throwaway slate (never a real one - rewriting a real
     # slate's stored projections would change historical data). No
     # game_time, so no Vegas adjustment muddies the comparison.
     from models.projections import _project_from_history, generate_projections
 
-    rows = [("E2E_MCMILLAN", "Jalen McMillan", MCMILLAN), ("E2E_EGBUKA", "Emeka Egbuka", EGBUKA)]
+    sitter = _a_wr_currently_missing_team_games(engine)
+    rows = [("E2E_SITTER", sitter.player_name, sitter.player_id, sitter.team), ("E2E_EGBUKA", "Emeka Egbuka", EGBUKA, "TB")]
     try:
         with engine.begin() as conn:
-            for dk_id, name, _ in rows:
+            for dk_id, name, _, team in rows:
                 conn.execute(
                     text(
                         "INSERT INTO slate_player_pool (slate_id, player_id, name, position, salary, team, opponent) "
-                        "VALUES (:s, :p, :n, 'WR', 5000, 'TB', 'ATL')"
+                        "VALUES (:s, :p, :n, 'WR', 5000, :t, 'ATL')"
                     ),
-                    {"s": E2E_SLATE, "p": dk_id, "n": name},
+                    {"s": E2E_SLATE, "p": dk_id, "n": name, "t": team},
                 )
         generate_projections(E2E_SLATE, engine=engine)
 
-        history = _load_recent_stats([MCMILLAN, EGBUKA], engine)
-        missed = _missed_team_games({MCMILLAN: "TB", EGBUKA: "TB"}, engine)
+        history = _load_recent_stats([sitter.player_id, EGBUKA], engine)
+        missed = _missed_team_games({sitter.player_id: sitter.team, EGBUKA: "TB"}, engine)
         with engine.connect() as conn:
             stored = dict(conn.execute(
                 text("SELECT player_id, proj_median FROM projections WHERE slate_id = :s"), {"s": E2E_SLATE}
             ).fetchall())
 
-        assert missed[MCMILLAN] >= 1 and missed[EGBUKA] == 0
-        expected_mcmillan = _project_from_history(history[MCMILLAN], "WR")["proj_median"]
-        expected_mcmillan *= MISSED_TEAM_GAMES_MULTIPLIER[min(missed[MCMILLAN], 4)]
-        assert float(stored["E2E_MCMILLAN"]) == pytest.approx(expected_mcmillan, abs=0.02)
+        assert missed[sitter.player_id] >= 1 and missed[EGBUKA] == 0
+        if sitter.player_id not in history:
+            pytest.skip(f"{sitter.player_name}'s history is past the staleness cutoff - nothing to discount")
+        expected = _project_from_history(history[sitter.player_id], "WR")["proj_median"]
+        expected *= MISSED_TEAM_GAMES_MULTIPLIER[min(missed[sitter.player_id], 4)]
+        assert float(stored["E2E_SITTER"]) == pytest.approx(expected, abs=0.02)
         assert float(stored["E2E_EGBUKA"]) == pytest.approx(_project_from_history(history[EGBUKA], "WR")["proj_median"], abs=0.02)
     finally:
         with engine.begin() as conn:
             conn.execute(text("DELETE FROM projections WHERE slate_id = :s"), {"s": E2E_SLATE})
             conn.execute(text("DELETE FROM slate_player_pool WHERE slate_id = :s"), {"s": E2E_SLATE})
+
+
+def test_promoted_backup_qb_is_projected_from_his_real_starts_only(engine):
+    # Tyson Bagent (00-0038416): four 2023 starts at 96-100% snaps, plus
+    # 1-16% relief cameos in 2024-2026 that must not count as starts.
+    starts = _load_qb_starts({"00-0038416"}, engine, before=(2026, 3))
+    assert starts["00-0038416"] == [7.68, 19.80, 13.18, 12.88]
