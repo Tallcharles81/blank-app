@@ -105,6 +105,20 @@ estimates — see that module's docstring for why most real contests only
 have a partial curve on record, and why that's tracked explicitly rather
 than guessed at.
 
+## Research (not wired into the optimizer)
+
+`research/` holds offline studies that must prove themselves out-of-sample
+before anything they find touches live projections. Currently:
+defensive production redistribution (does a defense shift targets/carries
+between WR1/WR2/WR3/TE/RB roles?). It downloads nflverse data into a
+gitignored `.cache/`, never touches the database, and writes its results
+and report to `research/output/`:
+
+```
+python scripts/run_redistribution_research.py
+python -m research.redistribution_report
+```
+
 ## Testing / CI
 
 ```
