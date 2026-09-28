@@ -19,6 +19,7 @@ from data.pre_lock_check import (
 )
 from db.migrate import get_engine
 from models.field_simulation import ownership_proxy
+from models.optimizer import SALARY_CAP
 from models.simulation import _standard_normal_cdf
 
 # ---------------------------------------------------------------------------
@@ -146,6 +147,39 @@ def parse_contest_standings_csv(csv_path):
     return result, skipped, is_showdown
 
 
+# Share of a Classic contest's sampled real lineups allowed to price above
+# the salary cap under the target slate's salaries before the import is
+# refused. A correct match prices ~0% over (every real entry was legal);
+# contests 193028208/193028210 - week-1 contests once imported against the
+# week-2 dk_thu_mon_2026_09_17 pool by name - priced 99% over.
+MAX_OVER_CAP_SHARE = 0.05
+_LINEUP_SAMPLE_SIZE = 500
+_CLASSIC_SLOT_RE = re.compile(r"\s*\b(QB|RB|WR|TE|FLEX|DST)\s+")
+
+
+def _share_of_lineups_over_cap(csv_path, pool_by_name, salary_cap):
+    """(lineups_checked, share_over_cap) for the first _LINEUP_SAMPLE_SIZE
+    fully-matched Classic lineups in a contest export, priced with
+    pool_by_name's salaries. Lineups with any name missing from the pool
+    are skipped rather than guessed at.
+    """
+    checked = over = 0
+    with open(csv_path, encoding="utf-8-sig") as f:
+        for row in csv.DictReader(f):
+            lineup = (row.get("Lineup") or "").strip()
+            if not lineup:
+                continue
+            names = [n.strip() for n in _CLASSIC_SLOT_RE.split(" " + lineup)[2::2]]
+            if len(names) != 9 or any(n not in pool_by_name for n in names):
+                continue
+            checked += 1
+            if sum(pool_by_name[n]["salary"] for n in names) > salary_cap:
+                over += 1
+            if checked >= _LINEUP_SAMPLE_SIZE:
+                break
+    return checked, (over / checked if checked else 0.0)
+
+
 def import_contest_standings(csv_path, slate_id, contest_id, engine=None):
     """Match a real, parsed contest-standings export against slate_id's real
     slate_player_pool (by name - both sides are DK's own naming, so an exact
@@ -204,6 +238,15 @@ def import_contest_standings(csv_path, slate_id, contest_id, engine=None):
             if slate_pool_is_showdown and row["position"] != "FLEX":
                 continue
             pool_by_name[name] = dict(row)
+
+        if not is_showdown and not slate_pool_is_showdown:
+            checked, over_share = _share_of_lineups_over_cap(csv_path, pool_by_name, SALARY_CAP)
+            if checked and over_share > MAX_OVER_CAP_SHARE:
+                raise ValueError(
+                    f"contest {contest_id} doesn't look like slate {slate_id}: {over_share:.0%} of {checked} "
+                    f"real entered lineups price above the ${SALARY_CAP:,} cap at this slate's salaries "
+                    "(a correct match is ~0%) - likely a different week's contest"
+                )
 
         proj_rows = conn.execute(
             text("SELECT player_id, proj_median FROM projections WHERE slate_id = :slate_id"),

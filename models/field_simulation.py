@@ -75,10 +75,12 @@ DEFAULT_CONTEST_SIZE = 100
 # First real calibration evidence, now that a fitted ownership model exists
 # (models/ownership_model.py): on dk_sunday_2026_09_27 (week 3, held out of
 # the model's training), a 500-opponent simulated field's per-player
-# selection rate was compared against that slate's real %Drafted:
-#   fitted model weights:  conc 0.5 rho 0.647 MAE 3.47 | 1.0 rho 0.673 MAE 3.16
-#                          conc 2.0 rho 0.652 MAE 3.16 | 3.0 rho 0.610 MAE 3.45
-#   calibrated proxy best: conc 2.0 rho 0.466 MAE 3.64
+# selection rate was compared against that slate's real %Drafted (averaged
+# over its 2 imported contests; model trained on week 2 only, after the
+# week-1 mislabeled contests were removed):
+#   fitted model weights:  conc 0.5 rho 0.631 MAE 3.28 | 1.0 rho 0.657 MAE 3.05
+#                          conc 2.0 rho 0.610 MAE 3.43 | 3.0 rho 0.528 MAE 4.12
+#   calibrated proxy best: conc 2.0 rho 0.482 MAE 3.55
 # 1.0 is the best setting for the fitted model, so it stays - now with one
 # real held-out week behind it rather than none. One week is not settled;
 # re-check as more contests are imported. This says nothing about whether
@@ -147,12 +149,25 @@ def ownership_proxy(players):
 # accumulate, per this module's own accumulating-dataset design; re-run
 # data/ownership_calibration.py's summarize_ownership_calibration (Classic
 # slates only) before assuming these are still current.
+#
+# CORRECTION (supersedes the history above): the "dk_thu_mon_2026_09_17"
+# contests (193028208/193028210) were actually WEEK-1 contests - their FPTS
+# match week-1 box scores, and their real lineups price 99% over the salary
+# cap at week-2 salaries - matched by name against the week-2 pool. They
+# have been unlinked from that slate (see contest_ownership.unmatched_reason)
+# and import_contest_standings now refuses a pool whose salaries don't fit
+# the contest's real lineups. Recomputed from the remaining, correctly
+# matched Classic contests (dk_sunday_2026_09_20 x4, dk_sunday_2026_09_27
+# x2; n=156-739/position), pooled:
+#   QB 1.15 RB 2.51 WR 1.96 TE 1.32 DST 2.05
+# per slate: 09_20 QB 1.20 RB 2.60 WR 1.97 TE 1.29 DST 2.08;
+#            09_27 QB 1.08 RB 2.33 WR 1.93 TE 1.37 DST 1.99
 POSITION_OWNERSHIP_CALIBRATION = {
-    "QB": 1.19,
-    "RB": 2.55,
-    "WR": 2.00,
-    "TE": 1.28,
-    "DST": 2.17,
+    "QB": 1.15,
+    "RB": 2.51,
+    "WR": 1.96,
+    "TE": 1.32,
+    "DST": 2.05,
 }
 
 

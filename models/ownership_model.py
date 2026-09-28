@@ -31,12 +31,13 @@ from db.migrate import get_engine
 # finding behind the old proxy's biggest miss: at equal projection, the
 # field rosters the more EXPENSIVE player more, not less.
 #
-# Real, disclosed limits of the training data, as of this module's first
-# fit: 3 Classic slates across only 2 real NFL weeks (dk_thu_mon_2026_09_17
-# and dk_sunday_2026_09_20 are the same week 2 - the Sunday slate's games
-# are a subset of the Thu-Mon slate's). Held-out validation is therefore
-# leave-one-WEEK-out (2 folds), not leave-one-slate-out, so the same real
-# player outcomes never appear on both sides of a split. Showdown slates are
+# Real, disclosed limits of the training data: 2 Classic slates, one per
+# real NFL week (dk_sunday_2026_09_20 = week 2, dk_sunday_2026_09_27 = week
+# 3), 6 contests total. Contests once filed under dk_thu_mon_2026_09_17
+# turned out to be week-1 contests matched against week-2 salaries and have
+# been unlinked (see models/field_simulation.py's POSITION_OWNERSHIP_
+# CALIBRATION correction note). Validation is leave-one-WEEK-out, so the
+# same real player outcomes never appear on both sides of a split. Showdown slates are
 # excluded entirely - see POSITION_OWNERSHIP_CALIBRATION's comment in
 # models/field_simulation.py for why Showdown ownership isn't comparable.
 # Re-run backtest_ownership_model() as more weeks are imported.

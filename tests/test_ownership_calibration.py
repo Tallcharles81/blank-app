@@ -7,6 +7,7 @@ from data.ownership_calibration import (
     MIN_MATCHED_PLAYERS_FOR_CORRELATION,
     _classify_qb_starter_certainty,
     _rank,
+    _share_of_lineups_over_cap,
     _spearman,
     analyze_qb_ownership_gap,
     import_contest_standings,
@@ -159,6 +160,33 @@ def test_import_contest_standings_upsert_does_not_duplicate(engine, imported_con
     assert count == 4
 
 
+def _write_lineup_csv(path, lineups):
+    with open(path, "w", newline="", encoding="utf-8-sig") as f:
+        writer = csv.writer(f)
+        writer.writerow(["Rank", "EntryId", "EntryName", "TimeRemaining", "Points", "Lineup", "", "Player", "Roster Position", "%Drafted", "FPTS"])
+        for i, lu in enumerate(lineups, start=1):
+            writer.writerow([i, i, f"e{i}", 0, 100.0, lu, "", "", "", "", ""])
+
+
+def test_import_contest_standings_refuses_a_wrong_week_slate(tmp_path):
+    # Regression for a real incident: week-1 contests 193028208/193028210
+    # were imported by name against the week-2 dk_thu_mon_2026_09_17 pool.
+    # Same players, different week's prices - 99% of their real entered
+    # lineups priced over the $50,000 cap. A correct pool prices ~0% over.
+    names = ["Al", "Bo", "Cy", "Di", "Ed", "Fy", "Gus", "Hal", "Iowa"]
+    lineup = "DST Iowa  FLEX Hal QB Al RB Bo RB Cy TE Gus WR Di WR Ed WR Fy"
+    path = tmp_path / "contest-standings-GUARD.csv"
+    _write_lineup_csv(path, [lineup] * 30)
+
+    fits = {n: {"salary": 5500} for n in names}  # 49,500 total
+    too_expensive = {n: {"salary": 5600} for n in names}  # 50,400 total
+    assert _share_of_lineups_over_cap(str(path), fits, 50000) == (30, 0.0)
+    assert _share_of_lineups_over_cap(str(path), too_expensive, 50000) == (30, 1.0)
+    # A lineup with a name the pool doesn't have is skipped, not guessed at.
+    del fits["Gus"]
+    assert _share_of_lineups_over_cap(str(path), fits, 50000) == (0, 0.0)
+
+
 TEST_SHOWDOWN_CONTEST_ID = "TEST_CONTEST_OWNERSHIP_SHOWDOWN"
 
 
@@ -302,16 +330,17 @@ def test_run_ownership_correlation_test_reports_too_small_a_sample(engine, impor
 
 
 def test_run_ownership_correlation_test_uses_the_same_intersected_sample_for_both_bases(engine):
-    # Uses the real, permanently-imported contest 193028208 (a real DK
-    # contest-standings export the user actually entered, imported against
-    # dk_thu_mon_2026_09_17 and kept in this dev DB as real accumulating
-    # calibration data - see data/ownership_calibration.py's module
-    # docstring) rather than a synthetic fixture, the same real-fixture-
-    # dependency pattern tests/test_pre_lock_check.py's
+    # Uses the real, permanently-imported contest 195661349 (a real DK
+    # contest-standings export the user actually entered, on
+    # dk_sunday_2026_09_20, kept in this dev DB as real accumulating
+    # calibration data) rather than a synthetic fixture, the same real-
+    # fixture-dependency pattern tests/test_pre_lock_check.py's
     # test_hard_role_exclusions_survives_real_stars_and_catches_real_winston
     # already uses: if this contest is ever removed from the dev DB, this
     # test needs updating; the synthetic-fixture tests above cover the same
-    # intersection logic without that dependency.
+    # intersection logic without that dependency. (This used 193028208
+    # until that contest turned out to be week 1 matched against week-2
+    # salaries - see test_import_contest_standings_refuses_a_wrong_week_slate.)
     #
     # Regression test for a real bug caught before ever reporting a result:
     # an earlier version ran realized_fpts over every matched row with
@@ -319,7 +348,7 @@ def test_run_ownership_correlation_test_uses_the_same_intersected_sample_for_bot
     # (larger) sample than proj_median's - which would make "realized_fpts
     # scored a higher rho" potentially just an artifact of an easier sample,
     # not a real head-to-head result. Both bases must report the same n.
-    result = run_ownership_correlation_test("193028208", slate_id="dk_thu_mon_2026_09_17", engine=engine, store=False)
+    result = run_ownership_correlation_test("195661349", slate_id="dk_sunday_2026_09_20", engine=engine, store=False)
     assert result["proj_median"]["n"] == result["realized_fpts"]["n"]
     # The full, non-intersected sample is real too, but must be clearly a
     # different (larger or equal) size, never silently conflated with the
@@ -371,29 +400,28 @@ def test_classify_qb_starter_certainty_uncertain_other():
 
 
 def test_analyze_qb_ownership_gap_runs_on_real_contest_and_reports_every_category(engine):
-    # Uses the real, permanently-imported contest 193028208 - see the
+    # Uses the real, permanently-imported contest 195661349 - see the
     # comment on test_run_ownership_correlation_test_uses_the_same_
     # intersected_sample_for_both_bases above for why this dependency is
     # deliberate, matching this codebase's existing real-fixture-dependent
     # test pattern.
-    result = analyze_qb_ownership_gap("193028208", slate_id="dk_thu_mon_2026_09_17", engine=engine)
+    result = analyze_qb_ownership_gap("195661349", slate_id="dk_sunday_2026_09_20", engine=engine)
 
     assert len(result["qbs"]) >= MIN_MATCHED_PLAYERS_FOR_CORRELATION  # a real, non-trivial number of real QBs
     for qb in result["qbs"]:
         assert qb["starter_certainty"] in {"thin_data", "intermittent_backup_pattern", "clean_starter", "uncertain_other"}
 
     summary = result["summary_by_starter_certainty"]
-    # Real result on this contest: starter uncertainty is a REAL contributing
-    # factor (intermittent-backup QBs show a clearly more negative mean
-    # rank_diff than clean starters) but does NOT explain most of QB's
-    # overall bias - clean, obviously-certain starters still carry a
-    # substantial negative rank_diff of their own. Asserting the direction
-    # (backups worse than clean starters) since that's the real, structural
-    # relationship; not asserting exact numbers, which will shift as more
-    # contests are added to this same real dev-DB fixture over time.
+    # Structure only, deliberately no direction: an earlier version asserted
+    # backup-pattern QBs carry a more negative rank_diff than clean starters,
+    # based on contest 193028208 - which turned out to be a week-1 contest
+    # matched against week-2 salaries. On correctly matched contests the
+    # direction doesn't replicate: 195661349 (week 2) backups -88.5 vs clean
+    # -64.1, but 195921961 (week 3) backups -72.3 vs clean -85.4 (n=4
+    # backups). Starter uncertainty is not an established explanation of
+    # QB's ownership bias.
     assert "clean_starter" in summary
     assert "intermittent_backup_pattern" in summary
-    assert summary["intermittent_backup_pattern"]["mean_rank_diff"] < summary["clean_starter"]["mean_rank_diff"]
 
 
 # --- summarize_ownership_calibration ---------------------------------------
@@ -419,12 +447,12 @@ def test_summarize_ownership_calibration_reports_per_contest_not_pooled(engine, 
 
 
 def test_summarize_ownership_calibration_flags_shared_slate_ids(engine):
-    # Uses the real permanently-imported contests 193028208/193028210 (both
-    # on dk_thu_mon_2026_09_17) - same real-fixture-dependency pattern as
+    # Uses the real permanently-imported contests 195661349/195661326 (both
+    # on dk_sunday_2026_09_20) - same real-fixture-dependency pattern as
     # the other tests above that rely on this session's real imported data.
     result = summarize_ownership_calibration(engine=engine)
     proj_basis = result["proj_median"]
-    real_contests = [c for c in proj_basis["contests"] if c["contest_id"] in ("193028208", "193028210")]
+    real_contests = [c for c in proj_basis["contests"] if c["contest_id"] in ("195661349", "195661326")]
     assert len(real_contests) == 2
     # Both real contests share the same real slate_id - distinct_slate_ids_with_data
     # must reflect that they are NOT independent weeks, not silently count them as two.
