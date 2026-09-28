@@ -124,9 +124,12 @@ would need a real seed-data strategy, which doesn't exist yet.
 
 ## Known limitations (the honest state, not a wish list)
 
-- **No live ownership feed.** Every "ownership" number in this codebase is
-  `ownership_proxy` (points-per-$1000 salary, position-calibrated against
-  real contest data) standing in for it — see `models/field_simulation.py`.
+- **No live ownership feed.** Lineup construction and field simulation
+  still use `ownership_proxy` (points-per-$1000 salary, position-calibrated
+  against real contest data) — see `models/field_simulation.py`. A fitted
+  ownership model (`models/ownership_model.py`, trained on imported real DK
+  %Drafted) beats that proxy on held-out weeks but is not wired into lineup
+  construction yet, and has only 2 real NFL weeks of training data so far.
 - **Field-simulation concentration is uncalibrated** (`DEFAULT_CONCENTRATION`
   in `models/field_simulation.py`) — there isn't enough real ownership data
   yet to know what value matches a real DK field's actual duplication.
