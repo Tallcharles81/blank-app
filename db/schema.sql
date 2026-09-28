@@ -258,3 +258,47 @@ CREATE TABLE IF NOT EXISTS contest_payout_tiers (
 
 CREATE INDEX IF NOT EXISTS idx_contest_payout_tiers_contest_id
     ON contest_payout_tiers (contest_id);
+
+-- Every lineup DK Edge builds for the user, tagged by how it was built
+-- (build_group, e.g. 'optimizer' vs 'simulator'), so construction methods
+-- can be compared on real contest results - see data/lineup_tracking.py.
+-- Not tied to slate_player_pool by a foreign key: names are stored so a
+-- lineup can be scored straight from a contest-standings export, which
+-- identifies players by name only.
+CREATE TABLE IF NOT EXISTS built_lineups (
+    slate_id     TEXT NOT NULL,
+    build_id     TEXT NOT NULL,
+    lineup_id    TEXT NOT NULL,
+    build_group  TEXT NOT NULL,
+    detail       TEXT,
+    slots        TEXT[] NOT NULL,
+    player_ids   TEXT[] NOT NULL,
+    names        TEXT[] NOT NULL,
+    export_file  TEXT,
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (slate_id, build_id, lineup_id)
+);
+
+-- Each built lineup's real result in each real contest on its slate,
+-- scored from that contest's own standings export (official per-player
+-- FPTS, Captain rows included) whether or not it was actually entered.
+-- finish_pct = finish_rank / field_size (lower is better). times_entered
+-- counts the user's entries in that contest using exactly this lineup.
+CREATE TABLE IF NOT EXISTS lineup_contest_results (
+    contest_id       TEXT NOT NULL,
+    slate_id         TEXT NOT NULL,
+    build_id         TEXT NOT NULL,
+    lineup_id        TEXT NOT NULL,
+    build_group      TEXT NOT NULL,
+    points           NUMERIC(7, 2) NOT NULL,
+    finish_rank      INTEGER NOT NULL,
+    field_size       INTEGER NOT NULL,
+    finish_pct       NUMERIC(6, 4) NOT NULL,
+    missing_players  INTEGER NOT NULL DEFAULT 0,
+    times_entered    INTEGER NOT NULL DEFAULT 0,
+    scored_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (contest_id, build_id, lineup_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_lineup_contest_results_slate
+    ON lineup_contest_results (slate_id);

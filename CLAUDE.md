@@ -42,3 +42,23 @@ naming which of two successive exports (19-lineup vs. 20-lineup) it
 described, which the user reasonably read as contradicting a later,
 correct report on the newer file. This applies every time a new version of
 a file is generated, not just DK lineup exports.
+
+## Standing workflow: tag every build by method (optimizer vs simulator)
+
+Every lineup file built for the user is exported through
+`data.lineup_tracking.export_grouped_lineups(slate_id, build_id, groups, path)`
+with groups named `"optimizer"` (raw `generate_lineups` picks) and
+`"simulator"` (`generate_simulation_selected_lineup` picks), never
+`write_dk_upload_csv` directly - so each lineup is registered in
+`built_lineups` with its method. Tell the user which file holds which group.
+
+When contest standings are uploaded, import them with
+`bulk_import_contest_standings` (it scores every registered build on that
+slate automatically), then report `compare_build_groups()` - name the
+contest and file, give each group's average points and finish percentile,
+and say which of the user's entries came from which group (late swaps are
+reported as edited). The verdict stays INSUFFICIENT SAMPLE until
+`MIN_SLATES_FOR_VERDICT` slates; until then, don't present either method as
+better. Once it isn't, this is the "larger batch of real contest data" the
+simulator-default section above refers to: report it plainly either way.
+Seeded with dk_showdown_nyg_lar_2026_09_21 and dk_sunday_2026_09_27.

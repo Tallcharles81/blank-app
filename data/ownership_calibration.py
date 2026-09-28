@@ -9,6 +9,7 @@ from collections import defaultdict
 
 from sqlalchemy import text
 
+from data.lineup_tracking import score_builds_against_contest
 from data.player_availability import resolve_slate_season_week
 from data.player_crosswalk import resolve_dk_players_to_gsis
 from data.pre_lock_check import (
@@ -527,6 +528,13 @@ def bulk_import_contest_standings(folder_path, slate_id=None, slate_id_by_contes
                 continue
 
             result = import_contest_standings(csv_path, resolved_slate_id, contest_id, engine=engine)
+            # Score any tracked builds (optimizer vs simulator etc.) for this
+            # slate while the CSV is still on disk. Best-effort: a scoring
+            # problem must not undo or block the ownership import.
+            try:
+                result["build_scoring"] = score_builds_against_contest(csv_path, resolved_slate_id, contest_id, engine=engine)
+            except Exception as exc:
+                result["build_scoring"] = {"error": str(exc)}
             imported.append({"contest_id": contest_id, "slate_id": resolved_slate_id, **result})
             seen_contest_ids.add(contest_id)
         finally:
