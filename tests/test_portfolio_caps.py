@@ -1,9 +1,7 @@
-import pytest
-
 from models.optimizer import (
+    _load_player_pool,
     build_lineups_from_pool,
     select_portfolio_within_caps,
-    _load_player_pool,
 )
 
 # Regression coverage for a real incident: a 20-lineup export built from four
@@ -43,7 +41,7 @@ def test_select_portfolio_drops_an_exact_duplicate_even_with_slots_reordered():
     lineup_dup = _synthetic_lineup(dup_roster, points=140.0)
     lineup_b = _synthetic_lineup(b_roster, points=130.0)
 
-    selected, rejected, state = select_portfolio_within_caps(
+    selected, rejected, _state = select_portfolio_within_caps(
         [lineup_a, lineup_dup, lineup_b], target_count=3
     )
 
@@ -64,7 +62,7 @@ def test_select_portfolio_enforces_a_real_hard_exposure_cap_across_all_candidate
         roster = [("QB", _player("star", salary=8000))] + [(f"slot{j}", _player(f"c{i}_{j}")) for j in range(8)]
         candidates.append(_synthetic_lineup(roster, points=100.0 - i))
 
-    selected, rejected, state = select_portfolio_within_caps(candidates, target_count=5, max_exposure=0.4)
+    selected, rejected, _state = select_portfolio_within_caps(candidates, target_count=5, max_exposure=0.4)
 
     star_count = sum(1 for lu in selected for _, p in lu["roster"] if p["player_id"] == "star")
     assert star_count == 2  # floor(0.4 * 5)
@@ -84,7 +82,7 @@ def test_select_portfolio_accepts_a_per_player_exposure_dict_and_reports_a_real_
         roster = [("QB", _player("star", salary=8000))] + [(f"slot{j}", _player(f"c{i}_{j}")) for j in range(8)]
         candidates.append(_synthetic_lineup(roster, points=100.0 - i))
 
-    selected, rejected, state = select_portfolio_within_caps(
+    selected, rejected, _state = select_portfolio_within_caps(
         candidates, target_count=4, max_exposure={"default": 0.25, "star": 0.75}
     )
 
@@ -112,7 +110,7 @@ def test_select_portfolio_state_threads_across_sequential_calls_against_a_shared
         bucket2.append(_synthetic_lineup(roster, points=190.0 - i))
 
     state = None
-    selected1, rejected1, state = select_portfolio_within_caps(
+    selected1, _rejected1, state = select_portfolio_within_caps(
         bucket1, target_count=5, max_exposure=0.4, total_portfolio_size=10, state=state
     )
     # 40% of 10 = 4 - bucket 1 alone should already hit that real cap on "core".
@@ -142,7 +140,7 @@ def test_select_portfolio_with_real_solver_built_lineups_has_no_duplicates_or_ov
     raw_b, _ = build_lineups_from_pool(list(players), num_lineups=30, min_uniques=4, max_exposure=0.35)
 
     combined = raw_a + raw_b  # simulates two independent real generation calls, unaware of each other
-    selected, rejected, state = select_portfolio_within_caps(combined, target_count=10, max_exposure=0.4)
+    selected, _rejected, _state = select_portfolio_within_caps(combined, target_count=10, max_exposure=0.4)
 
     # >= 9, not a razor-exact 10: real headroom right at this margin varies
     # run to run by the same real margin build_lineups_from_pool's own
