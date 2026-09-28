@@ -1,8 +1,11 @@
+import pytest
 from sqlalchemy import text
 
 from models.projections import (
     MAX_STALENESS_WEEKS,
+    MISSED_TEAM_GAMES_MULTIPLIER,
     _load_recent_stats,
+    _missed_team_games,
     _real_week_sequence,
     _staleness_reference_week,
 )
@@ -74,3 +77,73 @@ def test_load_recent_stats_drops_a_player_stale_beyond_the_threshold(engine):
                 text("DELETE FROM player_weekly_stats WHERE player_id IN (:a, :b)"),
                 {"a": TEST_STALE_ID, "b": TEST_FRESH_ID},
             )
+
+
+# --- missed team games (MISSED_TEAM_GAMES_MULTIPLIER) ----------------------
+# Real players/weeks from the dev DB's 2025-2026 player_weekly_stats. Jalen
+# McMillan (TB) last played 2025 week 18 and recorded nothing in 2026 weeks
+# 1-2, yet was projected from his 2025 games at full strength - the case
+# this discount exists for.
+MCMILLAN, EGBUKA, ZAY, EVANS = "00-0039855", "00-0040129", "00-0039064", "00-0031408"
+
+
+def test_missed_team_games_counts_consecutive_team_games_sat_out(engine):
+    teams = {MCMILLAN: "TB", EGBUKA: "TB", ZAY: "BAL", EVANS: "SF"}
+    before_week2 = _missed_team_games(teams, engine, before=(2026, 2))
+    before_week3 = _missed_team_games(teams, engine, before=(2026, 3))
+
+    assert before_week2[MCMILLAN] == 1
+    assert before_week3[MCMILLAN] == 2
+    assert before_week3[EGBUKA] == 0
+    assert before_week2[ZAY] == 0  # played week 1
+    assert before_week3[ZAY] == 1  # sat out week 2
+    # Counted against his CURRENT team (traded TB -> SF, played both 2026
+    # weeks), not the old team's schedule.
+    assert before_week3[EVANS] == 0
+
+
+def test_missed_team_games_multiplier_shrinks_with_more_games_missed():
+    values = [MISSED_TEAM_GAMES_MULTIPLIER[k] for k in sorted(MISSED_TEAM_GAMES_MULTIPLIER)]
+    assert sorted(MISSED_TEAM_GAMES_MULTIPLIER) == [1, 2, 3, 4]
+    assert all(0 < v < 1 for v in values)
+    assert values == sorted(values, reverse=True)
+
+
+E2E_SLATE = "TEST_MISSED_GAMES_SLATE"
+
+
+def test_generate_projections_discounts_a_player_who_missed_team_games(engine):
+    # End-to-end on a throwaway slate (never a real one - rewriting a real
+    # slate's stored projections would change historical data). No
+    # game_time, so no Vegas adjustment muddies the comparison.
+    from models.projections import _project_from_history, generate_projections
+
+    rows = [("E2E_MCMILLAN", "Jalen McMillan", MCMILLAN), ("E2E_EGBUKA", "Emeka Egbuka", EGBUKA)]
+    try:
+        with engine.begin() as conn:
+            for dk_id, name, _ in rows:
+                conn.execute(
+                    text(
+                        "INSERT INTO slate_player_pool (slate_id, player_id, name, position, salary, team, opponent) "
+                        "VALUES (:s, :p, :n, 'WR', 5000, 'TB', 'ATL')"
+                    ),
+                    {"s": E2E_SLATE, "p": dk_id, "n": name},
+                )
+        generate_projections(E2E_SLATE, engine=engine)
+
+        history = _load_recent_stats([MCMILLAN, EGBUKA], engine)
+        missed = _missed_team_games({MCMILLAN: "TB", EGBUKA: "TB"}, engine)
+        with engine.connect() as conn:
+            stored = dict(conn.execute(
+                text("SELECT player_id, proj_median FROM projections WHERE slate_id = :s"), {"s": E2E_SLATE}
+            ).fetchall())
+
+        assert missed[MCMILLAN] >= 1 and missed[EGBUKA] == 0
+        expected_mcmillan = _project_from_history(history[MCMILLAN], "WR")["proj_median"]
+        expected_mcmillan *= MISSED_TEAM_GAMES_MULTIPLIER[min(missed[MCMILLAN], 4)]
+        assert float(stored["E2E_MCMILLAN"]) == pytest.approx(expected_mcmillan, abs=0.02)
+        assert float(stored["E2E_EGBUKA"]) == pytest.approx(_project_from_history(history[EGBUKA], "WR")["proj_median"], abs=0.02)
+    finally:
+        with engine.begin() as conn:
+            conn.execute(text("DELETE FROM projections WHERE slate_id = :s"), {"s": E2E_SLATE})
+            conn.execute(text("DELETE FROM slate_player_pool WHERE slate_id = :s"), {"s": E2E_SLATE})

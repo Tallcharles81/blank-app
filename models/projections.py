@@ -26,6 +26,20 @@ MAX_HISTORY_WEEKS = 10
 # (exactly the Christian McCaffrey 2024/Brandon Aiyuk case this was added
 # for - see _load_recent_stats).
 MAX_STALENESS_WEEKS = 4
+# Projection multiplier for a player who sat out his team's most recent k
+# games (k = 1..4; more than MAX_STALENESS_WEEKS already drops his history)
+# but still passes the availability gate - not IR/Out/Doubtful. Measured on
+# 2024-2025 regular seasons (models/projections.py's own history window):
+# such players played only 58%/42%/33%/31% as often as everyone else, and
+# scored 0.586/0.375/0.367/0.274x what their history projected (relative to
+# players with k=0). When they did play they produced ~normally, so this is
+# missed games, not reduced roles. Fit on 2024 alone and applied to 2025,
+# it cut these players' projection error 3.11 -> 2.07 pts (n=1,726) and
+# removed a +2 pt over-projection. Caught for real: Jalen McMillan (no 2026
+# games) carried a 32-pt ceiling at $4,400 into 10 of 20 lineups and
+# scored 0 in weeks 2 and 3; rebuilding those slates with this discount
+# raised mean lineup score +5.1 (week 2) and +6.6 (week 3).
+MISSED_TEAM_GAMES_MULTIPLIER = {1: 0.586, 2: 0.375, 3: 0.367, 4: 0.274}
 MIN_GAMES_FOR_OWN_VARIANCE = 3
 # Recent weeks matter more than older ones - an exponential decay with a 4-week
 # half-life weights last week roughly 1.19x more than 4 weeks ago.
@@ -255,6 +269,45 @@ def _load_recent_stats(player_ids, engine, max_weeks=MAX_HISTORY_WEEKS, before=N
     return {pid: [pts for _, pts in sorted(games)] for pid, games in fresh_players.items()}
 
 
+def _missed_team_games(team_by_gsis, engine, before=None):
+    """{gsis_id: k} - how many of the player's CURRENT team's games since his
+    own last recorded game he sat out, counting only weeks strictly before
+    `before` (or all loaded weeks in live mode). A team "played" a week if
+    any of its players has a stats row that week, so bye weeks never count.
+    Players with no recorded game at all are omitted (they have no history
+    to discount). `team_by_gsis` values are nflverse team codes.
+    """
+    if not team_by_gsis:
+        return {}
+    cutoff_sql = ""
+    params = {"gsis_ids": list(team_by_gsis), "teams": sorted(set(team_by_gsis.values()))}
+    if before is not None:
+        cutoff_sql = "AND (season < :before_season OR (season = :before_season AND week < :before_week))"
+        params["before_season"], params["before_week"] = before
+    with engine.connect() as conn:
+        last_games = conn.execute(
+            text(
+                f"""
+                SELECT player_id, max(season * 100 + week) AS last_sw FROM player_weekly_stats
+                WHERE player_id = ANY(:gsis_ids) AND fantasy_points_ppr IS NOT NULL {cutoff_sql}
+                GROUP BY player_id
+                """
+            ),
+            params,
+        ).fetchall()
+        team_weeks = conn.execute(
+            text(f"SELECT DISTINCT team, season * 100 + week AS sw FROM player_weekly_stats WHERE team = ANY(:teams) {cutoff_sql}"),
+            params,
+        ).fetchall()
+    weeks_by_team = defaultdict(list)
+    for team, sw in team_weeks:
+        weeks_by_team[team].append(sw)
+    return {
+        gsis_id: sum(1 for sw in weeks_by_team.get(team_by_gsis[gsis_id], []) if sw > last_sw)
+        for gsis_id, last_sw in last_games
+    }
+
+
 def _weighted_median(games_most_recent_first):
     # This used to compute a weighted MEAN despite the name. Fantasy scores
     # are right-skewed (a few boom games among many modest ones - see
@@ -379,6 +432,14 @@ def generate_projections(slate_id, engine=None, use_dst_opponent_matchup_adjustm
     usage_by_gsis = _load_recent_usage_batch(
         [gid for gid in gsis_by_dk_id.values() if gid is not None and not gid.startswith("DST_")], engine
     )
+    missed_games_by_gsis = _missed_team_games(
+        {
+            gsis_id: to_nflverse_team(player["team"])
+            for player in players
+            if (gsis_id := gsis_by_dk_id.get(player["player_id"])) and not gsis_id.startswith("DST_")
+        },
+        engine,
+    )
 
     # Real, current-week game-environment signal (see
     # GAME_ENVIRONMENT_CEILING_BOOST_PER_POINT) - best-effort per this
@@ -430,6 +491,9 @@ def generate_projections(slate_id, engine=None, use_dst_opponent_matchup_adjustm
                 real_position = player["position"]
 
             proj = _project_from_history(games, real_position)
+            missed = min(missed_games_by_gsis.get(gsis_id, 0), max(MISSED_TEAM_GAMES_MULTIPLIER))
+            if missed:
+                proj = _scale_projection(proj, MISSED_TEAM_GAMES_MULTIPLIER[missed])
             if use_dst_opponent_matchup_adjustment and real_position == "DST":
                 # Opt-in only - see this function's own docstring for the
                 # real backtest behind this. Synthetic implied_total so
