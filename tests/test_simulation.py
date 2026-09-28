@@ -9,6 +9,7 @@ from models.simulation import (
     SAME_TEAM_CORR,
     _load_players,
     _player_correlation,
+    simulate_player_distributions,
 )
 
 # Regression coverage for a real gap found by a fresh audit late in this
@@ -175,3 +176,136 @@ def test_full_pipeline_showdown_qb_pass_catcher_correlation_is_real(engine, show
     qb = players_by_id[ids_by_name["Trevor Lawrence"]["CPT"]]
     wr = players_by_id[ids_by_name["Parker Washington"]["FLEX"]]
     assert _player_correlation(qb, wr) == QB_PASS_CATCHER_CORR
+
+
+# --- simulate_player_distributions -----------------------------------------
+
+DISTRIBUTION_TEST_SLATE_ID = "TEST_SIMULATION_DISTRIBUTION"
+
+
+@pytest.fixture
+def distribution_test_slate(engine):
+    # Same two real players/real projections as showdown_simulation_slate
+    # above, reused under a dedicated Classic-shaped (plain QB/WR position
+    # labels, no CPT/FLEX) test slate - simulate_player_distributions has no
+    # Showdown-specific behavior to exercise, so a plain slate keeps this
+    # fixture simpler (no crosswalk/real_position resolution needed).
+    with engine.connect() as conn:
+        source_rows = conn.execute(
+            text(
+                """
+                SELECT sp.player_id, sp.name, sp.position, sp.team, sp.opponent, sp.salary,
+                       proj.proj_floor, proj.proj_median, proj.proj_ceiling, proj.proj_percentiles
+                FROM slate_player_pool sp
+                JOIN projections proj ON proj.slate_id = sp.slate_id AND proj.player_id = sp.player_id
+                WHERE sp.slate_id = 'dk_thu_mon_2026_09_17' AND sp.name IN ('Trevor Lawrence', 'Parker Washington')
+                """
+            )
+        ).mappings().fetchall()
+    assert len(source_rows) == 2, "expected real fixture data for these two players to still exist"
+
+    source_by_name = {r["name"]: dict(r) for r in source_rows}
+    ids_by_name = {}
+    try:
+        with engine.begin() as conn:
+            for r in source_rows:
+                percentiles = r["proj_percentiles"]
+                percentiles_json = json.dumps(percentiles) if isinstance(percentiles, dict) else percentiles
+                pid = f"DIST_{r['player_id']}"
+                ids_by_name[r["name"]] = pid
+                conn.execute(
+                    text(
+                        """
+                        INSERT INTO slate_player_pool (slate_id, player_id, name, position, salary, team, opponent)
+                        VALUES (:slate_id, :player_id, :name, :position, :salary, :team, :opponent)
+                        """
+                    ),
+                    {
+                        "slate_id": DISTRIBUTION_TEST_SLATE_ID,
+                        "player_id": pid,
+                        "name": r["name"],
+                        "position": r["position"],
+                        "salary": r["salary"],
+                        "team": r["team"],
+                        "opponent": r["opponent"],
+                    },
+                )
+                conn.execute(
+                    text(
+                        """
+                        INSERT INTO projections
+                            (slate_id, player_id, proj_floor, proj_median, proj_ceiling, proj_percentiles)
+                        VALUES (:slate_id, :player_id, :proj_floor, :proj_median, :proj_ceiling, :proj_percentiles)
+                        """
+                    ),
+                    {
+                        "slate_id": DISTRIBUTION_TEST_SLATE_ID,
+                        "player_id": pid,
+                        "proj_floor": r["proj_floor"],
+                        "proj_median": r["proj_median"],
+                        "proj_ceiling": r["proj_ceiling"],
+                        "proj_percentiles": percentiles_json,
+                    },
+                )
+        yield ids_by_name, source_by_name
+    finally:
+        with engine.begin() as conn:
+            conn.execute(text("DELETE FROM projections WHERE slate_id = :s"), {"s": DISTRIBUTION_TEST_SLATE_ID})
+            conn.execute(text("DELETE FROM slate_player_pool WHERE slate_id = :s"), {"s": DISTRIBUTION_TEST_SLATE_ID})
+
+
+def test_simulate_player_distributions_matches_own_stored_percentile_ladder(engine, distribution_test_slate):
+    # The Gaussian copula preserves each player's own marginal distribution
+    # exactly regardless of the joint correlation structure (see this
+    # module's own docstring) - a single player's simulated p10/p50/p90 must
+    # land close to their real, stored proj_percentiles ladder, not some
+    # other number the correlated joint draw invented.
+    ids_by_name, source_by_name = distribution_test_slate
+    pid = ids_by_name["Trevor Lawrence"]
+    ladder = source_by_name["Trevor Lawrence"]["proj_percentiles"]
+    if isinstance(ladder, str):
+        ladder = json.loads(ladder)
+
+    result = simulate_player_distributions(
+        DISTRIBUTION_TEST_SLATE_ID, player_ids=[pid], num_simulations=30000, seed=42, engine=engine
+    )
+    stats = result[pid]
+    assert stats["p10"] == pytest.approx(float(ladder["10"]), abs=1.0)
+    assert stats["p50"] == pytest.approx(float(ladder["50"]), abs=1.0)
+    assert stats["p90"] == pytest.approx(float(ladder["90"]), abs=1.0)
+
+
+def test_simulate_player_distributions_prob_at_least_is_monotonically_decreasing(engine, distribution_test_slate):
+    ids_by_name, _ = distribution_test_slate
+    pid = ids_by_name["Trevor Lawrence"]
+    result = simulate_player_distributions(
+        DISTRIBUTION_TEST_SLATE_ID, player_ids=[pid], num_simulations=5000, seed=7,
+        thresholds=(10, 20, 30, 40), engine=engine,
+    )
+    probs = result[pid]["prob_at_least"]
+    values = [probs[t] for t in sorted(probs)]
+    assert values == sorted(values, reverse=True)
+    assert all(0.0 <= v <= 1.0 for v in values)
+
+
+def test_simulate_player_distributions_reports_real_identity_fields(engine, distribution_test_slate):
+    ids_by_name, source_by_name = distribution_test_slate
+    pid = ids_by_name["Parker Washington"]
+    result = simulate_player_distributions(
+        DISTRIBUTION_TEST_SLATE_ID, player_ids=[pid], num_simulations=2000, seed=3, engine=engine
+    )
+    stats = result[pid]
+    assert stats["name"] == "Parker Washington"
+    assert stats["position"] == "WR"
+    assert stats["salary"] == source_by_name["Parker Washington"]["salary"]
+
+
+def test_simulate_player_distributions_defaults_to_every_player_with_a_projection(engine, distribution_test_slate):
+    ids_by_name, _ = distribution_test_slate
+    result = simulate_player_distributions(DISTRIBUTION_TEST_SLATE_ID, num_simulations=2000, seed=1, engine=engine)
+    assert set(result.keys()) == set(ids_by_name.values())
+
+
+def test_simulate_player_distributions_raises_for_a_slate_with_no_stored_projections(engine):
+    with pytest.raises(ValueError):
+        simulate_player_distributions("TEST_SLATE_DOES_NOT_EXIST_AT_ALL", engine=engine)

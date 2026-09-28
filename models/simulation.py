@@ -208,7 +208,7 @@ def _resolve_real_positions(rows, engine):
 def _load_players(slate_id, player_ids, engine):
     query = text(
         """
-        SELECT sp.player_id, sp.position, sp.team, sp.opponent, proj.proj_percentiles
+        SELECT sp.player_id, sp.name, sp.salary, sp.position, sp.team, sp.opponent, proj.proj_percentiles
         FROM slate_player_pool sp
         JOIN projections proj ON proj.slate_id = sp.slate_id AND proj.player_id = sp.player_id
         WHERE sp.slate_id = :slate_id AND sp.player_id = ANY(:player_ids)
@@ -226,6 +226,8 @@ def _load_players(slate_id, player_ids, engine):
             percentiles = json.loads(percentiles)
         players_by_id[row["player_id"]] = {
             "player_id": row["player_id"],
+            "name": row["name"],
+            "salary": row["salary"],
             "position": row["position"],
             "real_position": real_position_by_id.get(row["player_id"]),
             "team": row["team"],
@@ -239,6 +241,42 @@ def _load_players(slate_id, player_ids, engine):
     return players_by_id
 
 
+def _simulate_player_scores(player_ids, slate_id, num_simulations, seed, engine):
+    """The correlated per-player simulated-score arrays underlying every
+    function in this module (simulate_lineups sums these into lineup
+    totals and discards them) - factored out so simulate_player_distributions
+    can read the same real per-player draws directly, instead of a second,
+    parallel simulation path that could silently drift from the one lineup
+    scoring actually uses.
+
+    Returns (scores_by_player_id: {player_id: np.array of length
+    num_simulations}, players_by_id).
+    """
+    players_by_id = _load_players(slate_id, player_ids, engine)
+    ordered_players = [players_by_id[pid] for pid in player_ids]
+    percentile_ranks = _correlated_percentile_ranks(ordered_players, num_simulations, seed)
+    scores_by_player_id = {
+        player["player_id"]: _quantile_to_scores(percentile_ranks[:, j], player["percentiles"])
+        for j, player in enumerate(ordered_players)
+    }
+    return scores_by_player_id, players_by_id
+
+
+def _all_player_ids_with_projections(slate_id, engine):
+    with engine.connect() as conn:
+        rows = conn.execute(
+            text(
+                """
+                SELECT sp.player_id FROM slate_player_pool sp
+                JOIN projections proj ON proj.slate_id = sp.slate_id AND proj.player_id = sp.player_id
+                WHERE sp.slate_id = :slate_id
+                """
+            ),
+            {"slate_id": slate_id},
+        ).fetchall()
+    return [row[0] for row in rows]
+
+
 def simulate_lineups(lineups, slate_id, num_simulations=DEFAULT_NUM_SIMULATIONS, seed=None, engine=None):
     engine = engine or get_engine()
 
@@ -246,14 +284,7 @@ def simulate_lineups(lineups, slate_id, num_simulations=DEFAULT_NUM_SIMULATIONS,
     if not player_ids:
         raise ValueError("No players found across the given lineups")
 
-    players_by_id = _load_players(slate_id, player_ids, engine)
-    ordered_players = [players_by_id[pid] for pid in player_ids]
-
-    percentile_ranks = _correlated_percentile_ranks(ordered_players, num_simulations, seed)
-    scores_by_player_id = {
-        player["player_id"]: _quantile_to_scores(percentile_ranks[:, j], player["percentiles"])
-        for j, player in enumerate(ordered_players)
-    }
+    scores_by_player_id, _ = _simulate_player_scores(player_ids, slate_id, num_simulations, seed, engine)
 
     results = []
     for lu in lineups:
@@ -335,3 +366,67 @@ def select_best_by_simulation(candidate_lineups, slate_id, num_simulations=DEFAU
         }
         for lineup, result, rate in ranked
     ]
+
+
+DEFAULT_DISTRIBUTION_THRESHOLDS = (20, 30, 40)
+
+
+def simulate_player_distributions(
+    slate_id, player_ids=None, num_simulations=DEFAULT_NUM_SIMULATIONS, seed=None,
+    thresholds=DEFAULT_DISTRIBUTION_THRESHOLDS, engine=None,
+):
+    """The real per-player probability distribution this module's own
+    simulation machinery already computes internally (simulate_lineups sums
+    these same correlated per-player draws into lineup totals and discards
+    them) - exposed directly, per player, instead of only ever as a lineup
+    aggregate.
+
+    `player_ids` defaults to every player in `slate_id` with a stored
+    projection; pass an explicit list to scope it to fewer players (cheaper,
+    since the joint draw is over however many players are requested).
+
+    Real, disclosed scope: this reports the DK-fantasy-POINTS distribution
+    only (mean/stdev/percentiles/threshold probabilities), built from each
+    player's own percentile ladder (proj_percentiles) and this module's real,
+    fitted pairwise correlation model - see this module's own docstring for
+    what that correlation model is and isn't. It does NOT report stat-level
+    quantities like target share, air-yard share, or TD probability - this
+    codebase has no play-by-play/box-score-level simulation, only a points-
+    level one, and reporting those as if a further, unmodeled layer computed
+    them would be a real, silent overstatement of what this actually knows.
+
+    Returns {player_id: {"name", "salary", "position", "team", "opponent",
+    "mean", "stdev", "p10"..."p90" (the same 10/25/50/75/90 ladder
+    proj_percentiles is stored at), "prob_at_least": {threshold: probability
+    of scoring >= threshold in a simulated world}}}.
+    """
+    engine = engine or get_engine()
+    if player_ids is None:
+        player_ids = _all_player_ids_with_projections(slate_id, engine)
+    if not player_ids:
+        raise ValueError(f"No players with a stored projection found for slate {slate_id}")
+
+    scores_by_player_id, players_by_id = _simulate_player_scores(
+        list(player_ids), slate_id, num_simulations, seed, engine
+    )
+
+    results = {}
+    for pid in player_ids:
+        scores = scores_by_player_id[pid]
+        player = players_by_id[pid]
+        results[pid] = {
+            "name": player["name"],
+            "salary": player["salary"],
+            "position": player["real_position"] or player["position"],
+            "team": player["team"],
+            "opponent": player["opponent"],
+            "mean": round(float(np.mean(scores)), 2),
+            "stdev": round(float(np.std(scores, ddof=1)), 2),
+            "p10": round(float(np.percentile(scores, 10)), 2),
+            "p25": round(float(np.percentile(scores, 25)), 2),
+            "p50": round(float(np.percentile(scores, 50)), 2),
+            "p75": round(float(np.percentile(scores, 75)), 2),
+            "p90": round(float(np.percentile(scores, 90)), 2),
+            "prob_at_least": {t: round(float(np.mean(scores >= t)), 4) for t in thresholds},
+        }
+    return results
