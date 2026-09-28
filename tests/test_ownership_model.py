@@ -6,6 +6,7 @@ from models.ownership_model import (
     _implied_gap,
     backtest_ownership_model,
     fit_ownership_model,
+    fitted_ownership_fn,
     predict_group_shares,
     predict_ownership,
 )
@@ -77,6 +78,25 @@ def test_backtest_beats_the_points_per_dollar_proxy_on_every_held_out_week(engin
         model_score, proxy_score = fold["overall"]["model"], fold["overall"]["proxy"]
         assert model_score["spearman_rho"] > proxy_score["spearman_rho"]
         assert model_score["mae_pct_points"] < proxy_score["mae_pct_points"]
+
+
+def test_fitted_ownership_fn_spreads_ownership_over_only_the_players_given(engine):
+    # The field simulator passes its gate-eligible pool, not the whole slate -
+    # each position's total must be spread over just those players.
+    model = {
+        "beta": {"log_proj": 0.8, "log_salary_k": 0.6, "value_rank": 0.1, "proj_rank": 0.2, "implied_gap": 0.08},
+        "position_totals": {"QB": 99.0, "RB": 240.0, "WR": 330.0, "TE": 120.0, "DST": 99.0},
+    }
+    everyone = predict_ownership("dk_sunday_2026_09_27", model=model, engine=engine)
+    subset_ids = sorted(everyone)[: len(everyone) // 2]
+    subset = [{"player_id": pid} for pid in subset_ids]
+
+    weights = fitted_ownership_fn("dk_sunday_2026_09_27", model=model, engine=engine)(subset)
+    assert set(weights) == set(subset_ids)
+    assert all(w > 0 for w in weights.values())
+    # Removing half the players raises the rest's predicted share, it doesn't
+    # just drop the removed players' ownership on the floor.
+    assert sum(weights.values()) > sum(everyone[pid] for pid in subset_ids)
 
 
 def test_predict_ownership_on_a_real_slate_matches_position_totals(engine):

@@ -2,6 +2,7 @@ import pytest
 
 from models.field_simulation import (
     POSITION_OWNERSHIP_CALIBRATION,
+    _resolve_field_ownership_fn,
     build_chalk_lineup,
     build_contrarian_lineup,
     build_leverage_lineup,
@@ -163,6 +164,37 @@ def test_run_field_simulation_without_contest_id_has_no_payout_key(engine, stabl
     chalk = build_chalk_lineup(players)
     result = run_field_simulation(chalk, stable_slate, contest_size=10, num_simulations=200, seed=1, engine=engine)
     assert result["payout"] is None
+
+
+def test_run_field_simulation_defaults_to_the_fitted_ownership_model(engine, stable_slate):
+    players, _, _, _ = _load_player_pool(stable_slate, "proj_ceiling", engine)
+    chalk = build_chalk_lineup(players)
+    result = run_field_simulation(chalk, stable_slate, contest_size=10, num_simulations=200, seed=1, engine=engine)
+    assert result["ownership_source"] == "fitted_ownership_model"
+
+    old = run_field_simulation(
+        chalk, stable_slate, contest_size=10, num_simulations=200, seed=1, engine=engine,
+        proxy_fn=calibrated_ownership_proxy,
+    )
+    assert old["ownership_source"] == "calibrated_ownership_proxy"
+
+
+def test_field_ownership_falls_back_to_the_proxy_for_showdown():
+    proxy_fn, source = _resolve_field_ownership_fn(None, "dk_showdown_ind_kc_2026_09_20", engine=None)
+    assert proxy_fn is calibrated_ownership_proxy
+    assert "Showdown" in source
+
+
+def test_field_ownership_falls_back_to_the_proxy_when_the_model_cannot_fit(monkeypatch):
+    import models.ownership_model as om
+
+    def no_data(*args, **kwargs):
+        raise ValueError("No training groups")
+
+    monkeypatch.setattr(om, "fitted_ownership_fn", no_data)
+    proxy_fn, source = _resolve_field_ownership_fn(None, "dk_sunday_2026_09_27", engine=None)
+    assert proxy_fn is calibrated_ownership_proxy
+    assert "No training groups" in source
 
 
 def test_run_field_simulation_with_contest_id_adds_real_payout_stats(engine, stable_slate):

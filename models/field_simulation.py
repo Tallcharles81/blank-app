@@ -72,7 +72,19 @@ from models.simulation import DEFAULT_NUM_SIMULATIONS, simulate_lineups
 # ---------------------------------------------------------------------------
 
 DEFAULT_CONTEST_SIZE = 100
-DEFAULT_CONCENTRATION = 1.0  # UNCALIBRATED - see VALIDATION RESULT above
+# First real calibration evidence, now that a fitted ownership model exists
+# (models/ownership_model.py): on dk_sunday_2026_09_27 (week 3, held out of
+# the model's training), a 500-opponent simulated field's per-player
+# selection rate was compared against that slate's real %Drafted:
+#   fitted model weights:  conc 0.5 rho 0.647 MAE 3.47 | 1.0 rho 0.673 MAE 3.16
+#                          conc 2.0 rho 0.652 MAE 3.16 | 3.0 rho 0.610 MAE 3.45
+#   calibrated proxy best: conc 2.0 rho 0.466 MAE 3.64
+# 1.0 is the best setting for the fitted model, so it stays - now with one
+# real held-out week behind it rather than none. One week is not settled;
+# re-check as more contests are imported. This says nothing about whether
+# the chalk-vs-contrarian conclusions above hold at 1.0 with the new
+# weights - that comparison still runs on the old proxy.
+DEFAULT_CONCENTRATION = 1.0
 _VALUE_FLOOR = 0.01  # avoids log(0) for a zero-projected player without meaningfully affecting sampling
 
 
@@ -205,6 +217,22 @@ def generate_opponent_lineups(players, contest_size, concentration=DEFAULT_CONCE
     return opponents, failed
 
 
+def _resolve_field_ownership_fn(proxy_fn, slate_id, engine):
+    """(proxy_fn, ownership_source label) for run_field_simulation."""
+    if proxy_fn is not None:
+        return proxy_fn, getattr(proxy_fn, "__name__", "custom proxy_fn")
+    # Imported here, not at module level: models.ownership_model imports
+    # data.ownership_calibration, which imports this module.
+    from models.ownership_model import _is_showdown_slate, fitted_ownership_fn
+
+    if _is_showdown_slate(slate_id):
+        return calibrated_ownership_proxy, "calibrated_ownership_proxy (Showdown slate - fitted model is Classic-only)"
+    try:
+        return fitted_ownership_fn(slate_id, engine=engine), "fitted_ownership_model"
+    except ValueError as exc:
+        return calibrated_ownership_proxy, f"calibrated_ownership_proxy (fitted model unavailable: {exc})"
+
+
 def _roster_id_set(lineup):
     return frozenset(p["player_id"] for _, p in lineup["roster"])
 
@@ -218,7 +246,7 @@ def run_field_simulation(
     seed=None,
     engine=None,
     projection_field="proj_median",
-    proxy_fn=calibrated_ownership_proxy,
+    proxy_fn=None,
     contest_id=None,
 ):
     """Simulate a `contest_size`-lineup GPP field around `my_lineup` and score
@@ -264,8 +292,17 @@ def run_field_simulation(
     clear than the real one, so payout.cash_pct will read optimistic unless
     `contest_size` is set close to the real contest's own total_entries. See
     payout.field_size_note.
+
+    `proxy_fn` defaults to the fitted ownership model (models/
+    ownership_model.py - trained on real imported DK %Drafted, beats
+    calibrated_ownership_proxy on held-out weeks). It falls back to
+    calibrated_ownership_proxy for a Showdown slate (the model is Classic-
+    only) or when no real contests have been imported to fit from;
+    "ownership_source" in the result says which one actually ran. Pass
+    proxy_fn=calibrated_ownership_proxy to reproduce the old behavior.
     """
     players, _, _, _ = _load_player_pool(slate_id, projection_field, engine=engine)
+    proxy_fn, ownership_source = _resolve_field_ownership_fn(proxy_fn, slate_id, engine)
     opponents, failed_draws = generate_opponent_lineups(players, contest_size, concentration, seed, proxy_fn=proxy_fn)
     if not opponents:
         raise RuntimeError(f"Could not generate any feasible opponent lineups (all {contest_size} draws failed)")
@@ -331,6 +368,7 @@ def run_field_simulation(
         "contest_size_actual": len(opponents),
         "failed_draws": failed_draws,
         "concentration": concentration,
+        "ownership_source": ownership_source,
         "exact_duplicate_opponents": exact_duplicates,
         "duplication_rate": round(duplication_rate, 4),
         "avg_shared_players": round(avg_shared_players, 3),

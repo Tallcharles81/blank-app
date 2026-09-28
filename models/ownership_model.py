@@ -214,11 +214,16 @@ def predict_group_shares(model, players):
     return _softmax(_feature_matrix(players) @ beta)
 
 
-def predict_ownership(slate_id, model=None, engine=None):
+def predict_ownership(slate_id, model=None, engine=None, player_ids=None):
     """Predicted %Drafted for every player on a Classic `slate_id` with a
     stored projection - {player_id: predicted_pct}. `model` defaults to a
     fresh fit on every real Classic contest currently imported, so the
     estimate improves automatically as more contests are imported.
+
+    `player_ids` restricts prediction to that subset, and each position's
+    total ownership is spread over only those players - pass the
+    gate-eligible pool so players already ruled out (OUT, no role) don't
+    soak up share the real field would never give them.
 
     Still a MODEL of ownership, not a live feed: every downstream use should
     say "predicted ownership", never present it as the field's actual
@@ -238,11 +243,14 @@ def predict_ownership(slate_id, model=None, engine=None):
                 SELECT sp.player_id, sp.position, sp.salary, sp.team, sp.opponent, proj.proj_median
                 FROM slate_player_pool sp
                 JOIN projections proj ON proj.slate_id = sp.slate_id AND proj.player_id = sp.player_id
-                WHERE sp.slate_id = :s
+                WHERE sp.slate_id = :s AND proj.proj_median IS NOT NULL
                 """
             ),
             {"s": slate_id},
         ).mappings().fetchall()
+    if player_ids is not None:
+        wanted = set(player_ids)
+        rows = [r for r in rows if r["player_id"] in wanted]
     if not rows:
         raise ValueError(f"No players with a stored projection for slate {slate_id}")
 
@@ -266,6 +274,29 @@ def predict_ownership(slate_id, model=None, engine=None):
         for p, share in zip(players, shares):
             predicted[p["player_id"]] = round(float(share * position_total), 3)
     return predicted
+
+
+# Floor for field-simulation weights: models/field_simulation.py samples
+# opponents on log(weight), and a softmax share can underflow to exactly 0
+# for a deep-bench player.
+_MIN_FIELD_WEIGHT = 1e-4
+
+
+def fitted_ownership_fn(slate_id, model=None, engine=None):
+    """A proxy_fn for models/field_simulation.py: takes the simulator's
+    already-gated player list and returns {player_id: predicted %Drafted}
+    over exactly those players. The model is fit once here, not on every
+    call.
+    """
+    engine = engine or get_engine()
+    model = model or fit_ownership_model(load_training_groups(engine))
+
+    def proxy_fn(players):
+        predicted = predict_ownership(slate_id, model=model, engine=engine, player_ids=[p["player_id"] for p in players])
+        return {p["player_id"]: max(predicted.get(p["player_id"], 0.0), _MIN_FIELD_WEIGHT) for p in players}
+
+    proxy_fn.model = model
+    return proxy_fn
 
 
 def _proxy_shares(players):
