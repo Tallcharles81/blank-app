@@ -137,10 +137,10 @@ def build_sections(R):
         f"{f(red['RB_rushing_to_RB_receiving']['cross_half_r'], 3)}. RB1 → RB2 carry split: cross-half r = {f(red['RB1_carries_to_RB2_carries']['cross_half_r'], 3)}.",
         f"Out-of-sample target shares (mean abs error per role): no defense {f(oos_t['scores']['test']['none'], 5)}, generic defense-vs-position "
         f"{f(oos_t['scores']['test']['group'], 5)}, role redistribution {f(oos_t['scores']['test']['role'], 5)} (2025 test). Role vs generic: "
-        f"{paired_verdict(b_vs_g_val, b_vs_g_test)}; role vs none: {paired_verdict(b_vs_a_val, b_vs_a_test)}. Size of the role model's test gain "
-        f"over no-defense: {f(diff_key(b_vs_a_test), 5)} total share points per team-game (≈ {abs(diff_key(b_vs_a_test)) * 35:.2f} targets per team-game at 35 targets).",
-        f"Carry shares: the generic group model beats no-defense ({paired_verdict(cg_val, cg_test)}); the RB1/RB2 role split is worse than generic "
-        f"in 2025 (diff {f(diff_key(cr_vs_g_test), 5)}, p {fp(cr_vs_g_test['p'])}).",
+        f"{paired_verdict(b_vs_g_val, b_vs_g_test)}; role vs none: {paired_verdict(b_vs_a_val, b_vs_a_test)}. Role model minus no-defense "
+        f"in the 2025 test: {f(diff_key(b_vs_a_test), 5)} total share points per team-game (≈ {abs(diff_key(b_vs_a_test)) * 35:.2f} targets per team-game at 35 targets).",
+        f"Carry shares: generic group model vs no-defense: {paired_verdict(cg_val, cg_test)} (2025 diff {f(diff_key(cg_test), 5)}, p {fp(cg_test['p'])}); "
+        f"RB1/RB2 role split vs generic in 2025: diff {f(diff_key(cr_vs_g_test), 5)} (p {fp(cr_vs_g_test['p'])}; positive = role split worse).",
         f"DFS points (WR/TE/RB, 2025 test, n = {dk_test['none']['dk']['n']}), all models league-calibrated: MAE no-defense (A) {f(dk_test['none']['dk']['mae'], 3)}, generic "
         f"{f(dk_test['group']['dk']['mae'], 3)}, role (B) {f(dk_test['role']['dk']['mae'], 3)}, B+matchup (C) {f(dk_test['role_matchup']['dk']['mae'], 3)}, "
         f"Vegas terms only, no defense {f(dk_test['script_none']['dk']['mae'], 3)}, C+Vegas (D) {f(dk_test['script_role_matchup']['dk']['mae'], 3)}. Paired vs A in test: "
