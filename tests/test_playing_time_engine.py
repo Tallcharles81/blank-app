@@ -12,6 +12,7 @@ from models.playing_time_engine import (
     compute_opportunity_score,
     estimate_role,
     meets_playing_time_floor,
+    promote_past_unavailable_qbs,
 )
 
 # --- classify_player_status: real taxonomy from real, already-existing sources ---
@@ -243,3 +244,27 @@ def test_apply_playing_time_gate_debug_log_covers_every_real_player(engine):
         assert "role_confidence" in entry
         assert "opportunity_score" in entry
         assert entry["dfs_eligible"] in ("YES", "NO")
+
+
+# --- promote_past_unavailable_qbs: injured starter still listed QB1 ---
+
+
+def _qb(team, rank, as_of="2026-09-28T15:17:44Z"):
+    return {"team": team, "position": "QB", "pos_grp": "3WR 1TE", "pos_rank": rank, "pos_slot": 9, "as_of": as_of}
+
+
+def test_backup_qb_is_promoted_when_the_starter_is_out():
+    # Shape of the real CHI chart on 2026-09-28: starter Out, still QB1,
+    # plus a stale older row for a QB no longer on the current snapshot.
+    chart = {"starter": _qb("CHI", 1), "backup": _qb("CHI", 2), "third": _qb("CHI", 3),
+             "stale": _qb("CHI", 1, as_of="2026-09-15T12:00:00Z"), "other_team": _qb("PHI", 2)}
+    promoted = promote_past_unavailable_qbs(chart, {"starter"})
+    assert promoted["backup"]["pos_rank"] == 1
+    assert promoted["third"]["pos_rank"] == 2
+    assert promoted["other_team"]["pos_rank"] == 2  # PHI's QB1 isn't out
+    assert meets_playing_time_floor("QB", estimate_role("QB", {"current": [], "prior": []}, promoted["backup"]))[0]
+
+
+def test_no_unavailable_players_leaves_the_chart_unchanged():
+    chart = {"starter": _qb("CHI", 1), "backup": _qb("CHI", 2)}
+    assert promote_past_unavailable_qbs(chart, set()) is chart

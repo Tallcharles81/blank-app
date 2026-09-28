@@ -130,7 +130,7 @@ def _load_player_pool(slate_id, projection_field, engine, punt_mode=False):
     # the pipeline; this gate's only new real work is the playing-time
     # floor itself.
     playing_time_result = apply_playing_time_gate(
-        available_players, season, week, engine, punt_mode=punt_mode
+        available_players, season, week, engine, punt_mode=punt_mode, unavailable_gsis_ids=unavailable_gsis_ids
     )
     playing_time_excluded_ids = {e["player_id"]: e["reason"] for e in playing_time_result["excluded"]}
     excluded = {**excluded, **playing_time_excluded_ids}

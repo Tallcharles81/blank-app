@@ -372,6 +372,44 @@ def build_debug_entry(player, real_position, status, role_estimate, opportunity_
     }
 
 
+def promote_past_unavailable_qbs(depth_chart, unavailable_gsis_ids):
+    """Returns a copy of `depth_chart` where each QB's pos_rank counts only
+    the teammates above him who are still available this week.
+
+    nflverse's depth chart often keeps the injured starter at QB1 through
+    game day. A real case: PHI@CHI 2026-09-28, where Caleb Williams was Out
+    but the 09-28 snapshot still listed him QB1 and Tyson Bagent QB2. The
+    QB floor would drop the actual starter, so the injury report wins over
+    the depth-chart ordering here.
+
+    Only a teammate on the team's latest snapshot counts as "above" him.
+    Older rows linger for released or moved players (CHI had a 09-15 QB4
+    entry next to the 09-28 ones), and they shouldn't block a promotion.
+    """
+    if not unavailable_gsis_ids:
+        return depth_chart
+    latest_by_team = {}
+    for entry in depth_chart.values():
+        if entry["position"] == "QB":
+            latest_by_team[entry["team"]] = max(latest_by_team.get(entry["team"], ""), entry["as_of"])
+    current_qbs = {
+        gid: e for gid, e in depth_chart.items()
+        if e["position"] == "QB" and e["as_of"] == latest_by_team[e["team"]]
+    }
+    promoted = dict(depth_chart)
+    for gid, entry in current_qbs.items():
+        # Subtract only the confirmed-unavailable QBs above him. A gap in the
+        # chart (no QB1 row at all) isn't evidence he's starting.
+        out_above = sum(
+            1 for other_gid, other in current_qbs.items()
+            if other["team"] == entry["team"] and other["pos_rank"] < entry["pos_rank"]
+            and other_gid in unavailable_gsis_ids
+        )
+        if out_above:
+            promoted[gid] = {**entry, "pos_rank": entry["pos_rank"] - out_above, "promoted_from_rank": entry["pos_rank"]}
+    return promoted
+
+
 def apply_playing_time_gate(
     players,
     season,
@@ -381,6 +419,7 @@ def apply_playing_time_gate(
     injury_status_by_gsis=None,
     flag_status_by_gsis=None,
     punt_mode=False,
+    unavailable_gsis_ids=None,
 ):
     """The real, top-level entry point - runs BEFORE the optimizer sees a
     pool, per item 12's ordering. `players` is any list of dicts with
@@ -400,6 +439,10 @@ def apply_playing_time_gate(
     fixed real penalty on his own projection, not a suggestion) alongside
     his real debug entry, so a caller can apply it before optimizing rather
     than pretending the concern doesn't exist.
+
+    `unavailable_gsis_ids`: players the availability gate already excluded
+    this week. A backup QB whose starter is among them is treated as the
+    starter (see promote_past_unavailable_qbs).
 
     Returns {"eligible": [...players...], "excluded": [debug entries],
     "punt_flagged": [debug entries + penalty_multiplier], "debug_log":
@@ -439,6 +482,7 @@ def apply_playing_time_gate(
         depth_chart = latest_depth_chart_by_player(season)
     except RuntimeError:
         depth_chart = {}  # real feed unavailable (e.g. a past season it doesn't cover) - not a crash, just no depth-chart signal this run
+    depth_chart = promote_past_unavailable_qbs(depth_chart, unavailable_gsis_ids or set())
 
     history_by_gsis = _load_role_history(
         [gid for gid in gsis_by_dk_id.values() if gid], season, week, engine
