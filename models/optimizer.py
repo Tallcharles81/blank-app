@@ -11,7 +11,7 @@ from data.player_availability import (
     resolve_slate_season_week,
 )
 from data.player_crosswalk import resolve_dk_players_to_gsis
-from data.pre_lock_check import hard_role_exclusions
+from data.pre_lock_check import _load_recent_usage_batch, hard_role_exclusions
 from db.migrate import get_engine
 from models.playing_time_engine import apply_playing_time_gate
 from models.simulation import DEFAULT_NUM_SIMULATIONS, select_best_by_simulation
@@ -580,6 +580,7 @@ def build_lineups_from_pool(
     require_bring_back=False,
     ownership_values_by_id=None,
     ownership_cap=None,
+    min_captain_lineups=None,
 ):
     """Core multi-lineup builder, operating on an in-memory player pool (dicts
     with player_id/name/position/salary/team/points) instead of loading from
@@ -614,6 +615,13 @@ def build_lineups_from_pool(
     field_simulation.py::build_ownership_cap_lineup) - no live caller passes
     these yet.
 
+    min_captain_lineups: Showdown only - {cpt_row_player_id: n}, each of
+    those CPT rows must captain at least n lineups. Scheduled one per
+    lineup: once the total still owed reaches the lineups left, the most-
+    owed captain is locked in. min_exposure can't express this safely -
+    with two QBs both owed their last slots it would lock both into one
+    lineup, which has a single CPT spot.
+
     Returns (lineups, exposure_report) where exposure_report is
     {player_id: {"count": n, "fraction": n / lineups_actually_built}} - the
     achieved exposure, which may fall short of requested max/min_exposure if
@@ -631,6 +639,19 @@ def build_lineups_from_pool(
     exposure_counts = defaultdict(int)
     base_excluded_ids = set(excluded_player_ids or [])
     base_locked_ids = list(locked_player_ids or [])
+
+    min_captain_lineups = dict(min_captain_lineups or {})
+    if min_captain_lineups:
+        if slate_type != "showdown":
+            raise ValueError("min_captain_lineups only applies to Showdown slates")
+        cpt_ids = {p["player_id"] for p in players if p["position"] == "CPT"}
+        unknown = sorted(set(min_captain_lineups) - cpt_ids)
+        if unknown:
+            raise ValueError(f"min_captain_lineups ids are not CPT rows in the pool: {unknown}")
+        if sum(min_captain_lineups.values()) > num_lineups:
+            raise ValueError(
+                f"min_captain_lineups asks for {sum(min_captain_lineups.values())} captain slots in {num_lineups} lineups"
+            )
 
     for i in range(num_lineups):
         lineups_remaining = num_lineups - i
@@ -661,6 +682,12 @@ def build_lineups_from_pool(
                 needed = math.ceil(floor * num_lineups) - exposure_counts[pid]
                 if needed >= lineups_remaining:
                     forced_locks.append(pid)
+
+        captain_owed = {
+            pid: n - exposure_counts[pid] for pid, n in min_captain_lineups.items() if n > exposure_counts[pid]
+        }
+        if captain_owed and sum(captain_owed.values()) >= lineups_remaining:
+            forced_locks.append(max(captain_owed, key=captain_owed.get))
 
         conflicts = exposure_excluded & set(forced_locks)
         if conflicts:
@@ -806,6 +833,40 @@ def select_portfolio_within_caps(candidates, target_count, max_exposure=None, to
     return selected, rejected, state
 
 
+def showdown_qb_captain_ids(players, engine=None):
+    """CPT-row player_ids of the real QBs in a Showdown pool. Positions come
+    from each player's own game history, since a Showdown row's position is
+    just "CPT"/"FLEX"."""
+    engine = engine or get_engine()
+    cpt_rows = [p for p in players if p["position"] == "CPT"]
+    gsis_by_id, _, _ = resolve_dk_players_to_gsis(cpt_rows, engine)
+    usage = _load_recent_usage_batch([g for g in gsis_by_id.values() if g and not g.startswith("DST_")], engine)
+    return [
+        p["player_id"] for p in cpt_rows
+        if usage.get(gsis_by_id.get(p["player_id"])) and usage[gsis_by_id[p["player_id"]]][0]["position"] == "QB"
+    ]
+
+
+def select_with_captain_coverage(ranked_lineups, count, min_captain_lineups):
+    """Top `count` of `ranked_lineups` (best first) with each CPT id in
+    min_captain_lineups ({cpt_player_id: n}) captaining at least n of them -
+    the best-ranked lineups for each required captain first, then the rest
+    by rank. Returned in the original rank order. Used for the simulator
+    group, whose ranking would otherwise drop the lower-projected QB's
+    captain lineups the builder reserved.
+    """
+    chosen = []
+    for cpt_id, n in min_captain_lineups.items():
+        with_cpt = [i for i, lu in enumerate(ranked_lineups) if lu["roster"][0][1]["player_id"] == cpt_id and i not in chosen]
+        chosen.extend(with_cpt[:n])
+    for i in range(len(ranked_lineups)):
+        if len(chosen) >= count:
+            break
+        if i not in chosen:
+            chosen.append(i)
+    return [ranked_lineups[i] for i in sorted(chosen[:count])]
+
+
 def generate_lineups(
     slate_id,
     num_lineups=1,
@@ -820,6 +881,7 @@ def generate_lineups(
     require_qb_stack=True,
     require_bring_back=False,
     punt_mode=False,
+    min_captain_per_qb=0,
     engine=None,
 ):
     """The live GPP-style lineup path (models/backtest.py, calibration.py,
@@ -843,6 +905,14 @@ def generate_lineups(
     playing-time floor before the solver ever sees them. True lets them
     back in with a severe, real penalty applied to their own points/floor/
     ceiling instead - an explicit opt-in, never the default.
+
+    min_captain_per_qb (Showdown only, default 0 = off): every QB still in
+    the pool after the gates captains at least this many lineups. Across
+    the 5 Showdown games with imported contests, the QB the field captained
+    less outscored the popular one in 3 (Keenum 2.9% CPT, 36.7 pts vs Hurts
+    24%, 20.4) - a pure-projection build never captains the lower-
+    projected QB, so this reserves him a few lineups. A pattern to test via
+    build tracking, not a proven edge.
     """
     engine = engine or get_engine()
     players, availability_excluded, injury_report_available, playing_time_debug_log = _load_player_pool(
@@ -850,6 +920,13 @@ def generate_lineups(
     )
     if not players:
         raise ValueError(f"No players with a '{projection_field}' projection found for slate {slate_id}")
+
+    min_captain_lineups = None
+    if min_captain_per_qb:
+        excluded = set(excluded_player_ids or [])
+        min_captain_lineups = {
+            pid: min_captain_per_qb for pid in showdown_qb_captain_ids(players, engine) if pid not in excluded
+        }
 
     lineups, exposure_report = build_lineups_from_pool(
         players,
@@ -863,9 +940,11 @@ def generate_lineups(
         min_exposure=min_exposure,
         require_qb_stack=require_qb_stack,
         require_bring_back=require_bring_back,
+        min_captain_lineups=min_captain_lineups,
     )
 
     availability_report = _build_availability_report(players, availability_excluded, injury_report_available)
+    availability_report["captain_coverage"] = min_captain_lineups or {}
     # Item 13's own requirement: this debug information must be visible to
     # the user, not just logged - every real playing-time verdict (excluded
     # AND eligible alike), not only the ones that ended up excluded.

@@ -62,3 +62,11 @@ reported as edited). The verdict stays INSUFFICIENT SAMPLE until
 better. Once it isn't, this is the "larger batch of real contest data" the
 simulator-default section above refers to: report it plainly either way.
 Seeded with dk_showdown_nyg_lar_2026_09_21 and dk_sunday_2026_09_27.
+
+Showdown builds (set by the user after PHI@CHI 2026-09-28, where the
+2.9%-captained backup QB was the winning captain): pass
+`min_captain_per_qb=1` per 10-lineup group so every starting QB captains at
+least one lineup in each group, and pick the simulator group's lineups with
+`select_with_captain_coverage(ranked, 10, availability_report["captain_coverage"])`
+so the simulation ranking can't drop them. Report it in the captain
+exposure table; tracking decides whether it helps.
