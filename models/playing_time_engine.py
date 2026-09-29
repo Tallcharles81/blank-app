@@ -74,32 +74,28 @@ CURRENT_SEASON_MAX_GAMES = 8
 PRIOR_SEASON_MAX_GAMES = 8
 
 # The shrinkage constant K in weight = n_current / (n_current + K): at
-# n_current = K real current-season games, current and prior-season data get
-# equal real weight; more current-season games than that and current-season
-# evidence dominates, matching item 4's "progressively increase the weight
-# of current-season evidence" requirement with a standard, real statistical
-# form (empirical-Bayes-style shrinkage) instead of an arbitrary game-count
-# cutoff. K=4 is an INITIAL choice (same status as every position threshold
-# below).
+# n_current = K current-season games, current and prior-season data get
+# equal weight; past that, current-season evidence dominates.
 #
-# IMPORTANT, HONEST RESULT from models/calibration.py::run_shrinkage_
-# backtest (finally run for real, n=1606 real early-season player-weeks,
-# 34 real weeks, dk_sunday_2026_09_20's pool): this blend does NOT beat the
-# naive "trust current-season data the instant any of it exists, ignore
-# prior season" baseline it was meant to improve on - it's WORSE, by a
-# real, statistically significant margin (avg abs error predicting next-
-# week snap_pct: 0.1461 blended vs 0.1274 naive, t=-5.54, p<0.0001). Kept
-# as the live default for now rather than silently reverted, since this
-# contradicts the assumption this whole module shipped under and changing
-# it changes every downstream gate/backtest that depends on estimate_role -
-# a decision flagged to the user rather than made unilaterally. Plausible
-# real cause, not yet tested: real NFL offensive roles can differ sharply
-# year over year (team/scheme/coaching changes), so blending in year-old
-# usage may add real noise rather than real signal, especially this early
-# in a season - i.e. recent within-season data may just be a stronger real
-# predictor of role than last year's, undermining the empirical-Bayes prior
-# this blend assumes.
-SHRINKAGE_K = 4.0
+# K=1 (was 4), set from a backtest over every RB/WR/TE player-week
+# 2024-2026 with both current- and prior-season snaps (n=8,185, strictly
+# earlier games only). Error predicting that week's real snap share:
+#   K=0 (this season only) 0.1221, K=1 0.1214, K=2 0.1245, K=4 0.1300,
+#   K=8 0.1378. K1 - K4 = -0.0086 (week-clustered bootstrap 95% CI
+#   -0.0104 to -0.0070); K1 vs K0 is a tie (CI spans 0). Choosing K on 2024
+#   alone and scoring 2025-26 gives the same order (K=1 best, 0.1193).
+# The earlier run_shrinkage_backtest result (blend worse than current-only,
+# p<0.0001) was this same over-weighting of last season.
+#
+# What it does NOT change: the floor's aggregate hit rate. Excluded players
+# who still scored 8+ DK points: 11.6% at K=1 vs 11.7% at K=4. It trades
+# which mistakes happen - K=4 throws out role changers (Kalif Raymond,
+# PHI@CHI 2026-09-28: 60-62% snaps this season, blended to 43% and
+# excluded, then scored 21 DK points), K=0 throws out stars in their first
+# game back from injury (Rashee Rice 2025 wk8, Puka Nacua 2024 wk8). K=1
+# keeps a little prior-season weight for exactly that second case.
+# Reproduce with scripts/shrinkage_k_study.py.
+SHRINKAGE_K = 1.0
 
 # INITIAL thresholds, substituting real snap_pct for the unavailable real
 # "route participation %" metric on WR/TE (see module docstring). Backtested
