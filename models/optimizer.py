@@ -4,6 +4,7 @@ from collections import Counter, defaultdict
 import pulp
 from sqlalchemy import text
 
+from data.depth_charts import latest_depth_chart_by_player
 from data.dk_salary_csv import CLASSIC_ROSTER, SHOWDOWN_ROSTER
 from data.player_availability import (
     game_lock_status,
@@ -13,7 +14,10 @@ from data.player_availability import (
 from data.player_crosswalk import resolve_dk_players_to_gsis
 from data.pre_lock_check import _load_recent_usage_batch, hard_role_exclusions
 from db.migrate import get_engine
-from models.playing_time_engine import apply_playing_time_gate
+from models.playing_time_engine import (
+    apply_playing_time_gate,
+    promote_past_unavailable_qbs,
+)
 from models.simulation import DEFAULT_NUM_SIMULATIONS, select_best_by_simulation
 
 SALARY_CAP = 50000
@@ -112,7 +116,10 @@ def _load_player_pool(slate_id, projection_field, engine, punt_mode=False):
     # docstring). Checked against the pool that already survived the
     # availability gate, not the raw pool, so this never does redundant work
     # resolving a player who's excluded already.
-    role_excluded = hard_role_exclusions(available_players, engine, unavailable_gsis_ids=unavailable_gsis_ids)
+    role_excluded = hard_role_exclusions(
+        available_players, engine, unavailable_gsis_ids=unavailable_gsis_ids,
+        depth_chart_starter_gsis_ids=_depth_chart_starting_qbs(season, unavailable_gsis_ids),
+    )
     excluded = {**excluded, **role_excluded}
     available_players = [p for p in available_players if p["player_id"] not in role_excluded]
 
@@ -170,6 +177,19 @@ def _load_player_pool(slate_id, projection_field, engine, punt_mode=False):
         p["availability_flag"] = flagged.get(p["player_id"])
 
     return available_players, excluded, injury_report_available, playing_time_debug_log
+
+
+def _depth_chart_starting_qbs(season, unavailable_gsis_ids):
+    """gsis_ids of each team's current depth-chart QB1, after promoting past
+    QBs ruled out this week. Empty if the depth-chart feed can't be fetched
+    (a past season, or a failed download) - the role check then falls back
+    to snap history alone, as before."""
+    try:
+        depth_chart = latest_depth_chart_by_player(season)
+    except Exception:
+        return set()
+    promoted = promote_past_unavailable_qbs(depth_chart, unavailable_gsis_ids)
+    return {gid for gid, e in promoted.items() if e["position"] == "QB" and e["pos_rank"] == 1}
 
 
 def _apply_common_constraints(prob, x, players, locked_ids, excluded_ids, max_players_per_team, min_salary=None):

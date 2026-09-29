@@ -5,6 +5,7 @@ from data.pre_lock_check import (
     SEVERITY_LOW,
     SEVERITY_MEDIUM,
     _role_check_severity,
+    _would_be_hard_excluded,
     hard_role_exclusions,
 )
 from models.projections import _real_week_sequence
@@ -209,3 +210,19 @@ def test_hard_role_exclusions_survives_real_stars_and_catches_real_winston(engin
     for star in ("Jonathan Taylor", "CeeDee Lamb", "Malik Nabers", "Trevor Lawrence"):
         assert by_name[star] not in excluded, f"{star} is a real, clear starter and must never be hard-excluded"
     assert by_name["Jameis Winston"] in excluded, "Winston's real intermittent-starter pattern must be caught"
+
+
+def test_depth_chart_starter_overrides_the_intermittent_qb_pattern():
+    # Cam Ward's shape on the 2026-10-01 slate: 100% snaps in all three 2026
+    # games, plus a 9% game at the end of 2025 inside the 4-game window.
+    games = [{"snap_pct": s} for s in (1.0, 1.0, 1.0, 0.09)]
+    excluded, _ = _would_be_hard_excluded("QB", games)
+    assert excluded
+    excluded, _ = _would_be_hard_excluded("QB", games, depth_chart_starter=True)
+    assert not excluded
+
+
+def test_depth_chart_starter_does_not_rescue_a_non_qb_with_no_role():
+    games = [{"snap_pct": s} for s in (0.05, 0.02, 0.0, 0.1)]
+    excluded, _ = _would_be_hard_excluded("WR", games, depth_chart_starter=True)
+    assert excluded

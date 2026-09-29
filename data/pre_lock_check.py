@@ -506,7 +506,7 @@ MIN_SNAP_PCT_FOR_BENCHED = 0.15
 MAX_SNAP_PCT_FOR_FULL_GAME = 0.85
 
 
-def hard_role_exclusions(players, engine=None, unavailable_gsis_ids=None):
+def hard_role_exclusions(players, engine=None, unavailable_gsis_ids=None, depth_chart_starter_gsis_ids=None):
     """Players with NO evidence of a real role in any recent game on record -
     hard-excluded from the eligible pool before the optimizer ever runs, the
     same way data/player_availability.py's roster-absence and IR checks are
@@ -572,6 +572,13 @@ def hard_role_exclusions(players, engine=None, unavailable_gsis_ids=None):
     if not players:
         return {}
     unavailable_gsis_ids = unavailable_gsis_ids or set()
+    # QBs the current depth chart lists as their team's starter. The
+    # intermittent-starter pattern looks back 4 games, which can reach an
+    # injury-shortened game or last season - on the 2026-10-01 slate it
+    # excluded Cam Ward (100% snaps all 3 games), Sam Darnold (back from
+    # injury, 100% in week 3) and Jameis Winston (starting since Dart's IR),
+    # all listed QB1 on the 09-29 depth chart.
+    depth_chart_starter_gsis_ids = depth_chart_starter_gsis_ids or set()
 
     gsis_by_dk_id, _, _ = resolve_dk_players_to_gsis(players, engine)
     games_by_gsis = _load_recent_usage_batch(
@@ -630,13 +637,16 @@ def hard_role_exclusions(players, engine=None, unavailable_gsis_ids=None):
             teammate_gsis_ids = qb_gsis_by_team.get(p["team"], set()) - {gsis_id}
             teammate_starter_unavailable = bool(teammate_gsis_ids & unavailable_gsis_ids)
 
-        is_excluded, reason = _would_be_hard_excluded(real_position, games, teammate_starter_unavailable)
+        is_excluded, reason = _would_be_hard_excluded(
+            real_position, games, teammate_starter_unavailable,
+            depth_chart_starter=gsis_id in depth_chart_starter_gsis_ids,
+        )
         if is_excluded:
             excluded[p["player_id"]] = reason
     return excluded
 
 
-def _would_be_hard_excluded(real_position, games, teammate_starter_unavailable=False):
+def _would_be_hard_excluded(real_position, games, teammate_starter_unavailable=False, depth_chart_starter=False):
     """The exact per-player decision hard_role_exclusions makes, given a
     real (not Showdown CPT/FLEX) position and that player's own recent
     usage history - factored out so models/calibration.py's backtest can
@@ -655,6 +665,11 @@ def _would_be_hard_excluded(real_position, games, teammate_starter_unavailable=F
     place, and it deliberately doesn't touch the RB/WR/TE volume floor at
     all (that check claims "no real role", not "can't confirm who starts" -
     a different claim a teammate injury doesn't speak to).
+
+    depth_chart_starter: the current depth chart lists this QB as his
+    team's starter. Like teammate_starter_unavailable it only overrides the
+    QB intermittent-starter pattern. Historical backtests have no depth
+    chart, so they never set it.
     """
     snap_pcts = [float(g["snap_pct"]) for g in games if g["snap_pct"] is not None]
     if len(snap_pcts) < MIN_RECENT_GAMES_FOR_ROLE_CONFIDENCE:
@@ -664,6 +679,8 @@ def _would_be_hard_excluded(real_position, games, teammate_starter_unavailable=F
         if min(snap_pcts) < MIN_SNAP_PCT_FOR_BENCHED and max(snap_pcts) >= MAX_SNAP_PCT_FOR_FULL_GAME:
             if teammate_starter_unavailable:
                 return False, None  # a real teammate QB is confirmed out this week - this is the real starter now, not a random appearance
+            if depth_chart_starter:
+                return False, None
             return True, (
                 f"intermittent starter pattern in the last {len(snap_pcts)} recorded games "
                 f"(snap share swings between {min(snap_pcts):.0%} and {max(snap_pcts):.0%}) - "
