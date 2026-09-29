@@ -70,3 +70,26 @@ least one lineup in each group, and pick the simulator group's lineups with
 `select_with_captain_coverage(ranked, 10, availability_report["captain_coverage"])`
 so the simulation ranking can't drop them. Report it in the captain
 exposure table; tracking decides whether it helps.
+
+## Standing workflow: news research before building and before lock
+
+Set by the user after PHI@CHI 2026-09-28: the data feeds still had Tyson
+Bagent as Chicago's QB, while Case Keenum's start had been reported the day
+before. It was only caught after the lineups were built, when 8 of 20
+lineups plus the booster lineup had the backup QB.
+
+1. Before building any lineup, search the web for the slate's news:
+   injuries and designations (Out/Doubtful/Questionable), starting QBs,
+   suspensions, role changes, and the Vegas spread/total. Wherever news
+   contradicts the feeds (the availability gate, depth chart, projections),
+   correct the build for it - excluded players, promoted starters,
+   projections - and tell the user each correction and its source.
+2. After building, check again once inactives are posted (about 90 minutes
+   before kickoff). Confirm every rostered player in every lineup is active
+   and in his expected role, and give the user the exact lineup rows and the
+   swaps needed. If the user asks before inactives are out, say when to
+   check back instead of implying the lineups are final.
+
+Both checks run on every slate whether or not the user asks a follow-up.
+Cite the sources. If a search is blocked or comes back empty, say so rather
+than assuming no news.
