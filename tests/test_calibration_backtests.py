@@ -388,21 +388,28 @@ def test_run_opportunity_score_backtest_shows_real_signal_among_eligible_players
 
 
 def test_run_shrinkage_backtest_reports_the_real_negative_result_honestly(engine):
-    # Real regression coverage for a genuinely surprising, disclosed finding
-    # (see models/playing_time_engine.py's own SHRINKAGE_K comment): the
-    # empirical-Bayes blend does NOT beat the naive "trust current season
-    # the instant it exists" baseline at predicting real next-week
-    # snap_pct - it's measurably worse. This test locks in that this
-    # backtest keeps reporting that real result rather than silently
-    # flipping sign if the underlying data or logic ever changes without
-    # anyone noticing.
-    result = run_shrinkage_backtest("dk_sunday_2026_09_20", seasons={2023, 2024, 2025}, engine=engine)
+    # The old K=4 blend is measurably WORSE than trusting current-season
+    # data alone at predicting next-week snap_pct - the finding that led to
+    # SHRINKAGE_K = 1 (see models/playing_time_engine.py). Locked in so the
+    # backtest can't silently flip sign if the data or logic changes.
+    result = run_shrinkage_backtest("dk_sunday_2026_09_20", seasons={2023, 2024, 2025}, engine=engine, k=4)
 
     assert result["weeks_evaluated"] >= 1
     assert result["player_weeks_evaluated"] > 0
     assert result["avg_absolute_error_shrinkage"] > result["avg_absolute_error_naive_hard_cutoff"]
     assert result["avg_error_reduction"] < 0
     assert result["p_value"] < 0.01
+
+
+def test_run_shrinkage_backtest_live_k_is_no_worse_than_current_season_only(engine):
+    # The live K=1 closes that gap: within noise of current-season-only on the
+    # same player-weeks, and clearly better than K=4.
+    live = run_shrinkage_backtest("dk_sunday_2026_09_20", seasons={2023, 2024, 2025}, engine=engine)
+    old = run_shrinkage_backtest("dk_sunday_2026_09_20", seasons={2023, 2024, 2025}, engine=engine, k=4)
+
+    assert live["player_weeks_evaluated"] == old["player_weeks_evaluated"]
+    assert live["avg_absolute_error_shrinkage"] < old["avg_absolute_error_shrinkage"]
+    assert live["avg_error_reduction"] > -0.005
 
 
 def test_run_dst_matchup_backtest_shows_the_real_ordering_found_this_session(engine):

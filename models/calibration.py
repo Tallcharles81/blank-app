@@ -1572,7 +1572,13 @@ def _actual_snap_pct_for_week(gsis_ids, season, week, engine):
     return {row.player_id: float(row.snap_pct) for row in rows}
 
 
-def run_shrinkage_backtest(source_slate_id, seasons=None, engine=None):
+# The early-season window run_shrinkage_backtest scores: 1-3 current-season
+# games, where blending in last season can actually move the estimate. It
+# was implicitly SHRINKAGE_K back when that was 4.
+EARLY_SEASON_WINDOW_GAMES = 4
+
+
+def run_shrinkage_backtest(source_slate_id, seasons=None, engine=None, k=None):
     """The real backtest models/playing_time_engine.py's own SHRINKAGE_K
     comment has promised since it shipped ("see run_shrinkage_backtest in
     models/calibration.py for the real test of whether this actually beats
@@ -1599,8 +1605,14 @@ def run_shrinkage_backtest(source_slate_id, seasons=None, engine=None):
     current-season data approaches 1.0 and converges with the naive
     baseline by construction - this only tests the window where blending
     could plausibly help or hurt.
+
+    `k` (default: the live SHRINKAGE_K) is the blend strength under test.
+    The window is fixed at n_current in [1, EARLY_SEASON_WINDOW_GAMES)
+    rather than [1, k) so different k values are scored on the same
+    player-weeks - with the live k=1 a [1, k) window would be empty.
     """
     engine = engine or get_engine()
+    k = playing_time_engine.SHRINKAGE_K if k is None else k
 
     slate_players = load_slate_pool(source_slate_id, engine)
     if not slate_players:
@@ -1637,12 +1649,12 @@ def run_shrinkage_backtest(source_slate_id, seasons=None, engine=None):
             current_snaps = [float(g["snap_pct"]) for g in history["current"] if g["snap_pct"] is not None]
             prior_snaps = [float(g["snap_pct"]) for g in history["prior"] if g["snap_pct"] is not None]
             n_current = len(current_snaps)
-            if not (1 <= n_current < playing_time_engine.SHRINKAGE_K):
+            if not (1 <= n_current < EARLY_SEASON_WINDOW_GAMES):
                 continue
             if not prior_snaps:
                 continue  # both methods degenerate to the same current-only average here - no real disagreement to measure
 
-            shrinkage_pred, _, _, _ = playing_time_engine._shrinkage_blend(current_snaps, prior_snaps)
+            shrinkage_pred, _, _, _ = playing_time_engine._shrinkage_blend(current_snaps, prior_snaps, k=k)
             naive_pred = sum(current_snaps) / len(current_snaps)
 
             shrinkage_errors.append(abs(shrinkage_pred - actual))
