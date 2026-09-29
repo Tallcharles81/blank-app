@@ -200,6 +200,11 @@ CREATE TABLE IF NOT EXISTS contest_ownership (
 CREATE INDEX IF NOT EXISTS idx_contest_ownership_slate_id
     ON contest_ownership (slate_id);
 
+-- Showdown only: the CPT row's own %Drafted. pct_drafted stays the total
+-- across CPT + FLEX (what every existing consumer reads); FLEX share is
+-- pct_drafted - pct_drafted_cpt. NULL on Classic contests.
+ALTER TABLE contest_ownership ADD COLUMN IF NOT EXISTS pct_drafted_cpt NUMERIC(6, 3);
+
 -- One row per real correlation-test run against an imported contest, so the
 -- accumulating history of "how good is ownership_proxy really" over
 -- multiple real contests is itself queryable, not just the latest number.

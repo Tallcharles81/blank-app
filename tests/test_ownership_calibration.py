@@ -518,3 +518,20 @@ def test_position_ownership_calibration_still_reflects_real_cross_week_data(engi
             f"live constant {calibrated_value} by more than the real tolerance - re-run "
             "data/ownership_calibration.py's calibration and update models/field_simulation.py"
         )
+
+
+def test_showdown_parse_keeps_the_captain_share_separate(tmp_path):
+    # Keenum's real PHI@CHI split: 22.62% FLEX + 2.92% CPT. The total alone
+    # hid that he was the rarely-captained winning captain.
+    path = tmp_path / "contest-standings-9.csv"
+    path.write_text(
+        "Rank,EntryId,EntryName,TimeRemaining,Points,Lineup,,Player,Roster Position,%Drafted,FPTS\n"
+        "1,1,a,0,100,CPT Case Keenum FLEX X,,Case Keenum,CPT,2.92%,36.72\n"
+        "2,2,b,0,90,CPT X FLEX Case Keenum,,Case Keenum,FLEX,22.62%,24.48\n",
+        encoding="utf-8-sig",
+    )
+    totals, _, is_showdown = parse_contest_standings_csv(str(path))
+    assert is_showdown
+    assert totals["Case Keenum"]["pct_drafted"] == pytest.approx(25.54)
+    assert totals["Case Keenum"]["pct_drafted_cpt"] == pytest.approx(2.92)
+    assert totals["Case Keenum"]["fpts_contest"] == 24.48

@@ -79,8 +79,9 @@ def parse_contest_standings_csv(csv_path):
     left as a silent matching failure downstream.
 
     Returns (totals, skipped, is_showdown): totals is {player_name:
-    {"pct_drafted": float, "fpts_contest": float | None}}, already
-    deduplicated/summed across roster-slot rows. is_showdown is True if any
+    {"pct_drafted": float, "pct_drafted_cpt": float | None, "fpts_contest":
+    float | None}}, already deduplicated/summed across roster-slot rows
+    (pct_drafted_cpt is the CPT row alone, Showdown only). is_showdown is True if any
     row's real Roster Position is "CPT" - DK only uses that label on a
     Showdown (single-game) slate, never a Classic one, and that distinction
     matters downstream: a Showdown contest's real DK salaries are a
@@ -91,7 +92,7 @@ def parse_contest_standings_csv(csv_path):
     see import_contest_standings for how that's handled rather than silently
     computing ownership_proxy off the wrong price.
     """
-    totals = defaultdict(lambda: {"pct_drafted": 0.0, "fpts_by_position": {}})
+    totals = defaultdict(lambda: {"pct_drafted": 0.0, "pct_cpt": 0.0, "fpts_by_position": {}})
     skipped = 0
     is_showdown = False
     with open(csv_path, encoding="utf-8-sig") as f:
@@ -117,6 +118,8 @@ def parse_contest_standings_csv(csv_path):
                 except ValueError:
                     fpts = None
             totals[name]["pct_drafted"] += pct
+            if roster_position == "CPT":
+                totals[name]["pct_cpt"] += pct
             if fpts is not None:
                 totals[name]["fpts_by_position"][roster_position] = fpts
 
@@ -143,7 +146,14 @@ def parse_contest_standings_csv(csv_path):
             fpts = fpts_by_position.get("FLEX", fpts_by_position.get("CPT"))
         else:
             fpts = next(iter(fpts_by_position.values()), None)
-        result[name] = {"pct_drafted": info["pct_drafted"], "fpts_contest": fpts}
+        # The captain share is kept separately on Showdown: the combined
+        # number hid that Case Keenum (PHI@CHI 2026-09-28) was 25.5% owned
+        # overall but only 2.9% as captain - the winning captain.
+        result[name] = {
+            "pct_drafted": info["pct_drafted"],
+            "pct_drafted_cpt": info["pct_cpt"] if is_showdown else None,
+            "fpts_contest": fpts,
+        }
 
     return result, skipped, is_showdown
 
@@ -290,6 +300,7 @@ def import_contest_standings(csv_path, slate_id, contest_id, engine=None):
                     "position": None,
                     "salary": None,
                     "pct_drafted": stats["pct_drafted"],
+                    "pct_drafted_cpt": stats["pct_drafted_cpt"],
                     "fpts_contest": stats["fpts_contest"],
                     "proj_median_at_import": None,
                     "ownership_proxy": None,
@@ -312,6 +323,7 @@ def import_contest_standings(csv_path, slate_id, contest_id, engine=None):
                     "position": pool_match["position"],
                     "salary": None,
                     "pct_drafted": stats["pct_drafted"],
+                    "pct_drafted_cpt": stats["pct_drafted_cpt"],
                     "fpts_contest": stats["fpts_contest"],
                     "proj_median_at_import": None,
                     "ownership_proxy": None,
@@ -345,6 +357,7 @@ def import_contest_standings(csv_path, slate_id, contest_id, engine=None):
                 "position": real_position,
                 "salary": pool_match["salary"],
                 "pct_drafted": stats["pct_drafted"],
+                "pct_drafted_cpt": stats["pct_drafted_cpt"],
                 "fpts_contest": stats["fpts_contest"],
                 "proj_median_at_import": proj_median,
                 "ownership_proxy": proxy_value,
@@ -359,16 +372,19 @@ def import_contest_standings(csv_path, slate_id, contest_id, engine=None):
                     """
                     INSERT INTO contest_ownership
                         (contest_id, slate_id, player_id, name, position, salary, pct_drafted,
-                         fpts_contest, proj_median_at_import, ownership_proxy, unmatched_reason)
+                         pct_drafted_cpt, fpts_contest, proj_median_at_import, ownership_proxy,
+                         unmatched_reason)
                     VALUES
                         (:contest_id, :slate_id, :player_id, :name, :position, :salary, :pct_drafted,
-                         :fpts_contest, :proj_median_at_import, :ownership_proxy, :unmatched_reason)
+                         :pct_drafted_cpt, :fpts_contest, :proj_median_at_import, :ownership_proxy,
+                         :unmatched_reason)
                     ON CONFLICT (contest_id, name) DO UPDATE SET
                         slate_id = EXCLUDED.slate_id,
                         player_id = EXCLUDED.player_id,
                         position = EXCLUDED.position,
                         salary = EXCLUDED.salary,
                         pct_drafted = EXCLUDED.pct_drafted,
+                        pct_drafted_cpt = EXCLUDED.pct_drafted_cpt,
                         fpts_contest = EXCLUDED.fpts_contest,
                         proj_median_at_import = EXCLUDED.proj_median_at_import,
                         ownership_proxy = EXCLUDED.ownership_proxy,
