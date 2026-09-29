@@ -49,7 +49,7 @@ class LineupValidationError(ValueError):
     """
 
 
-def _load_player_pool(slate_id, projection_field, engine, punt_mode=False):
+def _load_player_pool(slate_id, projection_field, engine, punt_mode=False, role_override_ids=None):
     if projection_field not in ALLOWED_PROJECTION_FIELDS:
         raise ValueError(f"projection_field must be one of {sorted(ALLOWED_PROJECTION_FIELDS)}")
     # projection_field is checked against the fixed whitelist above before use, so
@@ -120,6 +120,13 @@ def _load_player_pool(slate_id, projection_field, engine, punt_mode=False):
         available_players, engine, unavailable_gsis_ids=unavailable_gsis_ids,
         depth_chart_starter_gsis_ids=_depth_chart_starting_qbs(season, unavailable_gsis_ids),
     )
+    # role_override_ids: players the caller has news-based evidence DO have a
+    # role this week, which the usage-history checks below can't see yet (a
+    # snap-count limit returning from injury - Zay Flowers, 33% snaps in his
+    # first game back, 2026-10-01 slate). Only the role/playing-time checks
+    # are bypassed; the injury, roster and game-lock gates still apply.
+    role_override_ids = set(role_override_ids or ())
+    role_excluded = {pid: r for pid, r in role_excluded.items() if pid not in role_override_ids}
     excluded = {**excluded, **role_excluded}
     available_players = [p for p in available_players if p["player_id"] not in role_excluded]
 
@@ -139,9 +146,14 @@ def _load_player_pool(slate_id, projection_field, engine, punt_mode=False):
     playing_time_result = apply_playing_time_gate(
         available_players, season, week, engine, punt_mode=punt_mode, unavailable_gsis_ids=unavailable_gsis_ids
     )
-    playing_time_excluded_ids = {e["player_id"]: e["reason"] for e in playing_time_result["excluded"]}
+    playing_time_excluded_ids = {
+        e["player_id"]: e["reason"] for e in playing_time_result["excluded"] if e["player_id"] not in role_override_ids
+    }
     excluded = {**excluded, **playing_time_excluded_ids}
-    available_players = playing_time_result["eligible"]
+    eligible_ids = {p["player_id"] for p in playing_time_result["eligible"]}
+    available_players = playing_time_result["eligible"] + [
+        p for p in available_players if p["player_id"] in role_override_ids and p["player_id"] not in eligible_ids
+    ]
     playing_time_debug_log = playing_time_result["debug_log"]
     playing_time_punt_flagged = playing_time_result["punt_flagged"]
 
@@ -902,6 +914,7 @@ def generate_lineups(
     require_bring_back=False,
     punt_mode=False,
     min_captain_per_qb=0,
+    role_override_ids=None,
     engine=None,
 ):
     """The live GPP-style lineup path (models/backtest.py, calibration.py,
@@ -933,10 +946,14 @@ def generate_lineups(
     24%, 20.4) - a pure-projection build never captains the lower-
     projected QB, so this reserves him a few lineups. A pattern to test via
     build tracking, not a proven edge.
+
+    role_override_ids: see _load_player_pool - news-backed players whose
+    role the usage-history checks can't see yet. Reported back in
+    availability_report["role_overrides"].
     """
     engine = engine or get_engine()
     players, availability_excluded, injury_report_available, playing_time_debug_log = _load_player_pool(
-        slate_id, projection_field, engine, punt_mode=punt_mode
+        slate_id, projection_field, engine, punt_mode=punt_mode, role_override_ids=role_override_ids
     )
     if not players:
         raise ValueError(f"No players with a '{projection_field}' projection found for slate {slate_id}")
@@ -965,6 +982,7 @@ def generate_lineups(
 
     availability_report = _build_availability_report(players, availability_excluded, injury_report_available)
     availability_report["captain_coverage"] = min_captain_lineups or {}
+    availability_report["role_overrides"] = sorted(role_override_ids or ())
     # Item 13's own requirement: this debug information must be visible to
     # the user, not just logged - every real playing-time verdict (excluded
     # AND eligible alike), not only the ones that ended up excluded.
