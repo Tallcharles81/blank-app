@@ -93,3 +93,22 @@ lineups plus the booster lineup had the backup QB.
 Both checks run on every slate whether or not the user asks a follow-up.
 Cite the sources. If a search is blocked or comes back empty, say so rather
 than assuming no news.
+
+## Standing workflow: SaberSim projections are the base
+
+Set by the user 2026-10-01: whenever a SaberSim export
+(`NFL_<date>_DK_<slate>.csv`) is provided, it is the base projection source.
+Load the DK salary file first, then
+`data.sabersim_import.apply_sabersim(slate_id, path)`: it snapshots our own
+projections as source `model`, writes SaberSim's distribution over them
+(Captain rows x1.5), and keeps ours for players SaberSim doesn't cover
+(kickers on Showdown slates). News corrections from the pre-build research
+are applied after that, on top of SaberSim. Report what was matched and what
+kept ours.
+
+After standings are imported for a slate, report
+`projection_accuracy(slate_id)` (model vs sabersim, same players) and keep
+a running tally across slates. First result, PHI@CHI 2026-09-28: model MAE
+4.24 vs SaberSim 4.50 on 19 players - one game, no conclusion. If a larger
+sample shows one source (or a blend) is clearly more accurate, say so
+plainly and let the user decide; don't switch the base on my own.

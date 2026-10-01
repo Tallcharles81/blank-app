@@ -307,3 +307,23 @@ CREATE TABLE IF NOT EXISTS lineup_contest_results (
 
 CREATE INDEX IF NOT EXISTS idx_lineup_contest_results_slate
     ON lineup_contest_results (slate_id);
+
+-- Every projection source used for a slate, kept side by side so their
+-- accuracy can be compared once games are played (data/sabersim_import.py).
+-- source: 'model' (DK Edge's own projections, snapshotted before anything
+-- overwrites them) or an external feed such as 'sabersim'. proj_percentiles
+-- uses the same 10/25/50/75/90 ladder as the projections table; own_proj is
+-- the source's projected ownership when it has one.
+CREATE TABLE IF NOT EXISTS projection_sources (
+    slate_id          TEXT NOT NULL,
+    source            TEXT NOT NULL,
+    player_id         TEXT NOT NULL,
+    name              TEXT NOT NULL,
+    position          TEXT,
+    proj_median       NUMERIC(7, 2),
+    proj_percentiles  JSONB,
+    own_proj          NUMERIC(7, 3),
+    source_file       TEXT,
+    recorded_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (slate_id, source, player_id)
+);
