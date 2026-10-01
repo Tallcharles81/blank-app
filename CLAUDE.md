@@ -118,10 +118,13 @@ changing anything, not changes to make on one file.
 
 Set by the user 2026-10-01: SaberSim exports seeded a running baseline per
 player (player_baselines). The full-week export
-NFL_2026-10-01-815pm_DK_Thu-Mon.csv (all 32 teams, week 4) seeded 410
-players, replacing the earlier 4-team seed; 18 projected players had no
-stats-history match (mostly fullbacks and rookies, e.g. Travis Hunter, Nick
-Singleton) and have no baseline. From then on each player's numbers are
+NFL_2026-10-01-815pm_DK_Thu-Mon.csv (all 32 teams, week 4) seeded 422 of
+its 428 projected players, replacing the earlier 4-team seed, with each
+player's stat projections and week context (salary, projected ownership,
+injury status, team/game implied points, 95th/99th percentile) stored in
+usage. The 6 without a baseline are rookies with no NFL games (Tanner Arkin,
+Gavin Bartholomew, Max Klare, Mark Redman, Patrick Herbert) and Drew
+Ogletree (Andrew in nflverse). From then on each player's numbers are
 updated from real results. If another SaberSim export arrives, seed it with
 `seed_from_sabersim(..., replace_older=True)` and apply it to its slate.
 Every week, after games are played and before building the next slate:

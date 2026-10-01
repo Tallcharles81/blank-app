@@ -33,6 +33,10 @@ from db.migrate import get_engine
 BASELINE_UPDATE_WEIGHT = 0.2
 BASELINE_BLEND_WEIGHT = 0.5
 _USAGE_FIELDS = ("Pass Att", "Pass Yds", "Pass TD", "Rec", "Rec Yds", "Rec TD", "Rush Att", "Rush Yds", "Rush TD")
+# Week context from the same export, kept with the seed for reference: salary,
+# projected ownership, injury status, SaberSim's team / game implied points,
+# and the spread and far tail our 10-90 ladder doesn't hold.
+_CONTEXT_FIELDS = ("Salary", "Adj Own", "Saber Team", "Saber Total", "dk_std", "dk_95_percentile", "dk_99_percentile")
 
 
 def smooth_ladder(ladder, actual, weight=BASELINE_UPDATE_WEIGHT):
@@ -64,7 +68,9 @@ def _usage(path):
     with open(path, encoding="utf-8-sig", newline="") as f:
         for r in csv.DictReader(f):
             vals = {}
-            for k in _USAGE_FIELDS:
+            if (r.get("Status") or "").strip():
+                vals["Status"] = r["Status"].strip()
+            for k in _USAGE_FIELDS + _CONTEXT_FIELDS:
                 try:
                     v = float(r.get(k) or 0)
                 except ValueError:
@@ -89,6 +95,15 @@ def seed_from_sabersim(path, season, week_by_team, engine=None, replace_older=Fa
     rows = [r for r in parse_sabersim_csv(path) if r["ladder"] and r["team"] in week_by_team]
     dk_like = [{"player_id": f"ss_{i}", "name": r["name"], "position": r["position"], "team": r["team"]} for i, r in enumerate(rows)]
     mapping, unmatched, ambiguous = resolve_dk_players_to_gsis(dk_like, engine)
+    still_unmatched = []
+    for pid in unmatched + ambiguous:
+        r = rows[int(pid[3:])]
+        gsis = _match_last_name_and_team(r["name"], r["team"], season, engine)
+        if gsis:
+            mapping[pid] = gsis
+        else:
+            still_unmatched.append(pid)
+    unmatched, ambiguous = still_unmatched, []
     usage = _usage(path)
     seeded = 0
     with engine.begin() as conn:
@@ -111,6 +126,28 @@ def seed_from_sabersim(path, season, week_by_team, engine=None, replace_older=Fa
             ).rowcount
     return {"seeded": seeded, "projected_rows": len(rows),
             "unmatched": [rows[int(i[3:])]["name"] for i in unmatched + ambiguous]}
+
+
+def _match_last_name_and_team(name, team, season, engine):
+    """Fallback match for names the crosswalk misses: a nickname (Joshua vs
+    Josh Palmer, Matt vs Matthew Hibner) or a position label (SaberSim's RB
+    vs nflverse's FB for fullbacks). Accepts only a single player with that
+    last name on that team this season, and only if the first names share
+    their first letter - otherwise None."""
+    parts = name.replace(".", "").split()
+    last = parts[-2] if parts[-1].lower() in ("jr", "sr", "ii", "iii", "iv") and len(parts) > 2 else parts[-1]
+    with engine.connect() as conn:
+        rows = conn.execute(
+            text(
+                """
+                SELECT DISTINCT player_id, player_name FROM player_weekly_stats
+                WHERE season = :s AND team = :t AND lower(player_name) LIKE :last
+                """
+            ),
+            {"s": season, "t": team, "last": f"% {last.lower()}%"},
+        ).fetchall()
+    rows = [r for r in rows if r.player_name[:1].lower() == name[:1].lower()]
+    return rows[0].player_id if len(rows) == 1 else None
 
 
 def update_baselines(through, engine=None):
