@@ -75,7 +75,7 @@ def _scaled(ladder, factor):
     return {k: round(v * factor, 2) for k, v in ladder.items()}
 
 
-def _record(conn, slate_id, source, player_id, name, position, ladder, own, source_file):
+def record_projection_source(conn, slate_id, source, player_id, name, position, ladder, own=None, source_file=None):
     conn.execute(
         text(
             """
@@ -136,14 +136,14 @@ def apply_sabersim(slate_id, path, engine=None, write_projections=True):
             if isinstance(ours, str):
                 ours = json.loads(ours)
             if ours and not already_snapshotted:
-                _record(conn, slate_id, "model", p["player_id"], p["name"], p["position"], ours, None, None)
+                record_projection_source(conn, slate_id, "model", p["player_id"], p["name"], p["position"], ours, None, None)
 
             r = by_id.get(p["player_id"]) or by_name_team.get((p["name"], p["team"]))
             if r is None or r["ladder"] is None:
                 kept_ours.append(p["name"])
                 continue
             ladder = _scaled(r["ladder"], CAPTAIN_MULTIPLIER) if p["position"] == "CPT" else r["ladder"]
-            _record(conn, slate_id, SOURCE, p["player_id"], p["name"], p["position"], ladder, r["own"], source_file)
+            record_projection_source(conn, slate_id, SOURCE, p["player_id"], p["name"], p["position"], ladder, r["own"], source_file)
             matched.append(p["name"])
             if not write_projections:
                 continue

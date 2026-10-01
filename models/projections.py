@@ -9,7 +9,9 @@ from data.nflverse_fetch import fetch_team_implied_totals, to_nflverse_team
 from data.player_availability import get_availability_gate, resolve_slate_season_week
 from data.player_crosswalk import resolve_dk_players_to_gsis
 from data.pre_lock_check import _load_recent_usage_batch
+from data.sabersim_import import record_projection_source
 from db.migrate import get_engine
+from models.player_baselines import blend_ladders, load_baselines
 from models.playing_time_engine import promote_past_unavailable_qbs
 
 # player_weekly_stats.player_id is nflverse's GSIS ID (e.g. "00-0034857"), which
@@ -499,6 +501,7 @@ def generate_projections(slate_id, engine=None, use_dst_opponent_matchup_adjustm
         engine,
     )
 
+    baselines_by_gsis = load_baselines(gsis_by_dk_id.values(), engine)
     promoted_qbs = _promoted_starting_qbs(slate_id, players, gsis_by_dk_id, engine)
     qb_starts_by_gsis = _load_qb_starts(promoted_qbs, engine)
 
@@ -546,7 +549,8 @@ def generate_projections(slate_id, engine=None, use_dst_opponent_matchup_adjustm
             if len(starts) >= MIN_QB_STARTS_FOR_PROMOTION:
                 # Starting this week - project from his real starts, not relief snaps.
                 games = starts
-            if not games:
+            baseline = baselines_by_gsis.get(gsis_id)
+            if not games and not baseline:
                 skipped_no_history.append(player["player_id"])
                 continue
             if player["position"] in ("CPT", "FLEX"):
@@ -555,10 +559,24 @@ def generate_projections(slate_id, engine=None, use_dst_opponent_matchup_adjustm
             else:
                 real_position = player["position"]
 
-            proj = _project_from_history(games, real_position)
-            missed = min(missed_games_by_gsis.get(gsis_id, 0), max(MISSED_TEAM_GAMES_MULTIPLIER))
-            if missed:
-                proj = _scale_projection(proj, MISSED_TEAM_GAMES_MULTIPLIER[missed])
+            if games:
+                proj = _project_from_history(games, real_position)
+                missed = min(missed_games_by_gsis.get(gsis_id, 0), max(MISSED_TEAM_GAMES_MULTIPLIER))
+                if missed:
+                    proj = _scale_projection(proj, MISSED_TEAM_GAMES_MULTIPLIER[missed])
+            if baseline:
+                # The player's running baseline (models/player_baselines.py) is
+                # blended in before the Vegas and Captain adjustments, so both
+                # apply to the blend the same way they apply to the model.
+                # Each source is recorded so projection_accuracy can tell
+                # whether the blend beats the model alone.
+                model_ladder = proj["proj_percentiles"] if games else baseline
+                blended = blend_ladders(model_ladder, baseline)
+                if player["position"] != "CPT":
+                    for source, ladder in (("model", model_ladder), ("baseline", baseline), ("blend", blended)):
+                        record_projection_source(conn, slate_id, source, player["player_id"], player["name"], player["position"], ladder)
+                proj = {"proj_floor": blended["25"], "proj_median": blended["50"], "proj_ceiling": blended["90"],
+                        "proj_percentiles": blended}
             if use_dst_opponent_matchup_adjustment and real_position == "DST":
                 # Opt-in only - see this function's own docstring for the
                 # real backtest behind this. Synthetic implied_total so

@@ -112,3 +112,23 @@ players: medians within about a point at every position; SaberSim's RB
 downside is much narrower (p10 at ~31% below median vs our ~97%) and its TE
 upside wider - candidates to verify against our own history before
 changing anything, not changes to make on one file.
+
+## Standing workflow: weekly player baseline update
+
+Set by the user 2026-10-01: the SaberSim export seeded a running baseline for
+every player it covered (player_baselines, 54 players on PHI/CHI/PIT/CLE),
+and from then on each player's numbers are updated from real results.
+Every week, after games are played and before building the next slate:
+
+1. Refresh 2026 stats (`refresh_player_weekly_stats` / `refresh_dst_weekly_stats`).
+2. `models.player_baselines.update_baselines((season, week))` - each played
+   game moves a baseline 20% toward the real score (games a player missed
+   change nothing).
+3. `generate_projections` then blends each baseline 50/50 with the model's
+   projection automatically and records model / baseline / blend in
+   projection_sources; report `projection_accuracy` for the slate after its
+   standings are imported, so we can see whether the blend beats the model.
+
+Players without a baseline (the other 28 teams) use the model, which already
+rebuilds from recent games each week. The 20% and 50% weights are starting
+values; revisit them once several weeks of model-vs-blend accuracy exist.

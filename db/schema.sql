@@ -327,3 +327,25 @@ CREATE TABLE IF NOT EXISTS projection_sources (
     recorded_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (slate_id, source, player_id)
 );
+
+-- One running baseline per player (models/player_baselines.py): seeded from
+-- an outside source (the one-time SaberSim export) and moved toward each
+-- real game result as weeks are played. generate_projections blends it with
+-- the model's own projection. ladder is the 10/25/50/75/90 base (non-Captain)
+-- distribution; usage holds the seed's stat projections (attempts, targets...).
+-- updated_season/updated_week: results through this week are included.
+CREATE TABLE IF NOT EXISTS player_baselines (
+    gsis_id          TEXT PRIMARY KEY,
+    name             TEXT NOT NULL,
+    team             TEXT,
+    position         TEXT,
+    ladder           JSONB NOT NULL,
+    usage            JSONB,
+    source           TEXT NOT NULL,
+    seeded_season    INTEGER NOT NULL,
+    seeded_week      INTEGER NOT NULL,
+    updated_season   INTEGER NOT NULL,
+    updated_week     INTEGER NOT NULL,
+    games_applied    INTEGER NOT NULL DEFAULT 0,
+    updated_at       TIMESTAMPTZ NOT NULL DEFAULT now()
+);
