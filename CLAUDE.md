@@ -94,21 +94,21 @@ Both checks run on every slate whether or not the user asks a follow-up.
 Cite the sources. If a search is blocked or comes back empty, say so rather
 than assuming no news.
 
-## Standing workflow: SaberSim projections are the base
+## SaberSim: one-time reference, our model stays the base
 
-Set by the user 2026-10-01: whenever a SaberSim export
-(`NFL_<date>_DK_<slate>.csv`) is provided, it is the base projection source.
-Load the DK salary file first, then
-`data.sabersim_import.apply_sabersim(slate_id, path)`: it snapshots our own
-projections as source `model`, writes SaberSim's distribution over them
-(Captain rows x1.5), and keeps ours for players SaberSim doesn't cover
-(kickers on Showdown slates). News corrections from the pre-build research
-are applied after that, on top of SaberSim. Report what was matched and what
-kept ours.
+The user had a SaberSim subscription for one slate only (cancelled
+2026-10-01) and sent one export, NFL_2026-09-28-815pm_DK_Mon-Thu.csv
+(PHI@CHI + PIT@CLE). Our own model remains the base projection for every
+slate going forward; do not wait for or ask for SaberSim files. If another
+export ever arrives, `data.sabersim_import.apply_sabersim(slate_id, path)`
+still works (it snapshots our projections as source `model` first).
 
-After standings are imported for a slate, report
-`projection_accuracy(slate_id)` (model vs sabersim, same players) and keep
-a running tally across slates. First result, PHI@CHI 2026-09-28: model MAE
-4.24 vs SaberSim 4.50 on 19 players - one game, no conclusion. If a larger
-sample shows one source (or a blend) is clearly more accurate, say so
-plainly and let the user decide; don't switch the base on my own.
+What that file was used for: PIT@CLE 2026-10-01 projections were rebased on
+it (kickers kept ours), and both sources are stored in projection_sources.
+After standings are imported for those two slates, report
+`projection_accuracy(slate_id)` (model vs sabersim, same players). PHI@CHI:
+model MAE 4.24 vs SaberSim 4.50 on 19 players. Shape comparison on 36
+players: medians within about a point at every position; SaberSim's RB
+downside is much narrower (p10 at ~31% below median vs our ~97%) and its TE
+upside wider - candidates to verify against our own history before
+changing anything, not changes to make on one file.
