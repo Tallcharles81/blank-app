@@ -60,3 +60,18 @@ def test_update_applies_each_played_game_once_in_order(engine, baseline_player):
     assert ladder["50"] == pytest.approx(expected["50"]) and games == 2 and week == 3
     update_baselines((2099, 3), engine=engine)  # re-running the same week changes nothing
     assert _baseline(engine)[1] == 2
+
+
+def test_newer_seed_replaces_an_older_baseline_only_when_asked(engine, baseline_player, tmp_path):
+    from models.player_baselines import seed_from_sabersim
+    with engine.begin() as conn:  # make the fixture player resolvable by name like a real one
+        conn.execute(text("UPDATE player_baselines SET seeded_week = 1 WHERE gsis_id = :g"), {"g": GSIS})
+    csv_path = tmp_path / "ss.csv"
+    csv_path.write_text("DFS ID,Name,Pos,Team,Opp,Status,Salary,SS Proj,Adj Own,dk_25_percentile,dk_50_percentile,"
+                        "dk_75_percentile,dk_85_percentile,dk_95_percentile,dk_99_percentile\n"
+                        "1,Test Baseline,RB,ZZ,YY,,5000,30,10,25,30,35,38,42,50\n")
+    seed_from_sabersim(str(csv_path), 2099, {"ZZ": 4}, engine=engine)
+    assert _baseline(engine)[0]["50"] == 15.0  # default: existing baseline kept
+    seed_from_sabersim(str(csv_path), 2099, {"ZZ": 4}, engine=engine, replace_older=True)
+    ladder, games, week = _baseline(engine)
+    assert ladder["50"] == 30.0 and games == 0 and week == 3

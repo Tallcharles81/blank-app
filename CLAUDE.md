@@ -103,8 +103,9 @@ slate going forward; do not wait for or ask for SaberSim files. If another
 export ever arrives, `data.sabersim_import.apply_sabersim(slate_id, path)`
 still works (it snapshots our projections as source `model` first).
 
-What that file was used for: PIT@CLE 2026-10-01 projections were rebased on
-it (kickers kept ours), and both sources are stored in projection_sources.
+What the files were used for: PIT@CLE 2026-10-01 and the Thu-Mon
+dk_thu_mon_2026_10_01 slate projections were rebased on them (kickers kept
+ours on Showdown), and both sources are stored in projection_sources.
 After standings are imported for those two slates, report
 `projection_accuracy(slate_id)` (model vs sabersim, same players). PHI@CHI:
 model MAE 4.24 vs SaberSim 4.50 on 19 players. Shape comparison on 36
@@ -115,9 +116,14 @@ changing anything, not changes to make on one file.
 
 ## Standing workflow: weekly player baseline update
 
-Set by the user 2026-10-01: the SaberSim export seeded a running baseline for
-every player it covered (player_baselines, 54 players on PHI/CHI/PIT/CLE),
-and from then on each player's numbers are updated from real results.
+Set by the user 2026-10-01: SaberSim exports seeded a running baseline per
+player (player_baselines). The full-week export
+NFL_2026-10-01-815pm_DK_Thu-Mon.csv (all 32 teams, week 4) seeded 410
+players, replacing the earlier 4-team seed; 18 projected players had no
+stats-history match (mostly fullbacks and rookies, e.g. Travis Hunter, Nick
+Singleton) and have no baseline. From then on each player's numbers are
+updated from real results. If another SaberSim export arrives, seed it with
+`seed_from_sabersim(..., replace_older=True)` and apply it to its slate.
 Every week, after games are played and before building the next slate:
 
 1. Refresh 2026 stats (`refresh_player_weekly_stats` / `refresh_dst_weekly_stats`).
@@ -129,6 +135,6 @@ Every week, after games are played and before building the next slate:
    projection_sources; report `projection_accuracy` for the slate after its
    standings are imported, so we can see whether the blend beats the model.
 
-Players without a baseline (the other 28 teams) use the model, which already
-rebuilds from recent games each week. The 20% and 50% weights are starting
+Players without a baseline use the model, which already rebuilds from
+recent games each week. The 20% and 50% weights are starting
 values; revisit them once several weeks of model-vs-blend accuracy exist.

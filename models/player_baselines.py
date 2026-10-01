@@ -50,6 +50,15 @@ def blend_ladders(model, baseline, weight=BASELINE_BLEND_WEIGHT):
     return {k: round((1 - weight) * float(model[k]) + weight * float(baseline[k]), 2) for k in model}
 
 
+_REPLACE_OLDER_SQL = """UPDATE SET name = EXCLUDED.name, team = EXCLUDED.team, position = EXCLUDED.position,
+                        ladder = EXCLUDED.ladder, usage = EXCLUDED.usage, source = EXCLUDED.source,
+                        seeded_season = EXCLUDED.seeded_season, seeded_week = EXCLUDED.seeded_week,
+                        updated_season = EXCLUDED.updated_season, updated_week = EXCLUDED.updated_week,
+                        games_applied = 0, updated_at = now()
+                    WHERE (player_baselines.seeded_season, player_baselines.seeded_week)
+                          <= (EXCLUDED.seeded_season, EXCLUDED.seeded_week)"""
+
+
 def _usage(path):
     out = {}
     with open(path, encoding="utf-8-sig", newline="") as f:
@@ -66,12 +75,16 @@ def _usage(path):
     return out
 
 
-def seed_from_sabersim(path, season, week_by_team, engine=None):
+def seed_from_sabersim(path, season, week_by_team, engine=None, replace_older=False):
     """Create baselines for every player the export projects. week_by_team
     gives the week each team's game in the export belongs to (an export can
     span weeks, e.g. a Monday and the following Thursday); results before
-    that week are treated as already reflected. Existing baselines are left
-    alone, so re-running never resets a player's updates."""
+    that week are treated as already reflected.
+
+    By default existing baselines are left alone, so re-running never resets
+    a player's updates. replace_older=True lets a newer export replace any
+    baseline seeded for the same or an earlier week - the newer projection
+    already reflects the games the old baseline was updated with."""
     engine = engine or get_engine()
     rows = [r for r in parse_sabersim_csv(path) if r["ladder"] and r["team"] in week_by_team]
     dk_like = [{"player_id": f"ss_{i}", "name": r["name"], "position": r["position"], "team": r["team"]} for i, r in enumerate(rows)]
@@ -90,8 +103,8 @@ def seed_from_sabersim(path, season, week_by_team, engine=None):
                     INSERT INTO player_baselines (gsis_id, name, team, position, ladder, usage, source,
                         seeded_season, seeded_week, updated_season, updated_week)
                     VALUES (:g, :n, :t, :pos, :l, :u, 'sabersim', :s, :w, :s, :prev)
-                    ON CONFLICT (gsis_id) DO NOTHING
-                    """
+                    ON CONFLICT (gsis_id) DO {}
+                    """.format(_REPLACE_OLDER_SQL if replace_older else "NOTHING")
                 ),
                 {"g": gsis, "n": r["name"], "t": r["team"], "pos": r["position"], "l": json.dumps(r["ladder"]),
                  "u": json.dumps(usage.get((r["name"], r["team"]), {})), "s": season, "w": week, "prev": week - 1},
