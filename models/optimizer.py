@@ -451,6 +451,10 @@ def _solve_showdown(
         if len(rows) > 1:
             prob += pulp.lpSum(x[p["player_id"]] for p in rows) <= 1
 
+    # DraftKings requires at least one player from each team on a Showdown roster.
+    for team in {p["team"] for p in players}:
+        prob += pulp.lpSum(x[p["player_id"]] for p in players if p["team"] == team) >= 1
+
     _apply_common_constraints(prob, x, players, locked_ids, excluded_ids, max_players_per_team, min_salary)
     _apply_diversity_constraints(prob, x, previous_lineups, min_uniques, SHOWDOWN_ROSTER_SIZE)
 
@@ -536,6 +540,11 @@ def _validate_showdown_roster(roster):
     for slot, p in roster:
         if slot not in ("CPT", "FLEX"):
             problems.append(f"unrecognized slot {slot!r} for {p.get('name')}")
+
+    # DraftKings rejects a Showdown lineup drawn from only one team.
+    teams = {p.get("team") for p in players if p.get("team")}
+    if len(teams) == 1:
+        problems.append(f"all players are from one team ({teams.pop()}) - Showdown needs both teams")
 
     return problems
 

@@ -88,3 +88,31 @@ def test_showdown_qb_captain_ids_finds_real_qbs_by_game_history(engine):
     qb_ids = set(showdown_qb_captain_ids([dict(r) for r in rows], engine))
     assert by_name["Jalen Hurts"] in qb_ids and by_name["Tyson Bagent"] in qb_ids
     assert by_name["D'Andre Swift"] not in qb_ids and by_name["DeVonta Smith"] not in qb_ids
+
+
+def test_showdown_lineups_always_include_both_teams():
+    # Team A's players are all projected far above team B's, so without the
+    # rule the solver would build an all-A lineup that DraftKings rejects.
+    pool = [dict(p, points=p["points"] * (5 if p["team"] == "A" else 1)) for p in _pool() + _extra_a()]
+    lineups, _ = build_lineups_from_pool(pool, num_lineups=4, min_uniques=1)
+    for lu in lineups:
+        assert len({p["team"] for _, p in lu["roster"]}) == 2
+
+
+def test_validator_rejects_a_one_team_showdown_lineup():
+    from models.optimizer import LineupValidationError, validate_lineup
+    a_only = [p for p in _pool() + _extra_a() if p["team"] == "A"]
+    roster = [("CPT", next(p for p in a_only if p["position"] == "CPT" and p["name"] == "Star"))]
+    roster += [("FLEX", p) for p in a_only if p["position"] == "FLEX" and p["name"] != "Star"][:5]
+    with pytest.raises(LineupValidationError):
+        validate_lineup({"roster": roster})
+
+
+def _extra_a():
+    # Two more cheap team-A players so an all-A roster is actually possible.
+    out = []
+    for name in ("TE2", "RB3"):
+        for pos, mult in (("FLEX", 1.0), ("CPT", 1.5)):
+            out.append({"player_id": f"{pos[0]}_{name}", "name": name, "position": pos, "team": "A", "opponent": "B",
+                        "salary": int(2000 * mult), "points": 6.0 * mult})
+    return out
