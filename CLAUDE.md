@@ -108,7 +108,9 @@ dk_thu_mon_2026_10_01 slate projections were rebased on them (kickers kept
 ours on Showdown), and both sources are stored in projection_sources.
 After standings are imported for those two slates, report
 `projection_accuracy(slate_id)` (model vs sabersim, same players). PHI@CHI:
-model MAE 4.24 vs SaberSim 4.50 on 19 players. Shape comparison on 36
+model MAE 4.24 vs SaberSim 4.50 on 19 players; PIT@CLE (2026-10-01):
+model 4.23 vs SaberSim 5.00 on 18 players (both too low, bias -3.8 / -4.1).
+Shape comparison on 36
 players: medians within about a point at every position; SaberSim's RB
 downside is much narrower (p10 at ~31% below median vs our ~97%) and its TE
 upside wider - candidates to verify against our own history before
@@ -133,6 +135,8 @@ Every week, after games are played and before building the next slate:
 2. `models.player_baselines.update_baselines((season, week))` - each played
    game moves a baseline 20% toward the real score (games a player missed
    change nothing).
+   Safe to run after each game day (Thursday, then Sunday/Monday): each
+   baseline is marked only through its own last applied game.
 3. `generate_projections` then blends each baseline 50/50 with the model's
    projection automatically and records model / baseline / blend in
    projection_sources; report `projection_accuracy` for the slate after its
