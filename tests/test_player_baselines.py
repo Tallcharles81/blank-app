@@ -54,11 +54,11 @@ def _baseline(engine):
 
 
 def test_update_applies_each_played_game_once_in_order(engine, baseline_player):
-    update_baselines((2099, 3), engine=engine)
+    update_baselines((2099, 3), engine=engine, gsis_ids=[GSIS])
     ladder, games, week = _baseline(engine)
     expected = smooth_ladder(smooth_ladder(LADDER, 20.0), 5.0)
     assert ladder["50"] == pytest.approx(expected["50"]) and games == 2 and week == 3
-    update_baselines((2099, 3), engine=engine)  # re-running the same week changes nothing
+    update_baselines((2099, 3), engine=engine, gsis_ids=[GSIS])  # re-running the same week changes nothing
     assert _baseline(engine)[1] == 2
 
 
@@ -75,3 +75,17 @@ def test_newer_seed_replaces_an_older_baseline_only_when_asked(engine, baseline_
     seed_from_sabersim(str(csv_path), 2099, {"ZZ": 4}, engine=engine, replace_older=True)
     ladder, games, week = _baseline(engine)
     assert ladder["50"] == 30.0 and games == 0 and week == 3
+
+
+def test_a_game_imported_after_an_earlier_update_of_its_week_still_applies(engine, baseline_player):
+    # Thursday's game is in, this player's Sunday game isn't yet: updating
+    # through week 4 must not mark week 4 done for him.
+    update_baselines((2099, 4), engine=engine, gsis_ids=[GSIS])
+    assert _baseline(engine)[1:] == (2, 3)
+    with engine.begin() as conn:
+        conn.execute(text("INSERT INTO player_weekly_stats (player_id, player_name, position, team, season, week, fantasy_points_ppr) "
+                          "VALUES (:g, 'Test Baseline', 'RB', 'ZZ', 2099, 4, 30.0)"), {"g": GSIS})
+    update_baselines((2099, 4), engine=engine, gsis_ids=[GSIS])
+    ladder, games, week = _baseline(engine)
+    expected = smooth_ladder(smooth_ladder(smooth_ladder(LADDER, 20.0), 5.0), 30.0)
+    assert ladder["50"] == pytest.approx(expected["50"]) and games == 3 and week == 4

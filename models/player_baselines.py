@@ -150,16 +150,23 @@ def _match_last_name_and_team(name, team, season, engine):
     return rows[0].player_id if len(rows) == 1 else None
 
 
-def update_baselines(through, engine=None):
+def update_baselines(through, engine=None, gsis_ids=None):
     """Apply every real game after each baseline's updated week, up to and
     including `through` (season, week), in order. A week a player didn't
     play (no stats row) changes nothing - an absence isn't a 0-point
-    performance to learn from."""
+    performance to learn from. Safe to run mid-week: each baseline is marked
+    only through its own last applied game. `gsis_ids` limits the update to
+    those players (tests use it so they never touch the real baselines)."""
     engine = engine or get_engine()
     season, week = through
     updated = []
     with engine.begin() as conn:
-        baselines = conn.execute(text("SELECT * FROM player_baselines")).mappings().fetchall()
+        if gsis_ids is None:
+            baselines = conn.execute(text("SELECT * FROM player_baselines")).mappings().fetchall()
+        else:
+            baselines = conn.execute(
+                text("SELECT * FROM player_baselines WHERE gsis_id = ANY(:ids)"), {"ids": list(gsis_ids)}
+            ).mappings().fetchall()
         for b in baselines:
             games = conn.execute(
                 text(
@@ -175,8 +182,13 @@ def update_baselines(through, engine=None):
             ladder = b["ladder"] if isinstance(b["ladder"], dict) else json.loads(b["ladder"])
             for g in games:
                 ladder = smooth_ladder(ladder, g.pts)
-            if games:
-                updated.append((b["name"], [g.pts for g in games], ladder["50"]))
+            if not games:
+                continue
+            updated.append((b["name"], [g.pts for g in games], ladder["50"]))
+            # Advance only to the last game actually applied, not to `through`:
+            # a Thursday game lands before the rest of its week, and marking
+            # week N done for every player would skip their Sunday games.
+            # Re-checking weeks a player sat out is harmless (no row, no change).
             conn.execute(
                 text(
                     """
@@ -185,7 +197,7 @@ def update_baselines(through, engine=None):
                     WHERE gsis_id = :g AND (updated_season, updated_week) < (:s, :w)
                     """
                 ),
-                {"l": json.dumps(ladder), "n": len(games), "s": season, "w": week, "g": b["gsis_id"]},
+                {"l": json.dumps(ladder), "n": len(games), "s": games[-1].season, "w": games[-1].week, "g": b["gsis_id"]},
             )
     return {"through": through, "baselines": len(baselines), "updated": updated}
 
