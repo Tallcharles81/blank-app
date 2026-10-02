@@ -17,6 +17,7 @@ from models.calibration import (
     run_hard_exclude_backtest,
     run_opportunity_score_backtest,
     run_playing_time_floor_backtest,
+    run_quantile_coverage_backtest,
     run_salary_left_backtest,
     run_shrinkage_backtest,
     run_situational_backtest,
@@ -452,3 +453,15 @@ def test_run_playing_time_floor_backtest_runs_and_shows_a_real_effect(engine):
         assert miss["position"] in ("QB", "RB", "WR", "TE")
     scores = [m["actual_score"] for m in result["top_misses"]]
     assert scores == sorted(scores, reverse=True)
+
+
+def test_quantile_coverage_backtest_reports_ordered_shares_by_position_and_tercile(engine):
+    result = run_quantile_coverage_backtest("dk_thu_mon_2026_09_17", seasons={2026}, engine=engine)
+
+    assert result["player_weeks"] > 0
+    pooled = result["pooled"]["share_below"]
+    # Higher points on the ladder must have at least as many real scores below them.
+    assert [pooled[k] for k in ("10", "25", "50", "75", "90")] == sorted(pooled[k] for k in ("10", "25", "50", "75", "90"))
+    assert {"QB", "RB", "WR", "TE"} <= set(result["by_position"])
+    if result["by_implied_total_tercile"]:
+        assert result["by_implied_total_tercile"]["high"]["avg_gap"] > result["by_implied_total_tercile"]["low"]["avg_gap"]

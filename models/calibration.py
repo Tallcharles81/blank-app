@@ -2497,3 +2497,100 @@ def run_dst_matchup_backtest(source_slate_id, seasons=None, engine=None):
         "current_vs_proposed_t_stat": round(t_cp, 4) if t_cp is not None else None,
         "current_vs_proposed_p_value": round(p_cp, 4) if p_cp is not None else None,
     }
+
+
+def run_quantile_coverage_backtest(source_slate_id, seasons=None, engine=None):
+    """How often real scores land below each point of the projected ladder
+    (10/25/50/75/90), by position and by Vegas implied-total tercile. A
+    well-calibrated ladder has 10% of real scores below p10, 50% below the
+    median, 90% below p90.
+
+    Built to check two open questions with history instead of one game:
+    whether our RB floor is too low (SaberSim's sat far closer to the
+    median - PIT@CLE/PHI@CHI exports), and whether we under-project
+    players in high-total games (every projection on PIT@CLE came in ~4
+    points low). Same as-of/no-lookahead method as the other backtests:
+    each week is projected only from games before it, with the live Vegas
+    adjustment applied, and only player-weeks the player actually played
+    are scored (availability is the gate's job, not the ladder's).
+    """
+    engine = engine or get_engine()
+
+    slate_players = load_slate_pool(source_slate_id, engine)
+    if not slate_players:
+        raise ValueError(f"No players found in slate_player_pool for slate {source_slate_id}")
+    gsis_by_dk_id, _, _ = resolve_dk_players_to_gsis(slate_players, engine)
+    players_by_id = {p["player_id"]: p for p in slate_players}
+
+    weeks = _available_weeks(engine)
+    if seasons is not None:
+        weeks = [(s, w) for s, w in weeks if s in seasons]
+
+    try:
+        implied_totals_by_team_season_week = _team_implied_totals(fetch_schedules())
+    except Exception:
+        implied_totals_by_team_season_week = {}
+
+    labels = ("10", "25", "50", "75", "90")
+    records = []  # (position, gap_or_None, actual, ladder)
+    for season, week in weeks:
+        history = _load_recent_stats(gsis_by_dk_id.values(), engine, before=(season, week))
+        actual_points, _ = load_actual_scores(slate_players, season, week, engine)
+        played_gsis_ids = _played_gsis_ids(gsis_by_dk_id.values(), season, week, engine)
+        teams_by_gsis = _teams_for_week(gsis_by_dk_id.values(), season, week, engine)
+        implied_totals_by_team = {
+            team: total for (team, s, w), total in implied_totals_by_team_season_week.items() if s == season and w == week
+        }
+        league_average = (
+            sum(implied_totals_by_team.values()) / len(implied_totals_by_team) if implied_totals_by_team else None
+        )
+        for dk_id, gsis_id in gsis_by_dk_id.items():
+            player = players_by_id.get(dk_id)
+            if player is None or dk_id not in actual_points:
+                continue
+            if player["position"] != "DST" and gsis_id not in played_gsis_ids:
+                continue
+            games = history.get(gsis_id)
+            if not games:
+                continue
+            proj = _project_from_history(games, player["position"])
+            real_team = teams_by_gsis.get(gsis_id)
+            implied_total = implied_totals_by_team.get(real_team) if real_team else None
+            gap = None
+            if implied_total is not None and league_average is not None:
+                proj = _apply_game_environment_adjustment(proj, implied_total, league_average)
+                gap = implied_total - league_average
+            records.append((player["position"], gap, actual_points[dk_id], proj["proj_percentiles"]))
+
+    if not records:
+        raise ValueError(f"No real player-weeks could be evaluated for slate {source_slate_id}")
+
+    def _coverage(rows):
+        if not rows:
+            return None
+        n = len(rows)
+        return {
+            "n": n,
+            "share_below": {k: round(sum(1 for _, _, a, lad in rows if a < lad[k]) / n, 4) for k in labels},
+            "avg_actual": round(sum(a for _, _, a, _ in rows) / n, 2),
+            "avg_projected_median": round(sum(lad["50"] for _, _, _, lad in rows) / n, 2),
+        }
+
+    by_position = defaultdict(list)
+    for r in records:
+        by_position[r[0]].append(r)
+
+    with_gap = sorted((r for r in records if r[1] is not None), key=lambda r: r[1])
+    third = len(with_gap) // 3
+    terciles = {}
+    if third >= 20:
+        for label, rows in (("low", with_gap[:third]), ("middle", with_gap[third:-third]), ("high", with_gap[-third:])):
+            terciles[label] = {"avg_gap": round(sum(r[1] for r in rows) / len(rows), 2), **_coverage(rows)}
+
+    return {
+        "player_weeks": len(records),
+        "target_share_below": {k: int(k) / 100 for k in labels},
+        "pooled": _coverage(records),
+        "by_position": {pos: _coverage(rows) for pos, rows in sorted(by_position.items())},
+        "by_implied_total_tercile": terciles,
+    }
