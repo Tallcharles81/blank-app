@@ -133,8 +133,11 @@ model 4.23 vs SaberSim 5.00 on 18 players (both too low, bias -3.8 / -4.1).
 Shape comparison on 36
 players: medians within about a point at every position; SaberSim's RB
 downside is much narrower (p10 at ~31% below median vs our ~97%) and its TE
-upside wider - candidates to verify against our own history before
-changing anything, not changes to make on one file.
+upside wider. Checked against history 2026-10-02
+(`run_quantile_coverage_backtest`, 2023-26): our RB floor is right - 11% of
+real scores for RBs projected 8+ fell below our p10 (target 10%) vs 34%
+below a SaberSim-style floor - so keep ours. Their wider TE upside is
+supported: 17% of real TE scores beat our p90 (target 10%).
 
 ## Standing workflow: weekly player baseline update
 
