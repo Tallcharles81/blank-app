@@ -76,8 +76,10 @@ CEILING_Z_BOOST = 0.3
 #
 # Off by default: lineups built from the calibrated projections scored no
 # better on real results (57 weeks, optimizer top-5 by median -0.06 pts/wk,
-# by ceiling -0.90, both noise). Turn on only if a lineup-level backtest
-# shows it helps.
+# by ceiling -0.90, both noise), and simulation-selected lineups did
+# slightly worse (run_simulation_selection_backtest, same 57 weeks, seed 7:
+# field percentile 0.9475 -> 0.9340). Turn on only if a lineup-level
+# backtest shows it helps.
 USE_MEDIAN_CALIBRATION = False
 MEDIAN_CALIBRATION = {
     "QB": (5.0, 0.65),
