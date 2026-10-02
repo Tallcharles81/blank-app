@@ -162,6 +162,13 @@ def test_generate_projections_discounts_a_player_who_missed_team_games(engine):
             stored = dict(conn.execute(
                 text("SELECT player_id, proj_median FROM projections WHERE slate_id = :s"), {"s": E2E_SLATE}
             ).fetchall())
+            # A player with a running baseline is stored as the model/baseline
+            # blend; the discount under test is applied to the model side,
+            # which generate_projections records as source 'model'.
+            stored.update(conn.execute(
+                text("SELECT player_id, proj_median FROM projection_sources WHERE slate_id = :s AND source = 'model'"),
+                {"s": E2E_SLATE},
+            ).fetchall())
 
         assert missed[sitter.player_id] >= 1 and missed[EGBUKA] == 0
         if sitter.player_id not in history:
@@ -173,6 +180,7 @@ def test_generate_projections_discounts_a_player_who_missed_team_games(engine):
     finally:
         with engine.begin() as conn:
             conn.execute(text("DELETE FROM projections WHERE slate_id = :s"), {"s": E2E_SLATE})
+            conn.execute(text("DELETE FROM projection_sources WHERE slate_id = :s"), {"s": E2E_SLATE})
             conn.execute(text("DELETE FROM slate_player_pool WHERE slate_id = :s"), {"s": E2E_SLATE})
 
 

@@ -55,6 +55,10 @@ def showdown_projection_slate(engine):
                 {"slate_id": TEST_SHOWDOWN_PROJECTIONS_SLATE_ID},
             )
             conn.execute(
+                text("DELETE FROM projection_sources WHERE slate_id = :slate_id"),
+                {"slate_id": TEST_SHOWDOWN_PROJECTIONS_SLATE_ID},
+            )
+            conn.execute(
                 text("DELETE FROM slate_player_pool WHERE slate_id = :slate_id"),
                 {"slate_id": TEST_SHOWDOWN_PROJECTIONS_SLATE_ID},
             )

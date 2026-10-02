@@ -82,6 +82,7 @@ def dst_adjustment_slate(engine):
     finally:
         with engine.begin() as conn:
             conn.execute(text("DELETE FROM projections WHERE slate_id = :s"), {"s": TEST_DST_ADJUSTMENT_SLATE_ID})
+            conn.execute(text("DELETE FROM projection_sources WHERE slate_id = :s"), {"s": TEST_DST_ADJUSTMENT_SLATE_ID})
             conn.execute(text("DELETE FROM slate_player_pool WHERE slate_id = :s"), {"s": TEST_DST_ADJUSTMENT_SLATE_ID})
 
 
