@@ -71,6 +71,26 @@ least one lineup in each group, and pick the simulator group's lineups with
 so the simulation ranking can't drop them. Report it in the captain
 exposure table; tracking decides whether it helps.
 
+## Standing workflow: single-entry lineups and file naming
+
+Set by the user after PIT@CLE 2026-10-01. For a single-entry contest (or
+any contest the user enters with one lineup), use the main build's
+simulator #1 (simulator-01, `generate_simulation_selected_lineup`'s
+ranked[0]) instead of a separate leverage/contest-EV search: on PIT@CLE
+simulator-01 finished top 10.6% while the dedicated single-entry searches
+finished top 24-59%. A different pick needs a stated, specific reason
+(e.g. news after the build), told to the user.
+
+Deliver exactly one file per contest, named for the contest, e.g.
+`DKUpload_PIT_CLE_PlayAction_FINAL.csv`. When a lineup changes, overwrite
+that file instead of adding v2/v3, and delete superseded versions: on
+PIT@CLE, three versions per contest led to the Pylon v2 lineup going into
+Play-Action, where the Play-Action file would have cashed by 41 places.
+
+After standings are imported, report `compare_top_pick_to_pool()` next to
+`compare_build_groups()`; it stays INSUFFICIENT SAMPLE until
+`MIN_SLATES_FOR_VERDICT` slates.
+
 ## Standing workflow: news research before building and before lock
 
 Set by the user after PHI@CHI 2026-09-28: the data feeds still had Tyson
