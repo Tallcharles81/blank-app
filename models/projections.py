@@ -64,6 +64,29 @@ PERCENTILE_Z = {"10": -1.2816, "25": -0.6745, "50": 0.0, "75": 0.6745, "90": 1.2
 # and leave the median/below alone since busts are bounded near zero anyway.
 CEILING_Z_BOOST = 0.3
 
+# Regression to the mean, per position: median' = a + b * median. A recent-
+# games median overreacts - players projected 18+ (2025-26, n=532) scored
+# 18.96 on average against a 21.84 median, and players projected under 2
+# scored 2.58 against 0.71 (models/calibration.py::run_quantile_coverage_
+# backtest). Fit on 2023-24 only (n=9,054 player-weeks) by quantile loss over
+# the full ladder and tested on 2025-26 (n=6,652): loss 1.774 -> 1.735,
+# better at every position, paired t=7.89; the 18+ group's median becomes
+# 18.87. Spread (stdev) is still measured around the raw median. Positions
+# not listed (K) are left as they are.
+#
+# Off by default: lineups built from the calibrated projections scored no
+# better on real results (57 weeks, optimizer top-5 by median -0.06 pts/wk,
+# by ceiling -0.90, both noise). Turn on only if a lineup-level backtest
+# shows it helps.
+USE_MEDIAN_CALIBRATION = False
+MEDIAN_CALIBRATION = {
+    "QB": (5.0, 0.65),
+    "RB": (1.25, 0.80),
+    "WR": (1.0, 0.80),
+    "TE": (0.75, 0.75),
+    "DST": (2.0, 0.50),
+}
+
 # Real, current-week Vegas lines (spread_line/total_line, via
 # data/nflverse_fetch.py's fetch_team_implied_totals) were being fetched and
 # stored in player_weekly_stats.vegas_implied_total this whole time but never
@@ -408,6 +431,10 @@ def _project_from_history(games, position):
     stdev = _sample_stdev(games, median) if len(games) >= MIN_GAMES_FOR_OWN_VARIANCE else None
     if not stdev:
         stdev = median * POSITION_COV_FALLBACK.get(position, DEFAULT_COV_FALLBACK)
+
+    if USE_MEDIAN_CALIBRATION and position in MEDIAN_CALIBRATION:
+        a, b = MEDIAN_CALIBRATION[position]
+        median = max(a + b * median, 0.0)
 
     percentiles = {}
     for label, z in PERCENTILE_Z.items():
