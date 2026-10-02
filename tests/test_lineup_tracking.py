@@ -6,6 +6,7 @@ from sqlalchemy import text
 from data.lineup_tracking import (
     MIN_SLATES_FOR_VERDICT,
     compare_build_groups,
+    compare_top_pick_to_pool,
     register_built_lineups,
     score_builds_against_contest,
 )
@@ -108,3 +109,30 @@ def test_compare_reports_insufficient_sample_until_enough_slates(engine, cleanup
     assert full["n_slates"] == MIN_SLATES_FOR_VERDICT
     assert full["mean_finish_pct_diff"] == pytest.approx(-0.20)
     assert full["slates_group_b_better"] == MIN_SLATES_FOR_VERDICT
+
+
+def test_top_pick_is_compared_with_its_own_pool_and_singles_listed_apart(engine, cleanup):
+    slates = [f"TEST_TRACK_P{i}" for i in range(MIN_SLATES_FOR_VERDICT)]
+    with engine.begin() as conn:
+        def add(slate, build, lineup, pct):
+            conn.execute(text(
+                """INSERT INTO lineup_contest_results (contest_id, slate_id, build_id, lineup_id, build_group, points,
+                   finish_rank, field_size, finish_pct) VALUES (:c, :s, :b, :l, :g, 100, 1, 100, :p)"""),
+                {"c": f"TCP_{slate}", "s": slate, "b": build, "l": lineup, "g": lineup.split("-")[0], "p": pct})
+        for i, slate in enumerate(slates):
+            # Pool of 10 averaging 0.50; simulator-01 at 0.20 (+ noise so sd > 0).
+            add(slate, "main", "simulator-01", 0.20 + 0.01 * i)
+            for j in range(2, 6):
+                add(slate, "main", f"simulator-0{j}", 0.50)
+            for j in range(1, 6):
+                add(slate, "main", f"optimizer-0{j}", 0.50)
+        add(slates[0], "single", "simulator-01", 0.90)
+    few = compare_top_pick_to_pool(slate_ids=slates[:2], engine=engine)
+    assert few["verdict"].startswith("INSUFFICIENT SAMPLE")
+    assert few["single_entry_builds"] == [{"slate_id": slates[0], "build_id": "single", "finish_pct": 0.90}]
+    full = compare_top_pick_to_pool(slate_ids=slates, engine=engine)
+    first = full["builds"][0]
+    assert first["pool_size"] == 10 and first["simulator_01_finish_pct"] == pytest.approx(0.20)
+    assert first["pool_avg_finish_pct"] == pytest.approx((0.20 + 9 * 0.50) / 10)
+    assert full["slates_top_pick_better"] == MIN_SLATES_FOR_VERDICT
+    assert full["verdict"].startswith("TOP PICK BEATS THE POOL")

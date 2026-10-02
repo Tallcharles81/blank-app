@@ -288,3 +288,68 @@ def compare_build_groups(group_a="optimizer", group_b="simulator", slate_ids=Non
     else:
         out["verdict"] = f"NO DETECTABLE DIFFERENCE ({n} slates, p = {out.get('p', float('nan')):.2f})"
     return out
+
+
+def compare_top_pick_to_pool(slate_ids=None, min_pool=10, engine=None):
+    """Would a single entry do better taking the simulator's #1 lineup
+    (simulator-01, generate_simulation_selected_lineup's ranked[0]) from the
+    main build than an average lineup from that same build? Per slate and
+    build with at least `min_pool` lineups: the pool's mean finish
+    percentile, simulator-01's and optimizer-01's, each averaged over every
+    scored contest on the slate. One-lineup builds (dedicated single-entry
+    searches) are listed beside them for comparison.
+
+    Added after PIT@CLE 2026-10-01, where the main build's simulator-01
+    finished top 10.6% while the separate single-entry searches finished
+    top 24-59%. Same sample rule as compare_build_groups: INSUFFICIENT
+    SAMPLE until MIN_SLATES_FOR_VERDICT slates."""
+    engine = engine or get_engine()
+    sql = "SELECT slate_id, build_id, lineup_id, finish_pct FROM lineup_contest_results"
+    params = {}
+    if slate_ids is not None:
+        sql += " WHERE slate_id = ANY(:slates)"
+        params["slates"] = list(slate_ids)
+    with engine.connect() as conn:
+        rows = conn.execute(text(sql), params).fetchall()
+
+    per = defaultdict(lambda: defaultdict(list))  # (slate, build) -> lineup -> [finish_pct per contest]
+    for r in rows:
+        per[(r.slate_id, r.build_id)][r.lineup_id].append(float(r.finish_pct))
+
+    def avg(vals):
+        return sum(vals) / len(vals)
+
+    builds, singles = [], []
+    for (slate, build), lineups in sorted(per.items()):
+        means = {lid: avg(v) for lid, v in lineups.items()}
+        if len(means) == 1:
+            singles.append({"slate_id": slate, "build_id": build, "finish_pct": next(iter(means.values()))})
+        elif len(means) >= min_pool and "simulator-01" in means:
+            builds.append({"slate_id": slate, "build_id": build, "pool_size": len(means),
+                           "pool_avg_finish_pct": avg(list(means.values())),
+                           "simulator_01_finish_pct": means["simulator-01"],
+                           "optimizer_01_finish_pct": means.get("optimizer-01")})
+
+    # One number per slate (its largest build), so a slate with two builds isn't counted twice.
+    by_slate = {}
+    for b in builds:
+        if b["slate_id"] not in by_slate or b["pool_size"] > by_slate[b["slate_id"]]["pool_size"]:
+            by_slate[b["slate_id"]] = b
+    diffs = [b["simulator_01_finish_pct"] - b["pool_avg_finish_pct"] for b in by_slate.values()]
+    n = len(diffs)
+    out = {"builds": builds, "single_entry_builds": singles, "n_slates": n, "min_slates_for_verdict": MIN_SLATES_FOR_VERDICT}
+    if n:
+        out["mean_top_pick_minus_pool"] = avg(diffs)
+        out["slates_top_pick_better"] = sum(d < 0 for d in diffs)
+    if n < MIN_SLATES_FOR_VERDICT:
+        out["verdict"] = f"INSUFFICIENT SAMPLE ({n} of {MIN_SLATES_FOR_VERDICT} slates needed)"
+    else:
+        mean = avg(diffs)
+        sd = math.sqrt(sum((d - mean) ** 2 for d in diffs) / (n - 1))
+        z = mean / (sd / math.sqrt(n)) if sd > 0 else 0.0
+        out["p"] = math.erfc(abs(z) / math.sqrt(2))
+        if out["p"] < 0.05:
+            out["verdict"] = f"TOP PICK {'BEATS' if mean < 0 else 'TRAILS'} THE POOL (p = {out['p']:.3f}, {n} slates)"
+        else:
+            out["verdict"] = f"NO DETECTABLE DIFFERENCE ({n} slates, p = {out['p']:.2f})"
+    return out
