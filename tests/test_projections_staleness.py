@@ -189,3 +189,35 @@ def test_promoted_backup_qb_is_projected_from_his_real_starts_only(engine):
     # 1-16% relief cameos in 2024-2026 that must not count as starts.
     starts = _load_qb_starts({"00-0038416"}, engine, before=(2026, 3))
     assert starts["00-0038416"] == [7.68, 19.80, 13.18, 12.88]
+
+
+def test_injury_returner_gets_the_lighter_discount_only_with_a_clean_report():
+    import pandas as pd
+    from models.projections import _injury_returners
+
+    injuries = pd.DataFrame({
+        "gsis_id": ["RET", "RET", "QSTN", "QSTN", "QSTN", "ROLE", "LONG", "LONG", "LONG", "RET", "NODESIG", "NODESIG"],
+        "week": [2, 3, 2, 3, 4, 3, 1, 2, 3, 4, 2, 4],
+        "report_status": ["Out", "Out", "Out", "Doubtful", "Questionable", None, "Out", "Out", "Out", None, "Out", None],
+    })
+    missed = {
+        "RET": [(2026, 2), (2026, 3)],      # Out both weeks, on report week 4 with no designation -> returner
+        "QSTN": [(2026, 2), (2026, 3)],     # still Questionable this week -> general discount
+        "ROLE": [(2026, 3)],                # missed with no injury listed (role loss) -> general discount
+        "LONG": [(2026, 1), (2026, 2), (2026, 3)],  # 3 missed games -> beyond the returner window
+        "NODESIG": [(2026, 2), (2026, 3)],  # week 3 absence not on the report -> not every absence was injury
+        "OLD": [(2025, 18)],                # absence spans seasons -> not an in-season injury
+    }
+    assert _injury_returners(missed, injuries, 2026, 4) == {"RET"}
+
+
+def test_missed_team_games_counts_match_missed_team_weeks(engine):
+    from models.projections import _missed_team_games, _missed_team_weeks
+
+    with engine.connect() as conn:
+        rows = conn.execute(text(
+            "SELECT DISTINCT player_id, team FROM player_weekly_stats WHERE season = 2026 AND position = 'WR' LIMIT 40"
+        )).fetchall()
+    team_by_gsis = {r.player_id: r.team for r in rows}
+    weeks = _missed_team_weeks(team_by_gsis, engine)
+    assert _missed_team_games(team_by_gsis, engine) == {g: len(w) for g, w in weeks.items()}

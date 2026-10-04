@@ -5,7 +5,7 @@ from collections import defaultdict
 from sqlalchemy import text
 
 from data.depth_charts import latest_depth_chart_by_player
-from data.nflverse_fetch import fetch_team_implied_totals, to_nflverse_team
+from data.nflverse_fetch import download_csv, fetch_team_implied_totals, to_nflverse_team
 from data.player_availability import get_availability_gate, resolve_slate_season_week
 from data.player_crosswalk import resolve_dk_players_to_gsis
 from data.pre_lock_check import _load_recent_usage_batch
@@ -44,6 +44,20 @@ MAX_STALENESS_WEEKS = 4
 # scored 0 in weeks 2 and 3; rebuilding those slates with this discount
 # raised mean lineup score +5.1 (week 2) and +6.6 (week 3).
 MISSED_TEAM_GAMES_MULTIPLIER = {1: 0.586, 2: 0.375, 3: 0.367, 4: 0.274}
+# A starter returning from a reported injury is not a player losing his
+# role, but the discount above treated them the same: Nico Collins
+# (hamstring, Out weeks 2-3, full practice and no designation week 4) was
+# cut to 11.1 and scored 33.8 on 2026-10-04. Players whose every missed game
+# this season was a reported Out/Doubtful, who carry no designation now,
+# and who missed 1-2 games scored 0.695 of their undiscounted projection
+# (2024-25, n=191 of 3,453 missed-game player-weeks; 0.706 in 2024, 0.686 in
+# 2025) vs 0.586/0.375 under the general discount. Fit on 2024 and tested on
+# 2025 it removed most of the under-projection (bias -1.55 -> -0.59 pts)
+# at about equal MAE (3.73 -> 3.67, t=0.31) - modest evidence, but it stops
+# hiding a healthy returning starter's ceiling from the optimizer.
+INJURY_RETURN_MULTIPLIER = 0.695
+INJURY_RETURN_MAX_MISSED = 2
+INJURY_ABSENCE_STATUSES = ("Out", "Doubtful")
 MIN_GAMES_FOR_OWN_VARIANCE = 3
 # Recent weeks matter more than older ones - an exponential decay with a 4-week
 # half-life weights last week roughly 1.19x more than 4 weeks ago.
@@ -362,6 +376,12 @@ def _missed_team_games(team_by_gsis, engine, before=None):
     Players with no recorded game at all are omitted (they have no history
     to discount). `team_by_gsis` values are nflverse team codes.
     """
+    return {g: len(weeks) for g, weeks in _missed_team_weeks(team_by_gsis, engine, before).items()}
+
+
+def _missed_team_weeks(team_by_gsis, engine, before=None):
+    """{gsis_id: [(season, week), ...]} - the team games counted by
+    _missed_team_games, so a caller can check why each was missed."""
     if not team_by_gsis:
         return {}
     cutoff_sql = ""
@@ -388,9 +408,28 @@ def _missed_team_games(team_by_gsis, engine, before=None):
     for team, sw in team_weeks:
         weeks_by_team[team].append(sw)
     return {
-        gsis_id: sum(1 for sw in weeks_by_team.get(team_by_gsis[gsis_id], []) if sw > last_sw)
+        gsis_id: sorted(divmod(sw, 100) for sw in weeks_by_team.get(team_by_gsis[gsis_id], []) if sw > last_sw)
         for gsis_id, last_sw in last_games
     }
+
+
+def _injury_returners(missed_weeks_by_gsis, injuries, season, week):
+    """gsis_ids that missed 1..INJURY_RETURN_MAX_MISSED team games, were
+    listed Out/Doubtful on the injury report for every one of them, and have
+    no game designation this week (off the report, or on it with no status).
+    `injuries` is nflverse's injury report for `season` (all weeks)."""
+    status = {}
+    for g, w, st in zip(injuries["gsis_id"], injuries["week"], injuries["report_status"]):
+        status[(g, int(w))] = st if isinstance(st, str) and st else None
+    returners = set()
+    for g, weeks in missed_weeks_by_gsis.items():
+        if not 1 <= len(weeks) <= INJURY_RETURN_MAX_MISSED:
+            continue
+        if any(s_ != season for s_, _ in weeks):
+            continue  # an absence spanning seasons isn't a reported in-season injury
+        if all(status.get((g, w)) in INJURY_ABSENCE_STATUSES for _, w in weeks) and status.get((g, week)) is None:
+            returners.add(g)
+    return returners
 
 
 def _weighted_median(games_most_recent_first):
@@ -521,7 +560,7 @@ def generate_projections(slate_id, engine=None, use_dst_opponent_matchup_adjustm
     usage_by_gsis = _load_recent_usage_batch(
         [gid for gid in gsis_by_dk_id.values() if gid is not None and not gid.startswith("DST_")], engine
     )
-    missed_games_by_gsis = _missed_team_games(
+    missed_weeks_by_gsis = _missed_team_weeks(
         {
             gsis_id: to_nflverse_team(player["team"])
             for player in players
@@ -529,6 +568,18 @@ def generate_projections(slate_id, engine=None, use_dst_opponent_matchup_adjustm
         },
         engine,
     )
+    missed_games_by_gsis = {g: len(w) for g, w in missed_weeks_by_gsis.items()}
+    # Best-effort, like every external fetch here: without the injury report
+    # every missed-games player keeps the general discount.
+    injury_returners = set()
+    try:
+        season_week = resolve_slate_season_week(slate_id, engine)
+        if season_week is not None:
+            injury_returners = _injury_returners(
+                missed_weeks_by_gsis, download_csv("injuries", f"injuries_{season_week[0]}.csv.gz"), *season_week
+            )
+    except Exception:
+        injury_returners = set()
 
     baselines_by_gsis = load_baselines(gsis_by_dk_id.values(), engine)
     promoted_qbs = _promoted_starting_qbs(slate_id, players, gsis_by_dk_id, engine)
@@ -592,7 +643,8 @@ def generate_projections(slate_id, engine=None, use_dst_opponent_matchup_adjustm
                 proj = _project_from_history(games, real_position)
                 missed = min(missed_games_by_gsis.get(gsis_id, 0), max(MISSED_TEAM_GAMES_MULTIPLIER))
                 if missed:
-                    proj = _scale_projection(proj, MISSED_TEAM_GAMES_MULTIPLIER[missed])
+                    multiplier = INJURY_RETURN_MULTIPLIER if gsis_id in injury_returners else MISSED_TEAM_GAMES_MULTIPLIER[missed]
+                    proj = _scale_projection(proj, multiplier)
             if baseline:
                 # The player's running baseline (models/player_baselines.py) is
                 # blended in before the Vegas and Captain adjustments, so both
