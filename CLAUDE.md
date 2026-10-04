@@ -71,6 +71,29 @@ least one lineup in each group, and pick the simulator group's lineups with
 so the simulation ranking can't drop them. Report it in the captain
 exposure table; tracking decides whether it helps.
 
+## Standing workflow: spread the portfolio across games and players
+
+Set by the user after 2026-10-04, when 20 lineups used only 3 QBs (Purdy 9,
+Lawrence 6, Allen 5), put up to 12 of 20 on the same players, and gave the
+#2-ranked game (DAL@HOU, 34-30) 4 of 180 player slots while the contest
+leader stacked it. Every multi-lineup build:
+
+1. Rank the slate's games with `models.game_environment.rank_slate_games`
+   and show the user the table.
+2. Give each of the top 5 games at least 2 lineups built around its QB
+   stack (lock that game's QB; the stack and bring-back rules still apply),
+   then fill the rest normally.
+3. Exposure caps per 10-lineup group: any QB at most 2 lineups, any DST at
+   most 30%, any other player at most 40% (`max_exposure` dict).
+4. Single-entry lineups built the same day are counted with the
+   multi-entry file: report the combined exposure, and don't let one
+   player's bust sink every entry - flag any player in more than 40% of all
+   the user's entries for the day.
+
+Report the per-game slot counts and QB list with the exposure table. Track
+it like the other rules: compare_build_groups and finish percentiles
+decide whether it helps.
+
 ## Standing workflow: single-entry lineups and file naming
 
 Set by the user after PIT@CLE 2026-10-01. For a single-entry contest (or
