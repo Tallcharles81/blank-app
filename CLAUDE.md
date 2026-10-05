@@ -102,13 +102,22 @@ decide whether it helps.
 
 ## Standing workflow: single-entry lineups and file naming
 
-Set by the user after PIT@CLE 2026-10-01. For a single-entry contest (or
-any contest the user enters with one lineup), use the main build's
-simulator #1 (simulator-01, `generate_simulation_selected_lineup`'s
-ranked[0]) instead of a separate leverage/contest-EV search: on PIT@CLE
-simulator-01 finished top 10.6% while the dedicated single-entry searches
-finished top 24-59%. A different pick needs a stated, specific reason
-(e.g. news after the build), told to the user.
+Updated 2026-10-05 (the user: "do whatever you think is best"). For a
+single-entry contest (or any contest the user enters with one lineup), pick
+`models.contest_selection.generate_contest_selected_lineup(slate_id,
+paid_share, ...)`'s ranked[0], with the same news exclusions and
+(Showdown) `min_captain_per_qb=1` as the main build. `paid_share` is that
+contest's paid places / entries. It replaced simulator-01 (win rate among
+our own candidates). Simulator-01 had averaged 8 points worse than its
+pool across 6 slates; in the 9-slate retro study (stored projections, 60
+candidates) its pick finished top 70% in Classic vs 51% for the average
+candidate. The cash-rate pick averaged top 43% over all 9 and was never
+the worst. No selection score predicted much (Spearman within +/-0.06), so
+report it as the least-bad pick, not an edge. The multi-entry simulator
+group (best simulated p90 per QB) is unchanged. A different single-entry
+pick needs a stated, specific reason (e.g. news after the build), told to
+the user. Keep tracking it with `compare_top_pick_to_pool()` and say so
+plainly if it underperforms.
 
 Deliver exactly one file per contest, named for the contest, e.g.
 `DKUpload_PIT_CLE_PlayAction_FINAL.csv`. When a lineup changes, overwrite
