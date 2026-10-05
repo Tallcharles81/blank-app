@@ -197,3 +197,25 @@ Every week, after games are played and before building the next slate:
 Players without a baseline use the model, which already rebuilds from
 recent games each week. The 20% and 50% weights are starting
 values; revisit them once several weeks of model-vs-blend accuracy exist.
+
+## Top-5 winner study (2026-10-05): what held up and what didn't
+
+Studied the top 5 lineups of all 27 uploaded contests (5 Classic Sundays
+incl. week 1, 7 Showdowns) against the whole field and our builds.
+- Real and already in the rules: winners' QB came from a top-5 Vegas-total
+  game 71% of the time vs 46% for the field (the spread portfolio covers it).
+- Not different from the field: total ownership (112 vs 112), QB ownership
+  (~7%), stack size (QB + 1.35 vs 1.33 receivers), kicker/DST use in
+  Showdown, captain ownership (11% vs 14%). Don't present these as edges.
+- Looked like patterns but failed a retro test (stored projections, same
+  pool, only the rule changed) - do not adopt without new evidence:
+  no RB in Classic FLEX (winners 14% vs field 40% 3-RB): avg finish
+  55/44/36% -> 54/47/39%, cashes 18 -> 15 over 9/20, 9/27, 10/04.
+  Showdown captain's team 4+ of 6 (winners 84% vs field 66%): avg finish
+  43% -> 44%, cashes 35 -> 33, worse on 3 of 6 slates.
+- What actually separated us from the winners on 9/27 and 10/04 was the
+  players, not construction: 0 exposure to the cores (Geno/G. Wilson/Sadiq/
+  JSN; Stroud/Lamb/Collins/Hockenson), from projection misses (Geno $4,900
+  ranked QB29, rookie Sadiq projected 3.7, injury-returner Collins 11.1 at
+  $7,200) plus the pre-spread concentration.
+Scripts: scratchpad top5_patterns.py / top5_agg.py / retro_patterns.py.
