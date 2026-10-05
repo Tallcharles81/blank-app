@@ -47,3 +47,17 @@ def stable_slate():
     finally:
         opt.game_lock_status = real_lock
         opt.resolve_slate_season_week = real_resolve
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _remove_test_contests(engine):
+    """The payout tests import fake contests (ids starting "test_") into the
+    real database, some tied to real slates (test_fs_payout_contest sat on
+    dk_sunday_2026_09_27). Remove them after the run so nothing that reads
+    contests by slate ever picks one up."""
+    yield
+    from sqlalchemy import text
+
+    with engine.begin() as conn:
+        conn.execute(text(r"DELETE FROM contest_payout_tiers WHERE contest_id LIKE 'test\_%'"))
+        conn.execute(text(r"DELETE FROM contests WHERE contest_id LIKE 'test\_%'"))

@@ -13,15 +13,19 @@ def _zay_flex_id(engine):
         ).scalar()
 
 
-def test_role_override_bypasses_only_the_role_checks(engine):
+def test_role_override_bypasses_only_the_role_checks(engine, monkeypatch):
     # Zay Flowers returned from a hamstring on a snap count (29%/33%), so the
     # snap-share floor excludes him; news says the role is intact.
+    import models.optimizer as opt
+
     zay = _zay_flex_id(engine)
     if zay is None:
         pytest.skip("2026-10-01 slate not loaded")
+    # This is about the role override, not lock timing: once the slate's
+    # games kicked off, the lock gate excluded him on the override call and
+    # the test failed for a reason it doesn't cover.
+    monkeypatch.setattr(opt, "game_lock_status", lambda players: {p["player_id"]: False for p in players})
     _, excluded, _, _ = _load_player_pool(SLATE, "proj_ceiling", engine)
-    if excluded.get(zay) == "game already started":
-        pytest.skip("slate already locked")
     assert "snap share" in excluded[zay]
 
     players, excluded, _, _ = _load_player_pool(SLATE, "proj_ceiling", engine, role_override_ids={zay})
