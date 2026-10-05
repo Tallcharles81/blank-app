@@ -348,16 +348,26 @@ def _load_qb_starts(gsis_ids, engine, before=None, min_snap_pct=QB_START_MIN_SNA
     return dict(starts)
 
 
-def _promoted_starting_qbs(slate_id, players, gsis_by_dk_id, engine):
-    """gsis_ids of backup QBs who start this week because every QB above
-    them on the depth chart is ruled out (same rule the optimizer's
-    playing-time gate uses - see promote_past_unavailable_qbs).
+def _expected_starting_qbs(slate_id, players, gsis_by_dk_id, engine):
+    """gsis_ids of every QB expected to start this week: QB1 on his team's
+    latest depth-chart snapshot, after promoting past ruled-out QBs (same
+    rule the optimizer's playing-time gate uses - see
+    promote_past_unavailable_qbs).
 
-    Their normal recent-games projection is built from relief cameos, not
-    starts: Tyson Bagent (PHI@CHI 2026-09-28, Caleb Williams Out) projected
-    a 0.8 median off 2.16 / 0.80 / 1.78-point relief games, while his four
-    real 2023 starts averaged 13.4. Best-effort: any fetch failure just
-    returns no promotions, leaving the normal projection in place.
+    These are projected from their real starts only (QB_START_MIN_SNAP_PCT),
+    not every recent game. Relief cameos and games left early drag a
+    starter's median down: on every 2023-2025 QB start whose prior 10 games
+    included a partial one (699 starts), the all-games median ran 2.09
+    points low (MAE 6.79) vs 0.11 (MAE 6.50) from starts only, and every
+    season moved the same way (2024 bias +2.61 -> +0.45, 2025 +2.18 ->
+    -0.06). Tyson Bagent (PHI@CHI 2026-09-28) was the extreme case: 0.8
+    median off relief games vs 13.4 in his real starts. 2026 Sundays had
+    Darnold, Mariota, Lock and Winston all projected under 10 as starters
+    and scoring 20-33. Backups stay on the normal projection, so a QB2
+    with two old starts doesn't get a starter's number.
+
+    Best-effort: any fetch failure returns no starters, leaving the normal
+    projection in place.
     """
     try:
         season_week = resolve_slate_season_week(slate_id, engine)
@@ -369,7 +379,16 @@ def _promoted_starting_qbs(slate_id, players, gsis_by_dk_id, engine):
     except Exception:
         return set()
     promoted = promote_past_unavailable_qbs(depth_chart, unavailable)
-    return {gid for gid, e in promoted.items() if e.get("promoted_from_rank") and e["pos_rank"] == 1}
+    # Older snapshot rows linger for released or moved QBs; only the team's
+    # latest snapshot says who is QB1 now.
+    latest_by_team = {}
+    for entry in promoted.values():
+        if entry["position"] == "QB":
+            latest_by_team[entry["team"]] = max(latest_by_team.get(entry["team"], ""), entry["as_of"])
+    return {
+        gid for gid, e in promoted.items()
+        if e["position"] == "QB" and e["pos_rank"] == 1 and e["as_of"] == latest_by_team[e["team"]] and gid not in unavailable
+    }
 
 
 def _missed_team_games(team_by_gsis, engine, before=None):
@@ -596,8 +615,8 @@ def generate_projections(slate_id, engine=None, use_dst_opponent_matchup_adjustm
         injury_returners = set()
 
     baselines_by_gsis = load_baselines(gsis_by_dk_id.values(), engine)
-    promoted_qbs = _promoted_starting_qbs(slate_id, players, gsis_by_dk_id, engine)
-    qb_starts_by_gsis = _load_qb_starts(promoted_qbs, engine)
+    starting_qbs = _expected_starting_qbs(slate_id, players, gsis_by_dk_id, engine)
+    qb_starts_by_gsis = _load_qb_starts(starting_qbs, engine)
 
     # Real, current-week game-environment signal (see
     # GAME_ENVIRONMENT_CEILING_BOOST_PER_POINT) - best-effort per this
@@ -641,7 +660,7 @@ def generate_projections(slate_id, engine=None, use_dst_opponent_matchup_adjustm
             games = history_by_gsis.get(gsis_id) if gsis_id else None
             starts = qb_starts_by_gsis.get(gsis_id, [])
             if len(starts) >= MIN_QB_STARTS_FOR_PROMOTION:
-                # Starting this week - project from his real starts, not relief snaps.
+                # Starting this week - project from his real starts, not relief snaps or early exits.
                 games = starts
             baseline = baselines_by_gsis.get(gsis_id)
             if not games and not baseline:

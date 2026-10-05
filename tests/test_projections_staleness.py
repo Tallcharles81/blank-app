@@ -229,3 +229,34 @@ def test_missed_team_games_counts_match_missed_team_weeks(engine):
     team_by_gsis = {r.player_id: r.team for r in rows}
     weeks = _missed_team_weeks(team_by_gsis, engine)
     assert _missed_team_games(team_by_gsis, engine) == {g: len(w) for g, w in weeks.items()}
+
+
+def test_every_expected_starter_uses_starts_only_but_backups_do_not(monkeypatch):
+    # The starts-only projection now covers every QB1 (not just a promoted
+    # backup), and a QB2 must stay on his normal projection so two old
+    # starts don't hand a backup a starter's number.
+    import models.projections as proj
+
+    chart = {
+        "S1": {"position": "QB", "team": "AAA", "pos_rank": 1, "as_of": "2026-10-01"},
+        "B1": {"position": "QB", "team": "AAA", "pos_rank": 2, "as_of": "2026-10-01"},
+        "OUT": {"position": "QB", "team": "BBB", "pos_rank": 1, "as_of": "2026-10-01"},
+        "UP": {"position": "QB", "team": "BBB", "pos_rank": 2, "as_of": "2026-10-01"},
+        "OLD": {"position": "QB", "team": "AAA", "pos_rank": 1, "as_of": "2026-09-15"},  # stale snapshot row
+        "WR1": {"position": "WR", "team": "AAA", "pos_rank": 1, "as_of": "2026-10-01"},
+    }
+    monkeypatch.setattr(proj, "resolve_slate_season_week", lambda slate_id, engine: (2026, 5))
+    monkeypatch.setattr(proj, "get_availability_gate", lambda players, s, w, engine: (["dk_out"], None, None))
+    monkeypatch.setattr(proj, "latest_depth_chart_by_player", lambda season: chart)
+    got = proj._expected_starting_qbs("x", [], {"dk_out": "OUT"}, engine=None)
+    assert got == {"S1", "UP"}
+
+
+def test_expected_starters_fall_back_to_none_when_feeds_fail(monkeypatch):
+    import models.projections as proj
+
+    def boom(*a, **k):
+        raise RuntimeError("feed down")
+
+    monkeypatch.setattr(proj, "resolve_slate_season_week", boom)
+    assert proj._expected_starting_qbs("x", [], {}, engine=None) == set()
