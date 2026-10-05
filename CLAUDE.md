@@ -80,11 +80,17 @@ leader stacked it. Every multi-lineup build:
 
 1. Rank the slate's games with `models.game_environment.rank_slate_games`
    and show the user the table.
-2. Give each of the top 5 games at least 2 lineups built around its QB
-   stack (lock that game's QB; the stack and bring-back rules still apply),
-   then fill the rest normally.
-3. Exposure caps per 10-lineup group: any QB at most 2 lineups, any DST at
-   most 30%, any other player at most 40% (`max_exposure` dict).
+2. Build each 10-lineup group with `models.portfolio.qb_plan` +
+   `build_spread_portfolio`: both QBs of each of the top 5 games get one
+   stacked lineup (10 different QBs), every player capped at 40% and every
+   DST at 30%. Optimizer group: `choose=None`; simulator group: 8
+   candidates per QB, keep the best simulated one.
+3. Pass the news exclusions as `excluded_player_ids` as before.
+
+Retro test (projections stored at the time + the injury-return fix):
+9/27 cashed 6 of 20 vs 4 built, best rank 141 of 89,179; 10/04 cashed 7
+vs 1. Spreading alone, without the fix, was roughly neutral (5 and 0) -
+the projections matter as much as the spread.
 4. Single-entry lineups built the same day are counted with the
    multi-entry file: report the combined exposure, and don't let one
    player's bust sink every entry - flag any player in more than 40% of all
