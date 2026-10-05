@@ -57,10 +57,10 @@ MISSED_TEAM_GAMES_MULTIPLIER = {1: 0.586, 2: 0.375, 3: 0.367, 4: 0.274}
 # hiding a healthy returning starter's ceiling from the optimizer.
 INJURY_RETURN_MULTIPLIER = 0.695
 INJURY_RETURN_MAX_MISSED = 2
-# Questionable counts too: a player listed Questionable who then sat was an
-# injury absence (Puka Nacua: Questionable wk 2, Doubtful wk 3, 30.7 pts wk 4,
-# missed by the Out/Doubtful-only version). With it the group is n=211,
-# multiplier 0.687 (0.689 in 2024, 0.686 in 2025) - same as before.
+# Questionable counts too when he didn't fully practice: Puka Nacua
+# (Questionable + DNP wk 2, Doubtful wk 3, 30.7 pts wk 4) was missed by the
+# Out/Doubtful-only version. With that the group is n=204, multiplier 0.693
+# (0.695 in 2024, 0.691 in 2025) - same as before.
 INJURY_ABSENCE_STATUSES = ("Out", "Doubtful", "Questionable")
 MIN_GAMES_FOR_OWN_VARIANCE = 3
 # Recent weeks matter more than older ones - an exponential decay with a 4-week
@@ -419,19 +419,29 @@ def _missed_team_weeks(team_by_gsis, engine, before=None):
 
 def _injury_returners(missed_weeks_by_gsis, injuries, season, week):
     """gsis_ids that missed 1..INJURY_RETURN_MAX_MISSED team games, were
-    listed Out/Doubtful/Questionable for every one of them, and have
+    listed Out/Doubtful (or Questionable without full practice) for every one of them, and have
     no game designation this week (off the report, or on it with no status).
     `injuries` is nflverse's injury report for `season` (all weeks)."""
     status = {}
     for g, w, st in zip(injuries["gsis_id"], injuries["week"], injuries["report_status"]):
         status[(g, int(w))] = st if isinstance(st, str) and st else None
+    practice = injuries["practice_status"] if "practice_status" in injuries else [None] * len(injuries)
+    full_practice = {(g, int(w)) for g, w, ps in zip(injuries["gsis_id"], injuries["week"], practice)
+                     if isinstance(ps, str) and ps.startswith("Full")}
+
+    def injury_absence(g, w):
+        # Questionable with full practice, then sat, is a healthy scratch or a
+        # role call, not an injury: Jalen McMillan (Questionable but full
+        # practice wk 2) scored 0 in wk 3 and would have been boosted.
+        st = status.get((g, w))
+        return st in ("Out", "Doubtful") or (st == "Questionable" and (g, w) not in full_practice)
     returners = set()
     for g, weeks in missed_weeks_by_gsis.items():
         if not 1 <= len(weeks) <= INJURY_RETURN_MAX_MISSED:
             continue
         if any(s_ != season for s_, _ in weeks):
             continue  # an absence spanning seasons isn't a reported in-season injury
-        if all(status.get((g, w)) in INJURY_ABSENCE_STATUSES for _, w in weeks) and status.get((g, week)) is None:
+        if all(injury_absence(g, w) for _, w in weeks) and status.get((g, week)) is None:
             returners.add(g)
     return returners
 

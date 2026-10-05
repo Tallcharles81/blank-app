@@ -210,8 +210,13 @@ def test_injury_returner_gets_the_lighter_discount_only_with_a_clean_report():
     }
     assert _injury_returners(missed, injuries, 2026, 4) == {"RET"}
     # Listed Questionable, then sat: still an injury absence (the Puka Nacua case).
-    puka = pd.DataFrame({"gsis_id": ["PUKA"] * 3, "week": [2, 3, 4], "report_status": ["Questionable", "Doubtful", None]})
+    puka = pd.DataFrame({"gsis_id": ["PUKA"] * 3, "week": [2, 3, 4], "report_status": ["Questionable", "Doubtful", None],
+                         "practice_status": ["Did Not Participate In Practice"] * 2 + ["Full Participation in Practice"]})
     assert _injury_returners({"PUKA": [(2026, 2), (2026, 3)]}, puka, 2026, 4) == {"PUKA"}
+    # Questionable but practicing in full, then sat: not an injury absence (the Jalen McMillan case).
+    mcm = pd.DataFrame({"gsis_id": ["MCM"] * 3, "week": [1, 2, 3], "report_status": ["Doubtful", "Questionable", None],
+                        "practice_status": ["Limited Participation in Practice", "Full Participation in Practice", "Full Participation in Practice"]})
+    assert _injury_returners({"MCM": [(2026, 1), (2026, 2)]}, mcm, 2026, 3) == set()
 
 
 def test_missed_team_games_counts_match_missed_team_weeks(engine):
