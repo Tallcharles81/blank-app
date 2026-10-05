@@ -48,7 +48,7 @@ MISSED_TEAM_GAMES_MULTIPLIER = {1: 0.586, 2: 0.375, 3: 0.367, 4: 0.274}
 # role, but the discount above treated them the same: Nico Collins
 # (hamstring, Out weeks 2-3, full practice and no designation week 4) was
 # cut to 11.1 and scored 33.8 on 2026-10-04. Players whose every missed game
-# this season was a reported Out/Doubtful, who carry no designation now,
+# this season was on the injury report (Out/Doubtful/Questionable), who carry no designation now,
 # and who missed 1-2 games scored 0.695 of their undiscounted projection
 # (2024-25, n=191 of 3,453 missed-game player-weeks; 0.706 in 2024, 0.686 in
 # 2025) vs 0.586/0.375 under the general discount. Fit on 2024 and tested on
@@ -57,7 +57,11 @@ MISSED_TEAM_GAMES_MULTIPLIER = {1: 0.586, 2: 0.375, 3: 0.367, 4: 0.274}
 # hiding a healthy returning starter's ceiling from the optimizer.
 INJURY_RETURN_MULTIPLIER = 0.695
 INJURY_RETURN_MAX_MISSED = 2
-INJURY_ABSENCE_STATUSES = ("Out", "Doubtful")
+# Questionable counts too: a player listed Questionable who then sat was an
+# injury absence (Puka Nacua: Questionable wk 2, Doubtful wk 3, 30.7 pts wk 4,
+# missed by the Out/Doubtful-only version). With it the group is n=211,
+# multiplier 0.687 (0.689 in 2024, 0.686 in 2025) - same as before.
+INJURY_ABSENCE_STATUSES = ("Out", "Doubtful", "Questionable")
 MIN_GAMES_FOR_OWN_VARIANCE = 3
 # Recent weeks matter more than older ones - an exponential decay with a 4-week
 # half-life weights last week roughly 1.19x more than 4 weeks ago.
@@ -415,7 +419,7 @@ def _missed_team_weeks(team_by_gsis, engine, before=None):
 
 def _injury_returners(missed_weeks_by_gsis, injuries, season, week):
     """gsis_ids that missed 1..INJURY_RETURN_MAX_MISSED team games, were
-    listed Out/Doubtful on the injury report for every one of them, and have
+    listed Out/Doubtful/Questionable for every one of them, and have
     no game designation this week (off the report, or on it with no status).
     `injuries` is nflverse's injury report for `season` (all weeks)."""
     status = {}

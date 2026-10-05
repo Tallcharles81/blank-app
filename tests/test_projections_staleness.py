@@ -209,6 +209,9 @@ def test_injury_returner_gets_the_lighter_discount_only_with_a_clean_report():
         "OLD": [(2025, 18)],                # absence spans seasons -> not an in-season injury
     }
     assert _injury_returners(missed, injuries, 2026, 4) == {"RET"}
+    # Listed Questionable, then sat: still an injury absence (the Puka Nacua case).
+    puka = pd.DataFrame({"gsis_id": ["PUKA"] * 3, "week": [2, 3, 4], "report_status": ["Questionable", "Doubtful", None]})
+    assert _injury_returners({"PUKA": [(2026, 2), (2026, 3)]}, puka, 2026, 4) == {"PUKA"}
 
 
 def test_missed_team_games_counts_match_missed_team_weeks(engine):
