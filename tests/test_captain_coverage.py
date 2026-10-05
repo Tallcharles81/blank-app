@@ -116,3 +116,24 @@ def _extra_a():
             out.append({"player_id": f"{pos[0]}_{name}", "name": name, "position": pos, "team": "A", "opponent": "B",
                         "salary": int(2000 * mult), "points": 6.0 * mult})
     return out
+
+
+def test_owed_captain_is_built_before_exposure_caps_close_off_his_roster():
+    # ATL@NO 2026-10-05: with the owed captain saved for the last slot, the
+    # exposure caps had already used up the players his roster needed, the
+    # solve failed and the build silently came back one lineup short (or,
+    # without a salary floor, $8.5K under the cap). Placed early, it fits.
+    # Old behavior on this pool: 5 lineups, no Backup captain; and with no
+    # salary floor, a Backup-captain lineup at $38,100.
+    lineups, _ = build_lineups_from_pool(
+        _pool(), num_lineups=6, min_uniques=1, max_exposure=0.6, min_salary=45000,
+        min_captain_lineups={"C_Backup": 1},
+    )
+    assert len(lineups) == 6
+    assert _captains(lineups)["C_Backup"] == 1
+    assert lineups[1]["roster"][0][1]["player_id"] == "C_Backup"
+
+    no_floor, _ = build_lineups_from_pool(
+        _pool(), num_lineups=6, min_uniques=1, max_exposure=0.6, min_captain_lineups={"C_Backup": 1}
+    )
+    assert min(lu["total_salary"] for lu in no_floor) > 45000

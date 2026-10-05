@@ -727,7 +727,12 @@ def build_lineups_from_pool(
         captain_owed = {
             pid: n - exposure_counts[pid] for pid, n in min_captain_lineups.items() if n > exposure_counts[pid]
         }
-        if captain_owed and sum(captain_owed.values()) >= lineups_remaining:
+        # Owed captains are placed right after the unconstrained best lineup,
+        # not saved for the last slots: by then max_exposure has capped the
+        # players their roster needs, the solve fails, and the loop below
+        # silently stops one lineup short. ATL@NO 2026-10-05: the Penix
+        # captain lineup came out either $8.5K under the cap or not at all.
+        if captain_owed and (i >= 1 or sum(captain_owed.values()) >= lineups_remaining):
             forced_locks.append(max(captain_owed, key=captain_owed.get))
 
         conflicts = exposure_excluded & set(forced_locks)
@@ -924,6 +929,7 @@ def generate_lineups(
     punt_mode=False,
     min_captain_per_qb=0,
     role_override_ids=None,
+    min_salary=None,
     engine=None,
 ):
     """The live GPP-style lineup path (models/backtest.py, calibration.py,
@@ -987,6 +993,7 @@ def generate_lineups(
         require_qb_stack=require_qb_stack,
         require_bring_back=require_bring_back,
         min_captain_lineups=min_captain_lineups,
+        min_salary=min_salary,
     )
 
     availability_report = _build_availability_report(players, availability_excluded, injury_report_available)
@@ -1109,7 +1116,10 @@ def generate_cash_lineups(
     p<0.0001). The GPP ceiling objective (generate_lineups) was checked the
     same way and shows no such effect (correlation 0.03, avg $907 left
     unspent on its own) - it naturally spends the cap without needing this
-    constraint, which is why generate_lineups has no min_salary of its own.
+    constraint, which is why generate_lineups defaults min_salary to None. It
+    accepts one for the exception: Showdown captain coverage plus exposure
+    caps can force a captain whose best legal roster is cheap filler (ATL@NO
+    2026-10-05: two Penix-captain lineups left ~$8K unspent).
 
     lineup['total_points'] on the results is the real sum of proj_floor (what
     you'd actually expect), not the risk-adjusted objective value used
