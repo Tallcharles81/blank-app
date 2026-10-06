@@ -152,6 +152,15 @@ Both checks run on every slate whether or not the user asks a follow-up.
 Cite the sources. If a search is blocked or comes back empty, say so rather
 than assuming no news.
 
+If the inactive list can't be confirmed from here (ATL@NO 2026-10-05: ESPN,
+CBS, SI, Yahoo, FantasyPros and the DK/Sleeper APIs were all blocked by the
+network policy, and Questionable Noah Fant turned out inactive and scored 0
+in 6 of 20 lineups), don't leave it at "probably fine": at build time keep
+any Questionable player who didn't practice fully to at most 2 of 20
+lineups, and before lock tell the user plainly that inactives are
+unconfirmed, give the swap rows, and ask them to check DraftKings' red
+"O"/"INACT" tag before kickoff.
+
 When news rules out a player, move his production with
 `models.absence_redistribution.redistribute_absence(slate_id, name)`, not a
 hand-made split (added 2026-10-06). Measured on 2023-25: a lead RB's backup
