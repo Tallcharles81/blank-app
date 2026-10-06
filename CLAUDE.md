@@ -152,6 +152,14 @@ Both checks run on every slate whether or not the user asks a follow-up.
 Cite the sources. If a search is blocked or comes back empty, say so rather
 than assuming no news.
 
+When news rules out a player, move his production with
+`models.absence_redistribution.redistribute_absence(slate_id, name)`, not a
+hand-made split (added 2026-10-06). Measured on 2023-25: a lead RB's backup
+gains a median 34% of his points and the third back 15%; a lead WR's absence
+lifts the other WRs/TEs by about nothing, so it moves nothing. The two
+hand-made splits it replaced both missed: Coker (60% to pass catchers,
+DET@CAR) and Etienne (Kamara got 33%, then scored 22.8 vs our 11.9).
+
 ## SaberSim: one-time reference, our model stays the base
 
 The user had a SaberSim subscription for one slate only (cancelled
@@ -228,3 +236,16 @@ incl. week 1, 7 Showdowns) against the whole field and our builds.
   ranked QB29, rookie Sadiq projected 3.7, injury-returner Collins 11.1 at
   $7,200) plus the pre-spread concentration.
 Scripts: scratchpad top5_patterns.py / top5_agg.py / retro_patterns.py.
+
+Game-script Showdown builds (tested 2026-10-06 after ATL@NO, where every
+top-100 lineup was Kamara/Bijan/B. Robinson and none of ours was): simulate
+the game 1,000 times, build the best lineup for each simulated game, and
+pick the 20 that cash in the most different outcomes. On all 7 Showdowns
+with standings (stored projections, same exclusions/caps/captain rule) it
+finished better on average (top 44% vs 48%, 5 of 7 slates) and cashed more
+(40 vs 35 of ~140), but hit fewer top-1% finishes (2 vs 5), and on a typical
+GPP payout curve it returned $1.27 per $1 vs $1.80 for the current build
+(also behind at flatter and steeper curves). 10 optimizer + 10 game-script
+was worse than both. Not adopted; code kept in the scratchpad
+(scenario_builds_rejected.py). Revisit only with more slates, or for
+cash-style contests where finishing in the money matters more than the top.
