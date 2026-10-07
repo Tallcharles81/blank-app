@@ -44,3 +44,26 @@ def test_spread_portfolio_caps_every_player_and_uses_a_different_qb_each_lineup(
     positions = {p["player_id"]: p["position"] for p in pool}
     assert all(c <= (2 if positions[pid] == "DST" else 3) for pid, c in counts.items() if positions[pid] != "QB")
     assert len({p["player_id"] for lu in lineups for s, p in lu["roster"] if s == "QB"}) == 6
+
+
+def test_tight_per_player_cap_holds_below_the_general_cap():
+    import models.portfolio as pf
+    from collections import Counter
+
+    calls = []
+
+    def fake_build(pool, num_lineups, locked_player_ids, excluded_player_ids, **kw):
+        calls.append(set(excluded_player_ids))
+        roster = [("QB", {"player_id": locked_player_ids[0]})] + [("WR", {"player_id": "Q_WR"})] * (0 if "Q_WR" in excluded_player_ids else 1)
+        roster.append(("WR", {"player_id": f"filler_{len(calls)}"}))
+        return [{"roster": roster}], {}
+
+    orig = pf.build_lineups_from_pool
+    pf.build_lineups_from_pool = fake_build
+    try:
+        pool = [{"player_id": f"qb{i}", "position": "QB"} for i in range(6)] + [{"player_id": "Q_WR", "position": "WR"}]
+        lus, _ = pf.build_spread_portfolio(pool, [f"qb{i}" for i in range(6)], max_player_share=1.0, max_count_by_player={"Q_WR": 2})
+    finally:
+        pf.build_lineups_from_pool = orig
+    counts = Counter(p["player_id"] for lu in lus for _, p in lu["roster"])
+    assert counts["Q_WR"] == 2

@@ -44,10 +44,16 @@ def qb_plan(ranked_games, pool, num_lineups, top_games=5):
 
 
 def build_spread_portfolio(pool, plan, choose=None, candidates_per_qb=1, max_player_share=MAX_PLAYER_SHARE,
-                           max_dst_share=MAX_DST_SHARE, require_bring_back=False, excluded_player_ids=None):
+                           max_dst_share=MAX_DST_SHARE, require_bring_back=False, excluded_player_ids=None,
+                           max_count_by_player=None):
     """One lineup per QB in `plan`, each a QB stack built with every capped
     player excluded. Returns the lineups in plan order (a QB whose stack
-    can't be built under the caps is skipped and reported in `skipped`)."""
+    can't be built under the caps is skipped and reported in `skipped`).
+
+    max_count_by_player: {player_id: n} tighter caps for single players, e.g.
+    a Questionable player whose status can't be confirmed before the build
+    (at most 2 lineups - ATL@NO 2026-10-05, where an unconfirmed
+    Questionable TE turned out inactive in 6 of 20 lineups)."""
     n = len(plan)
     player_cap = max(1, int(max_player_share * n))
     dst_cap = max(1, int(max_dst_share * n))
@@ -55,8 +61,9 @@ def build_spread_portfolio(pool, plan, choose=None, candidates_per_qb=1, max_pla
     base_excluded = set(excluded_player_ids or [])
     positions = {p["player_id"]: p["position"] for p in pool}
     for qb in plan:
+        tight = max_count_by_player or {}
         capped = {pid for pid, c in counts.items()
-                  if pid != qb and c >= (dst_cap if positions.get(pid) == "DST" else player_cap)}
+                  if pid != qb and c >= min(tight.get(pid, 10**9), dst_cap if positions.get(pid) == "DST" else player_cap)}
         try:
             cands, _ = build_lineups_from_pool(pool, num_lineups=candidates_per_qb, locked_player_ids=[qb],
                                                excluded_player_ids=list(base_excluded | capped), min_uniques=2,
