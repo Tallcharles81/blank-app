@@ -277,6 +277,24 @@ def _apply_qb_stack_constraint(prob, x, players):
             prob += pass_catcher_sum >= x[qb_id]
 
 
+def _apply_no_dst_vs_offense_constraint(prob, x, players):
+    # A DST scores off the offense it faces (sacks, turnovers, points
+    # allowed), so pairing it with a skill player from that offense makes the
+    # two pull against each other. Sunday 10/11 build, first pass: 5 of 17
+    # lineups did it (Seahawks DST with George Kittle, Raiders DST with
+    # Rhamondre Stevenson). Opt-in so existing backtests keep their
+    # validated behavior.
+    offense_by_team = defaultdict(list)
+    for p in players:
+        if p["position"] not in ("DST", "CPT", "FLEX"):
+            offense_by_team[p.get("team")].append(p["player_id"])
+    for d in players:
+        if d["position"] != "DST" or not d.get("opponent"):
+            continue
+        for pid in offense_by_team.get(d["opponent"], []):
+            prob += x[d["player_id"]] + x[pid] <= 1
+
+
 def _apply_bring_back_constraint(prob, x, players):
     # The other half of a real "game stack": a pass-catcher from the QB's
     # OPPONENT, alongside his own team's pass-catcher from
@@ -350,6 +368,7 @@ def _solve_classic(
     require_bring_back=False,
     ownership_values_by_id=None,
     ownership_cap=None,
+    avoid_dst_vs_offense=False,
 ):
     prob = pulp.LpProblem("dfs_classic", pulp.LpMaximize)
     x = {p["player_id"]: pulp.LpVariable(f"x_{p['player_id']}", cat="Binary") for p in players}
@@ -378,6 +397,8 @@ def _solve_classic(
         _apply_qb_stack_constraint(prob, x, players)
     if require_bring_back:
         _apply_bring_back_constraint(prob, x, players)
+    if avoid_dst_vs_offense:
+        _apply_no_dst_vs_offense_constraint(prob, x, players)
     if ownership_cap is not None:
         _apply_ownership_cap_constraint(prob, x, players, ownership_values_by_id, ownership_cap)
 
@@ -415,6 +436,7 @@ def _solve_showdown(
     require_bring_back=False,
     ownership_values_by_id=None,
     ownership_cap=None,
+    avoid_dst_vs_offense=False,
 ):
     # require_qb_stack/require_bring_back are accepted (not just missing) so
     # build_lineups_from_pool can call either solver with the same keyword
@@ -430,7 +452,7 @@ def _solve_showdown(
     # Showdown yet (see models/field_simulation.py::
     # run_ownership_cap_validation_comparison, classic-only so far), not a
     # claim that the constraint wouldn't apply here too.
-    del require_qb_stack, require_bring_back, ownership_values_by_id, ownership_cap
+    del require_qb_stack, require_bring_back, ownership_values_by_id, ownership_cap, avoid_dst_vs_offense
     prob = pulp.LpProblem("dfs_showdown", pulp.LpMaximize)
     x = {p["player_id"]: pulp.LpVariable(f"x_{p['player_id']}", cat="Binary") for p in players}
 
@@ -622,6 +644,7 @@ def build_lineups_from_pool(
     ownership_values_by_id=None,
     ownership_cap=None,
     min_captain_lineups=None,
+    avoid_dst_vs_offense=False,
 ):
     """Core multi-lineup builder, operating on an in-memory player pool (dicts
     with player_id/name/position/salary/team/points) instead of loading from
@@ -758,6 +781,7 @@ def build_lineups_from_pool(
                 require_bring_back,
                 ownership_values_by_id,
                 ownership_cap,
+                avoid_dst_vs_offense=avoid_dst_vs_offense,
             )
         except ValueError:
             if i == 0:

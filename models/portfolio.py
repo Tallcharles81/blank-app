@@ -45,7 +45,7 @@ def qb_plan(ranked_games, pool, num_lineups, top_games=5):
 
 def build_spread_portfolio(pool, plan, choose=None, candidates_per_qb=1, max_player_share=MAX_PLAYER_SHARE,
                            max_dst_share=MAX_DST_SHARE, require_bring_back=False, excluded_player_ids=None,
-                           max_count_by_player=None):
+                           max_count_by_player=None, avoid_dst_vs_offense=True):
     """One lineup per QB in `plan`, each a QB stack built with every capped
     player excluded. Returns the lineups in plan order (a QB whose stack
     can't be built under the caps is skipped and reported in `skipped`).
@@ -67,7 +67,8 @@ def build_spread_portfolio(pool, plan, choose=None, candidates_per_qb=1, max_pla
         try:
             cands, _ = build_lineups_from_pool(pool, num_lineups=candidates_per_qb, locked_player_ids=[qb],
                                                excluded_player_ids=list(base_excluded | capped), min_uniques=2,
-                                               require_qb_stack=True, require_bring_back=require_bring_back)
+                                               require_qb_stack=True, require_bring_back=require_bring_back,
+                                               avoid_dst_vs_offense=avoid_dst_vs_offense)
         except ValueError:
             skipped.append(qb)
             continue
