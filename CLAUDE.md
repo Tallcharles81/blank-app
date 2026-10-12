@@ -161,6 +161,15 @@ lineups, and before lock tell the user plainly that inactives are
 unconfirmed, give the swap rows, and ask them to check DraftKings' red
 "O"/"INACT" tag before kickoff.
 
+A build made before Friday's final injury report is PRELIMINARY: name it
+`..._PRELIMINARY.csv`, say it must not be uploaded as final, and deliver the
+`_FINAL` file only after the Friday report. Sunday 10/11 (Dime Package): the
+Wednesday file was uploaded and never replaced; Kyle Monangai was ruled out
+Friday and scored 0 in 6 of 17 entries. Entered version cashed 1 of 17
+(best rank 20,932); the Friday rebuild would have cashed 3 (best 7,175).
+The Sunday inactives check must also ask which file was uploaded and give
+swaps for every version the user may have entered.
+
 When news rules out a player, move his production with
 `models.absence_redistribution.redistribute_absence(slate_id, name)`, not a
 hand-made split (added 2026-10-06). Measured on 2023-25: a lead RB's backup
