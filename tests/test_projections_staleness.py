@@ -193,6 +193,7 @@ def test_promoted_backup_qb_is_projected_from_his_real_starts_only(engine):
 
 def test_injury_returner_gets_the_lighter_discount_only_with_a_clean_report():
     import pandas as pd
+
     from models.projections import _injury_returners
 
     injuries = pd.DataFrame({

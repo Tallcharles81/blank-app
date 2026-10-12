@@ -47,8 +47,9 @@ def test_spread_portfolio_caps_every_player_and_uses_a_different_qb_each_lineup(
 
 
 def test_tight_per_player_cap_holds_below_the_general_cap():
-    import models.portfolio as pf
     from collections import Counter
+
+    import models.portfolio as pf
 
     calls = []
 

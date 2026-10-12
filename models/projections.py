@@ -5,7 +5,11 @@ from collections import defaultdict
 from sqlalchemy import text
 
 from data.depth_charts import latest_depth_chart_by_player
-from data.nflverse_fetch import download_csv, fetch_team_implied_totals, to_nflverse_team
+from data.nflverse_fetch import (
+    download_csv,
+    fetch_team_implied_totals,
+    to_nflverse_team,
+)
 from data.player_availability import get_availability_gate, resolve_slate_season_week
 from data.player_crosswalk import resolve_dk_players_to_gsis
 from data.pre_lock_check import _load_recent_usage_batch

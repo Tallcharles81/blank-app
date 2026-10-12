@@ -22,7 +22,11 @@ compare_top_pick_to_pool tracking like the rule before it.
 import numpy as np
 
 from db.migrate import get_engine
-from models.optimizer import _load_player_pool, build_lineups_from_pool, generate_lineups
+from models.optimizer import (
+    _load_player_pool,
+    build_lineups_from_pool,
+    generate_lineups,
+)
 from models.simulation import simulate_lineups
 
 # 0.8 was calibrated so the noise field's projected strength matches real

@@ -60,7 +60,10 @@ def rank_games(schedule_week, team_env):
     g = pd.DataFrame(rows)
     if g.empty:
         return g
-    z = lambda c: (g[c] - g[c].mean()) / (g[c].std() or 1.0)
+
+    def z(c):
+        return (g[c] - g[c].mean()) / (g[c].std() or 1.0)
+
     g["env_score"] = (2 * z("total") + z("plays_pg") + z("neutral_pass") + z("expl_off") + z("expl_allowed")
                       + z("off_epa") + z("def_epa_allowed")) / 8
     return g.sort_values("env_score", ascending=False).reset_index(drop=True)
