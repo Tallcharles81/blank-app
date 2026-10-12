@@ -267,3 +267,29 @@ GPP payout curve it returned $1.27 per $1 vs $1.80 for the current build
 was worse than both. Not adopted; code kept in the scratchpad
 (scenario_builds_rejected.py). Revisit only with more slates, or for
 cash-style contests where finishing in the money matters more than the top.
+
+## Standing reporting: player cards, averages and DST matchups
+
+Set by the user 2026-10-12 after the 10/11 Sunday ("pay attention to the
+players' average points, not just ceiling... the targets... who they're
+going against, especially the defense"). Every build report includes
+`models.player_cards.format_cards(player_cards(slate_id, rostered_ids))`
+for every rostered player: our median and ceiling, season and last-3 DK
+averages, targets/carries per game, snap% over the last 3, the opponent
+and how that defense has allowed the position (rank 1 = most allowed), and
+both implied totals. Call out any rostered player whose median is well
+above his real averages (or a backup whose role changed) and say why.
+
+What the data says each piece is worth (2023-25 fit, 2025-26 test):
+- DST: the opponent's implied total is the strongest signal (corr 0.31 vs
+  0.06 for a DST's own average). DSTs are now projected from it by default
+  (`models.dst_matchup`, `USE_DST_MATCHUP_LADDER`). Name each lineup's DST
+  with its opponent and that opponent's implied total.
+- Skill players: "the defense allows X to the position" did not improve
+  predictions at any position, so it is shown for context only. Averages
+  and usage (targets + carries) carry the signal.
+- Building toward median instead of ceiling was tested on the 4 Classic
+  Sundays (9/20-10/11, stored projections, spread portfolio): median
+  finished top 54% with 12 cashes, a 50/50 blend 52% with 14, ceiling 49%
+  with 18. GPP builds keep the ceiling objective; show the medians anyway
+  so a ceiling-only pick is visible. Retest when more Sundays exist.

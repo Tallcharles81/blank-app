@@ -103,14 +103,35 @@ def test_default_generate_projections_leaves_dst_treatment_unchanged(engine, dst
 
 
 def test_opt_in_dst_opponent_adjustment_moves_at_least_one_real_dst_ceiling(engine, dst_adjustment_slate):
-    generate_projections(dst_adjustment_slate, engine=engine)
+    generate_projections(dst_adjustment_slate, engine=engine, dst_matchup=False)
     baseline = _dst_ceilings(engine, dst_adjustment_slate)
     assert baseline  # real history must exist for at least one of these two real teams
 
-    generate_projections(dst_adjustment_slate, engine=engine, use_dst_opponent_matchup_adjustment=True)
+    generate_projections(dst_adjustment_slate, engine=engine, use_dst_opponent_matchup_adjustment=True, dst_matchup=False)
     adjusted = _dst_ceilings(engine, dst_adjustment_slate)
 
     # At least one real DST's ceiling must actually move - otherwise this
     # "opt-in" flag would be a silent no-op rather than a real alternative.
     changed = [pid for pid in baseline if pid in adjusted and baseline[pid] != adjusted[pid]]
     assert changed
+
+
+def test_dst_matchup_ladder_replaces_the_dst_projection(engine, dst_adjustment_slate):
+    """With dst_matchup on, each DST's projection is the opponent-implied
+    ladder (models/dst_matchup.py), recorded as source 'dst_matchup', and
+    the defense facing the lower implied total projects higher."""
+    from models.dst_matchup import load_dst_history, matchup_ladder
+
+    generate_projections(dst_adjustment_slate, engine=engine, dst_matchup=True)
+    with engine.connect() as conn:
+        stored = {r.player_id: float(r.proj_median) for r in conn.execute(text(
+            "SELECT player_id, proj_median FROM projections WHERE slate_id = :s"), {"s": dst_adjustment_slate})}
+        recorded = {r.player_id: float(r.proj_median) for r in conn.execute(text(
+            "SELECT player_id, proj_median FROM projection_sources WHERE slate_id = :s AND source = 'dst_matchup'"),
+            {"s": dst_adjustment_slate})}
+        implied = {r.team: float(r.v) for r in conn.execute(text(
+            "SELECT team, vegas_implied_total v FROM player_weekly_stats WHERE position = 'DST' AND season = 2026 AND week = 2"))}
+    assert recorded and recorded == {pid: stored[pid] for pid in recorded}
+    history = load_dst_history(before=(2026, 2), engine=engine)
+    assert stored[SEA_DST_ID] == matchup_ladder(implied["ARI"], history)["50"]
+    assert stored[ARI_DST_ID] == matchup_ladder(implied["SEA"], history)["50"]

@@ -15,6 +15,7 @@ from data.player_crosswalk import resolve_dk_players_to_gsis
 from data.pre_lock_check import _load_recent_usage_batch
 from data.sabersim_import import record_projection_source
 from db.migrate import get_engine
+from models.dst_matchup import load_dst_history, matchup_projection
 from models.player_baselines import blend_ladders, load_baselines
 from models.playing_time_engine import promote_past_unavailable_qbs
 
@@ -103,6 +104,15 @@ CEILING_Z_BOOST = 0.3
 # field percentile 0.9475 -> 0.9340). Turn on only if a lineup-level
 # backtest shows it helps.
 USE_MEDIAN_CALIBRATION = False
+
+# DSTs projected from the opponent's implied total (models/dst_matchup.py)
+# instead of their own history. 2023-26 holdout: corr with real DST points
+# 0.31 vs 0.06 for own average; top-3 picks a week 9.1 vs 6.9 pts. On the 4
+# 2026 Classic Sundays its top-5 DSTs averaged 7.3 real pts vs 6.6 for the
+# old projection (old better 9/20 and 9/27, new 10/04 and 10/11), and the
+# retro build (spread portfolio, ceiling objective) finished top 47% vs 49%
+# with 20 cashes vs 18 - small, but not worse, and the bigger sample backs it.
+USE_DST_MATCHUP_LADDER = True
 MEDIAN_CALIBRATION = {
     "QB": (5.0, 0.65),
     "RB": (1.25, 0.80),
@@ -562,8 +572,12 @@ def _apply_game_environment_adjustment(proj, implied_total, league_average_impli
     return {**proj, "proj_ceiling": adjusted_percentiles["90"], "proj_percentiles": adjusted_percentiles}
 
 
-def generate_projections(slate_id, engine=None, use_dst_opponent_matchup_adjustment=False):
-    """use_dst_opponent_matchup_adjustment: opt-in, default False. Applies
+def generate_projections(slate_id, engine=None, use_dst_opponent_matchup_adjustment=False, dst_matchup=None):
+    """dst_matchup: project every DST from its opponent's implied total
+    (models/dst_matchup.py); defaults to USE_DST_MATCHUP_LADDER. When it
+    applies, use_dst_opponent_matchup_adjustment is moot for that DST.
+
+    use_dst_opponent_matchup_adjustment: opt-in, default False. Applies
     the same real, already-validated boost-only Vegas mechanism
     (_apply_game_environment_adjustment) to a DST row using its real
     OPPONENT's implied total instead of the DST's own team's - real
@@ -576,6 +590,7 @@ def generate_projections(slate_id, engine=None, use_dst_opponent_matchup_adjustm
     False to keep today's shipped behavior unchanged.
     """
     engine = engine or get_engine()
+    dst_matchup = USE_DST_MATCHUP_LADDER if dst_matchup is None else dst_matchup
 
     with engine.connect() as conn:
         players = conn.execute(
@@ -639,6 +654,8 @@ def generate_projections(slate_id, engine=None, use_dst_opponent_matchup_adjustm
     league_average_implied_total = (
         sum(implied_totals_by_team.values()) / len(implied_totals_by_team) if implied_totals_by_team else None
     )
+    # Only games before this slate's week, so a re-run on an old slate can't see its own results.
+    dst_history = load_dst_history(before=season_week, engine=engine) if dst_matchup and implied_totals_by_team else []
 
     upsert_sql = text(
         """
@@ -695,7 +712,15 @@ def generate_projections(slate_id, engine=None, use_dst_opponent_matchup_adjustm
                         record_projection_source(conn, slate_id, source, player["player_id"], player["name"], player["position"], ladder)
                 proj = {"proj_floor": blended["25"], "proj_median": blended["50"], "proj_ceiling": blended["90"],
                         "proj_percentiles": blended}
-            if use_dst_opponent_matchup_adjustment and real_position == "DST":
+            dst_opponent_implied = implied_totals_by_team.get(to_nflverse_team(player["opponent"]))
+            if dst_matchup and real_position == "DST" and dst_history and dst_opponent_implied is not None:
+                # Replaces the DST's own history and its own team's total -
+                # see models/dst_matchup.py for why (own average ~ noise).
+                proj = matchup_projection(dst_opponent_implied, dst_history)
+                if player["position"] != "CPT":
+                    record_projection_source(conn, slate_id, "dst_matchup", player["player_id"], player["name"],
+                                             player["position"], proj["proj_percentiles"])
+            elif use_dst_opponent_matchup_adjustment and real_position == "DST":
                 # Opt-in only - see this function's own docstring for the
                 # real backtest behind this. Synthetic implied_total so
                 # _apply_game_environment_adjustment's own internal gap
