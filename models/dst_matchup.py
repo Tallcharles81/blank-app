@@ -19,7 +19,7 @@ total (the wrong side of the ball); on 2026-10-11 it ranked the Raiders
 The ladder is the real score distribution of past DSTs that faced a
 similar implied total (within WINDOW points, widened until MIN_GAMES), so
 it carries the real skew (a defensive TD is a big share of a ceiling). On
-the test weeks it was calibrated: 9/21/47/74/89% of real scores fell below
+the test weeks it was calibrated: 11/26/52/76/90% of real scores fell below
 p10/25/50/75/90.
 """
 import numpy as np
@@ -57,11 +57,17 @@ def matchup_ladder(opponent_implied_total, history, window=WINDOW, min_games=MIN
         raise ValueError("No DST history to build a matchup ladder from")
     pts = np.array([h[0] for h in history])
     imp = np.array([h[1] for h in history])
+    # DST scores are whole numbers, so raw neighbor percentiles tie (six DSTs
+    # at exactly 7.0 in week 6). Shifting each neighbor's score to the target
+    # total along the overall slope (about -0.5 pts per implied point) keeps
+    # the ladder's shape and still ranks a weaker opponent higher.
+    slope = np.polyfit(imp, pts, 1)[0] if len(set(imp)) > 1 else 0.0
     while True:
-        near = pts[np.abs(imp - opponent_implied_total) <= window]
-        if len(near) >= min(min_games, len(pts)):
+        mask = np.abs(imp - opponent_implied_total) <= window
+        if mask.sum() >= min(min_games, len(pts)):
             break
         window += 0.5
+    near = pts[mask] + slope * (opponent_implied_total - imp[mask])
     return {str(q): round(float(v), 2) for q, v in zip(PERCENTILES, np.percentile(near, PERCENTILES))}
 
 
